@@ -49,7 +49,6 @@ def normalize_playlist_config(payload: object) -> PlaylistConfig:
 
     clean_excluded_terms = tuple(term.strip() for term in excluded_terms if term.strip())
     excluded_term_keys = frozenset(normalize_term(term) for term in clean_excluded_terms)
-    raw_terms_by_key: dict[str, tuple[str, str]] = {}
     playlist_labels: list[str] = []
     raw_aliases_by_label: dict[str, tuple[str, ...]] = {}
     alias_keys_by_label: dict[str, tuple[str, ...]] = {}
@@ -72,10 +71,6 @@ def normalize_playlist_config(payload: object) -> PlaylistConfig:
             if alias_key in excluded_term_keys:
                 raise ValueError(f"raw term appears in excluded_terms and playlists: {clean_alias}")
 
-            previous = raw_terms_by_key.get(alias_key)
-            if previous and previous[0] != clean_label:
-                raise ValueError(f"raw term appears under multiple playlist labels: {clean_alias}")
-            raw_terms_by_key[alias_key] = (clean_label, clean_alias)
             if alias_key not in label_alias_keys:
                 label_aliases.append(clean_alias)
                 label_alias_keys.append(alias_key)
@@ -129,6 +124,7 @@ def format_playlist_config_overview(path: Path, config: PlaylistConfig, created:
             "5. If Style creates one or more playlists, keep those and skip Genre.",
             "6. Use Genre aliases only when Style creates no playlist.",
             "7. Keep playlist order from the playlists object in the config.",
+            "8. Allow the same raw term under multiple playlist labels.",
             "",
             "Current playlist config:",
             f"Playlist prefix: {config.playlist_prefix or '(none)'}",

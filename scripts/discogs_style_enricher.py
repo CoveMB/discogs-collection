@@ -25,8 +25,14 @@ from typing import TextIO
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from shared.discogs_columns import GENRE_COLUMN, RELEASE_ID_COLUMN, STYLE_COLUMN
 from shared.files import read_csv_file, write_csv_file, write_json_file
-from shared.reports import readable_timestamp
+from shared.reports import (
+    format_report_section,
+    format_report_title,
+    timestamped_report_path,
+    write_text_report,
+)
 from shared.text import (
     is_string_list,
     join_non_empty as join_notes,
@@ -36,23 +42,22 @@ from shared.text import (
 )
 
 
-STYLE_COLUMN = "Style"
-GENRE_COLUMN = "Genre"
 STYLE_SOURCE_COLUMN = "Style Source"
 STYLE_STATUS_COLUMN = "Style Status"
 STYLE_NOTES_COLUMN = "Style Notes"
 GENRE_NOTES_COLUMN = "Genre Notes"
 UPDATED_AT_COLUMN = "Updated At"
 LEGACY_UPDATED_AT_COLUMN = "Style Updated At"
-RELEASE_ID_COLUMN = "release_id"
 DEFAULT_COLLECTION_DIRECTORY = Path("collection")
 DEFAULT_MASTER_PATH = DEFAULT_COLLECTION_DIRECTORY / "enriched-collection.csv"
+DEFAULT_CACHE_DIRECTORY_NAME = "cache"
+DEFAULT_CACHE_DIRECTORY = DEFAULT_COLLECTION_DIRECTORY / DEFAULT_CACHE_DIRECTORY_NAME
 DEFAULT_CACHE_FILENAME = "processing.cache.json"
 DEFAULT_INPUT_DIRECTORY = Path("export")
 DEFAULT_PROCESSED_DIRECTORY = Path("processed")
-DEFAULT_REPORT_DIRECTORY = Path("reports")
 DEFAULT_USER_AGENT = "DiscogsStyleEnricher/1.0 +https://www.discogs.com"
-DEFAULT_SEEN_TERMS_PATH = DEFAULT_COLLECTION_DIRECTORY / "seen-discogs-terms.json"
+DEFAULT_SEEN_TERMS_FILENAME = "collected.cache.json"
+DEFAULT_SEEN_TERMS_PATH = DEFAULT_CACHE_DIRECTORY / DEFAULT_SEEN_TERMS_FILENAME
 DISCOGS_API_ROOT = "https://api.discogs.com"
 LOOKUP_CACHE_SCHEMA_VERSION = 2
 LOOKUP_CACHE_RECORD_TYPE = "discogs_release_metadata"
@@ -400,7 +405,7 @@ def find_single_csv_export(input_directory: Path) -> Path:
         if path.is_file() and path.suffix.lower() == ".csv"
     )
     if not csv_paths:
-        raise FileNotFoundError(f"no CSV export found in input folder: {input_directory}")
+        raise FileNotFoundError(f"No CSV export found in input folder {input_directory} export your collection from Discogs first and add it in {input_directory}")
     if len(csv_paths) > 1:
         csv_names = ", ".join(path.name for path in csv_paths)
         raise ValueError(
@@ -576,8 +581,8 @@ def prepare_seen_terms_update_from_previous(
     if previous_terms is None:
         return SeenTermsUpdate(
             terms=normalized_current_terms,
-            new_styles=(),
-            new_genres=(),
+            new_styles=normalized_current_terms.styles,
+            new_genres=normalized_current_terms.genres,
             initialized=True,
         )
 
@@ -618,8 +623,12 @@ def parse_genres_from_api_payload(payload: Mapping[str, object] | None) -> tuple
 def parse_master_id(payload: Mapping[str, object] | None) -> int:
     if not payload:
         return 0
+    return parse_int_or_zero(payload.get("master_id"))
+
+
+def parse_int_or_zero(value: object) -> int:
     try:
-        return int(payload.get("master_id") or 0)
+        return int(value or 0)
     except (TypeError, ValueError):
         return 0
 
@@ -956,10 +965,7 @@ def release_metadata_from_cache_record(release_id: str, record: Mapping[str, obj
 
 
 def parse_cached_master_id(master_id: object) -> int:
-    try:
-        return int(master_id or 0)
-    except (TypeError, ValueError):
-        return 0
+    return parse_int_or_zero(master_id)
 
 
 def metadata_field_from_cache_record(record: object) -> MetadataFieldLookup:
@@ -1215,60 +1221,77 @@ def utc_timestamp() -> str:
 
 
 def default_report_path(output_path: Path) -> Path:
-    return DEFAULT_REPORT_DIRECTORY / f"{output_path.stem}_{readable_timestamp()}_report.txt"
+    return timestamped_report_path(output_path, "report")
 
 
 def default_cache_path(output_path: Path) -> Path:
-    return output_path.parent / DEFAULT_CACHE_FILENAME
+    return output_path.parent / DEFAULT_CACHE_DIRECTORY_NAME / DEFAULT_CACHE_FILENAME
 
 
 def write_report(path: Path, summary: RunSummary, rows: Sequence[Mapping[str, str]]) -> None:
     rows_by_release_id = {str(row.get(RELEASE_ID_COLUMN, "") or ""): row for row in rows}
-    lines = [
-        "Discogs style and genre enrichment report",
-        f"Input export rows: {summary.input_rows}",
-        f"Master rows before: {summary.master_rows_before}",
-        f"Output rows: {summary.output_rows}",
-        f"Appended rows: {summary.appended_rows}",
-        f"Filled missing styles: {summary.filled_style_count}",
-        f"Filled missing genres: {summary.filled_genre_count}",
-        f"Preserved existing styles: {summary.preserved_style_count}",
-        f"Preserved existing genres: {summary.preserved_genre_count}",
-        f"Left blank / not sure: {summary.blank_count}",
-        f"Lookup errors: {summary.error_count}",
-        f"Output: {summary.output_path}",
-        f"Cache: {summary.cache_path}",
+    lines = format_report_title("Discogs style and genre enrichment report")
+    summary_lines = [
+        f"- Input export rows: {summary.input_rows}",
+        f"- Master rows before: {summary.master_rows_before}",
+        f"- Output rows: {summary.output_rows}",
+        f"- Appended rows: {summary.appended_rows}",
+        f"- Filled missing styles: {summary.filled_style_count}",
+        f"- Filled missing genres: {summary.filled_genre_count}",
+        f"- Preserved existing styles: {summary.preserved_style_count}",
+        f"- Preserved existing genres: {summary.preserved_genre_count}",
+        f"- Left blank / not sure: {summary.blank_count}",
+        f"- Lookup errors: {summary.error_count}",
     ]
+    file_lines = [
+        f"- Output: {summary.output_path}",
+        f"- Cache: {summary.cache_path}",
+    ]
+    lines.extend(format_report_section("Summary", summary_lines))
+    lines.extend(format_report_section("Files", file_lines))
     lines.extend(format_seen_terms_report_section(summary))
-    lines.extend(["", "Items left blank / not sure:"])
+    review_lines: list[str] = []
     if summary.not_sure_release_ids:
-        lines.extend(format_not_sure_line(release_id, rows_by_release_id.get(release_id, {})) for release_id in summary.not_sure_release_ids)
+        for index, release_id in enumerate(summary.not_sure_release_ids):
+            if index:
+                review_lines.append("")
+            review_lines.extend(format_not_sure_lines(release_id, rows_by_release_id.get(release_id, {})))
     else:
-        lines.append("- None")
-    lines.append("")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines), encoding="utf-8")
+        review_lines.append("- None")
+    lines.extend(format_report_section("Items left blank / not sure", review_lines))
+    write_text_report(path, lines)
 
 
 def format_seen_terms_report_section(summary: RunSummary) -> list[str]:
     if not summary.seen_terms_path:
         return []
+    lines: list[str] = []
     if summary.seen_terms_initialized:
-        return [
-            "",
-            "Seen terms snapshot:",
+        snapshot_lines = [
             f"- Initialized: {summary.seen_terms_path}",
             f"- Styles tracked: {summary.seen_styles_count}",
             f"- Genres tracked: {summary.seen_genres_count}",
         ]
-    return [
+        lines.extend(format_report_section("Seen terms snapshot", snapshot_lines))
+    if not has_new_discogs_terms(summary):
+        return lines
+    new_term_lines = [
+        "Consider mapping useful new styles and genres in the playlist mapper config.",
         "",
-        "New Discogs terms since last seen-terms snapshot:",
         "Styles:",
         *format_term_bullets(summary.new_styles),
+        "",
         "Genres:",
         *format_term_bullets(summary.new_genres),
     ]
+    lines.extend(
+        format_report_section("New Discogs terms since last seen-terms snapshot", new_term_lines)
+    )
+    return lines
+
+
+def has_new_discogs_terms(summary: RunSummary) -> bool:
+    return bool(summary.new_styles or summary.new_genres)
 
 
 def format_term_bullets(terms: Sequence[str]) -> list[str]:
@@ -1277,17 +1300,26 @@ def format_term_bullets(terms: Sequence[str]) -> list[str]:
     return [f"- {term}" for term in terms]
 
 
-def format_not_sure_line(release_id: str, row: Mapping[str, str]) -> str:
+def format_not_sure_lines(release_id: str, row: Mapping[str, str]) -> list[str]:
     artist = row.get("Artist", "")
     title = row.get("Title", "")
     notes = join_notes(
         [
-            format_missing_metadata_fields(row),
             format_field_note("style", row.get(STYLE_NOTES_COLUMN, "")),
             format_field_note("genre", row.get(GENRE_NOTES_COLUMN, "")),
         ]
     )
-    return f"- {release_id}: {artist} - {title} ({notes})"
+    lines = [
+        f"- Release ID: {release_id}",
+        f"  Artist: {artist}",
+        f"  Title: {title}",
+    ]
+    missing_fields = format_missing_metadata_fields(row)
+    if missing_fields:
+        lines.append(f"  Missing: {missing_fields}")
+    if notes:
+        lines.append(f"  Notes: {notes}")
+    return lines
 
 
 def format_missing_metadata_fields(row: Mapping[str, str]) -> str:
@@ -1298,7 +1330,7 @@ def format_missing_metadata_fields(row: Mapping[str, str]) -> str:
     ]
     if not missing_fields:
         return ""
-    return f"missing: {', '.join(missing_fields)}"
+    return ", ".join(missing_fields)
 
 
 def format_field_note(field_name: str, note: str | None) -> str:
@@ -1316,8 +1348,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--master", type=Path, default=DEFAULT_MASTER_PATH, help="Existing enriched master CSV. Created if missing. Defaults to collection/enriched-collection.csv.")
     parser.add_argument("--output", type=Path, help="Output enriched master CSV. Defaults to --master.")
     parser.add_argument("--report", type=Path, help="Text report path. Defaults to reports/<output-name>_<timestamp>_report.txt.")
-    parser.add_argument("--cache", type=Path, help="Lookup cache JSON path. Defaults to processing.cache.json beside output CSV.")
-    parser.add_argument("--seen-terms", type=Path, default=DEFAULT_SEEN_TERMS_PATH, help="Seen Discogs terms JSON path. Defaults to collection/seen-discogs-terms.json.")
+    parser.add_argument("--cache", type=Path, help="Lookup cache JSON path. Defaults to cache/processing.cache.json under the output CSV folder.")
+    parser.add_argument("--seen-terms", type=Path, default=DEFAULT_SEEN_TERMS_PATH, help="Seen Discogs terms JSON path. Defaults to collection/cache/collected.cache.json.")
     parser.add_argument("--no-seen-terms", action="store_true", help="Disable seen Discogs terms tracking for this run.")
     parser.add_argument("--discogs-token", default=os.environ.get("DISCOGS_TOKEN", ""), help="Optional Discogs personal access token. Defaults to DISCOGS_TOKEN.")
     parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT, help="User-Agent sent to Discogs.")
@@ -1342,14 +1374,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def print_summary(summary: RunSummary) -> None:
-    print(f"Output: {summary.output_path}")
+    print(f"\n## Files")
+    print(f"\nOutput: {summary.output_path}")
     print(f"Report: {summary.report_path}")
     print(f"Cache: {summary.cache_path}")
     if summary.seen_terms_path:
         print(f"Seen terms: {summary.seen_terms_path}")
     if summary.processed_export_path:
         print(f"Processed export: {summary.processed_export_path}")
-    print(f"Input export rows: {summary.input_rows}")
+    print(f"\n## Processed")
+    print(f"\nInput export rows: {summary.input_rows}")
     print(f"Master rows before: {summary.master_rows_before}")
     print(f"Output rows: {summary.output_rows}")
     print(f"Appended rows: {summary.appended_rows}")
@@ -1359,7 +1393,9 @@ def print_summary(summary: RunSummary) -> None:
     print(f"Preserved existing genres: {summary.preserved_genre_count}")
     print(f"Left blank / not sure: {summary.blank_count}")
     print(f"Lookup errors: {summary.error_count}")
-    if summary.seen_terms_path:
+    if summary.seen_terms_path and has_new_discogs_terms(summary):
+        print(f"\n## Styles and Genres")
+        print(f"\nNew styles or genres found, add them to your playlist mapper config if desired: {summary.seen_terms_path}\n")
         print(f"New styles: {len(summary.new_styles)}")
         print(f"New genres: {len(summary.new_genres)}")
 

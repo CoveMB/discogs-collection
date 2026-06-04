@@ -35,4 +35,6 @@ dist/
 **/*-style-report.txt
 reports/*_report.txt
 **/*cache.json
+collection/cache/
+collection/**.json
 config/**

@@ -130,9 +130,11 @@ The mapper also writes a report by default:
 reports/<output-name>_<YYYY-MM-DD_HH-MM-SS>_playlist_report.txt
 ```
 
-The report lists every row by `release_id`, artist, and title, followed by the
-playlist names written for that row. Rows with no mapped playlist are listed as
-`None`.
+The report groups the run into summary, file path, and playlist association
+sections. Each association shows the `release_id`, artist, title, and playlist
+names written for that row. Rows with no mapped playlist are listed as `None`.
+After a successful run, the mapper prints the same playlist association section
+to the console after the output paths and row counts.
 
 If the config file does not exist, the mapper creates an empty config with the
 expected fields, prints what each field is for, and waits for you to press Enter
@@ -181,14 +183,15 @@ Mapping rules:
 - If `Style` creates one or more playlists, `Genre` is ignored for that row.
 - If `Style` creates no playlist, `Genre` is used as the fallback.
 - One row can receive multiple playlists.
+- The same raw Discogs term can appear under multiple playlist labels; matching
+  rows receive each label.
 - Duplicate source terms do not duplicate playlist names.
 - Playlist order follows the order of `playlists` in the config.
 - Rows with no matching term get a blank `Playlists` value.
 
 The mapper validates the config before writing output. It rejects malformed JSON,
-missing or invalid `playlists`, invalid `excluded_terms`, aliases used by more
-than one playlist, and aliases that appear in both `excluded_terms` and
-`playlists`.
+missing or invalid `playlists`, invalid `excluded_terms`, and aliases that
+appear in both `excluded_terms` and `playlists`.
 
 ## How rows are merged
 
@@ -285,10 +288,11 @@ rate limits stop retrying for that URL.
 
 ## Cache and report files
 
-Unless you pass custom paths, the script writes `processing.cache.json` beside
-the output CSV and writes the report in `reports`:
+Unless you pass custom paths, the script writes the lookup cache under a
+`cache` folder beside the output CSV and writes the report in `reports`.
+With the default master path, the lookup cache is `collection/cache/processing.cache.json`.
 
-- `processing.cache.json`
+- `cache/processing.cache.json` under the output CSV folder
 - `reports/<output-name>_<YYYY-MM-DD_HH-MM-SS>_report.txt`
 
 The cache stores release metadata lookup results by `release_id`, including
@@ -304,7 +308,8 @@ The cache uses a schema-versioned JSON structure and does not store raw Discogs
 API payloads. Old flat style-only caches are not migrated; use the new default
 cache path or delete the old cache if you explicitly point `--cache` at it.
 
-The report summarizes the run:
+The report is a plain text file with summary, file path, seen-terms, and manual
+review sections. It summarizes the run:
 
 - input export row count
 - master row count before the run
@@ -325,7 +330,7 @@ The report summarizes the run:
 The enrichment script also keeps a local seen-terms sidecar file:
 
 ```text
-collection/seen-discogs-terms.json
+collection/cache/collected.cache.json
 ```
 
 This file records raw Discogs style and genre terms that have already appeared in
@@ -349,8 +354,9 @@ styles and genres into the report, then updates the file with the union of old
 and current terms. Stored terms are sorted alphabetically so diffs stay stable.
 
 On the first run, if the seen-terms file does not exist, the script creates it
-from the current output terms and reports that the snapshot was initialized. It
-does not list every current term as new on that first initialization.
+from the current output terms, reports that the snapshot was initialized, and
+lists every current term as new. Later runs report only terms that were not in
+that saved snapshot.
 
 If the seen-terms file exists but is malformed, the script fails clearly before
 writing the enriched CSV or updating the sidecar. It does not reset the file.
@@ -358,10 +364,12 @@ writing the enriched CSV or updating the sidecar. It does not reset the file.
 Report examples:
 
 ```text
-New Discogs terms since last seen-terms snapshot:
+New Discogs terms since last seen-terms snapshot
+------------------------------------------------
 Styles:
 - Acid Jazz
 - Breaks
+
 Genres:
 - None
 ```
@@ -369,10 +377,20 @@ Genres:
 or, on first initialization:
 
 ```text
-Seen terms snapshot:
-- Initialized: collection/seen-discogs-terms.json
+Seen terms snapshot
+-------------------
+- Initialized: collection/cache/collected.cache.json
 - Styles tracked: 42
 - Genres tracked: 8
+
+New Discogs terms since last seen-terms snapshot
+------------------------------------------------
+Styles:
+- Acid Jazz
+- Breaks
+
+Genres:
+- Electronic
 ```
 
 Use `--seen-terms PATH` to store this sidecar somewhere else. Use
@@ -380,8 +398,8 @@ Use `--seen-terms PATH` to store this sidecar somewhere else. Use
 
 New terms in the enrichment report are review prompts. Add a term to
 `config/playlist-map.json` only when you want that raw Discogs term to create a
-playlist label. Leaving a term only in `seen-discogs-terms.json` just prevents
-repeated alerts for a term you have already reviewed.
+playlist label. Leaving a term only in `collection/cache/collected.cache.json`
+just prevents repeated alerts for a term you have already reviewed.
 
 ## Refreshing existing metadata
 
@@ -435,10 +453,11 @@ script could not find explicit style or genre data and chose not to guess.
     Text report path. Defaults to reports/<output-name>_<timestamp>_report.txt.
 
 --cache PATH
-    Lookup cache JSON path. Defaults to processing.cache.json beside the output CSV.
+    Lookup cache JSON path. Defaults to cache/processing.cache.json under the
+    output CSV folder.
 
 --seen-terms PATH
-    Seen Discogs terms JSON path. Defaults to collection/seen-discogs-terms.json.
+    Seen Discogs terms JSON path. Defaults to collection/cache/collected.cache.json.
 
 --no-seen-terms
     Disable seen Discogs terms tracking for this run.

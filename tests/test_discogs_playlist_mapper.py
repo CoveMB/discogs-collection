@@ -1,11 +1,11 @@
-import csv
 import io
-import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+from helpers import read_csv_text, sample_playlist_config as sample_config, write_json
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -13,26 +13,6 @@ SCRIPTS_DIRECTORY = PROJECT_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 
 import discogs_playlist_mapper as mapper  # noqa: E402
-
-
-def read_csv_text(csv_text):
-    return list(csv.DictReader(io.StringIO(csv_text)))
-
-
-def write_json(path, payload):
-    path.write_text(json.dumps(payload), encoding="utf-8")
-
-
-def sample_config():
-    return {
-        "playlist_prefix": "Discogs - ",
-        "excluded_terms": ["Electronic", "Electro"],
-        "playlists": {
-            "Bossanova": ["Bossa Nova", "Bossanova"],
-            "Breakbeat": ["Breakbeat", "Breaks"],
-            "House": ["House", "Deep House", "Acid House"],
-        },
-    }
 
 
 class PlaylistMapperTests(unittest.TestCase):
@@ -145,12 +125,19 @@ class PlaylistMapperTests(unittest.TestCase):
         self.assertEqual(output_rows[0]["Playlists"], "Discogs - House")
         self.assertEqual(output_rows[1]["Playlists"], "Discogs - Breakbeat")
 
-    def test_ambiguous_config_fails_clearly(self):
+    def test_one_raw_term_can_create_multiple_playlist_labels(self):
         payload = sample_config()
         payload["playlists"]["House"].append("Breakbeat")
 
-        with self.assertRaisesRegex(ValueError, "raw term appears under multiple playlist labels: Breakbeat"):
-            mapper.normalize_playlist_config(payload)
+        config = mapper.normalize_playlist_config(payload)
+
+        self.assertEqual(
+            mapper.map_row_playlists(
+                {"Style": "Breakbeat", "Genre": ""},
+                config,
+            ),
+            "Discogs - Breakbeat, Discogs - House",
+        )
 
     def test_excluded_playlist_overlap_fails_clearly(self):
         payload = sample_config()
@@ -224,18 +211,72 @@ class PlaylistMapperTests(unittest.TestCase):
                 )
 
             report_text = report_path.read_text(encoding="utf-8")
+            stdout_text = stdout.getvalue()
 
             self.assertEqual(exit_code, 0)
-            self.assertIn(f"Output: {output_path}", stdout.getvalue())
-            self.assertIn(f"Report: {report_path}", stdout.getvalue())
+            self.assertIn(f"Output: {output_path}", stdout_text)
+            self.assertIn(f"Report: {report_path}", stdout_text)
+            self.assertIn(
+                "Release to playlist associations\n"
+                "--------------------------------\n"
+                "- Release ID: 111\n"
+                "  Artist: First Artist\n"
+                "  Title: First Title\n"
+                "  Playlists: Discogs - House",
+                stdout_text,
+            )
+            self.assertIn(
+                "- Release ID: 444\n"
+                "  Artist: Fourth Artist\n"
+                "  Title: Fourth Title\n"
+                "  Playlists: None",
+                stdout_text,
+            )
             self.assertIn("Discogs playlist mapping report", report_text)
             self.assertIn(f"Input: {input_path}", report_text)
             self.assertIn(f"Output: {output_path}", report_text)
             self.assertIn(f"Config: {config_path}", report_text)
-            self.assertIn("- 111: First Artist - First Title -> Discogs - House", report_text)
-            self.assertIn("- 222: Second Artist - Second Title -> Discogs - Breakbeat", report_text)
-            self.assertIn("- 333: Third Artist - Third Title -> Discogs - House", report_text)
-            self.assertIn("- 444: Fourth Artist - Fourth Title -> None", report_text)
+            self.assertIn(
+                "Discogs playlist mapping report\n"
+                "===============================\n"
+                "\n"
+                "Summary\n"
+                "-------\n"
+                "- Input rows: 4\n"
+                "- Output rows: 4\n"
+                "\n"
+                "Files\n"
+                "-----",
+                report_text,
+            )
+            self.assertIn(
+                "- Release ID: 111\n"
+                "  Artist: First Artist\n"
+                "  Title: First Title\n"
+                "  Playlists: Discogs - House",
+                report_text,
+            )
+            self.assertIn(
+                "- Release ID: 222\n"
+                "  Artist: Second Artist\n"
+                "  Title: Second Title\n"
+                "  Playlists: Discogs - Breakbeat",
+                report_text,
+            )
+            self.assertIn(
+                "- Release ID: 333\n"
+                "  Artist: Third Artist\n"
+                "  Title: Third Title\n"
+                "  Playlists: Discogs - House",
+                report_text,
+            )
+            self.assertIn(
+                "- Release ID: 444\n"
+                "  Artist: Fourth Artist\n"
+                "  Title: Fourth Title\n"
+                "  Playlists: None",
+                report_text,
+            )
 
     def test_cli_stops_after_creating_missing_config_when_stdin_is_closed(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -270,8 +311,35 @@ class PlaylistMapperTests(unittest.TestCase):
             self.assertFalse(output_path.exists())
             self.assertIn("fill the playlist map config", stderr.getvalue())
 
+    def test_cli_reports_missing_enriched_collection_clearly(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            input_path = directory / "collection" / "enriched-collection.csv"
+            config_path = directory / "playlist-map.json"
+            write_json(config_path, sample_config())
+
+            with (
+                patch("sys.stdout", new_callable=io.StringIO),
+                patch("sys.stderr", new_callable=io.StringIO) as stderr,
+            ):
+                exit_code = mapper.main(
+                    [
+                        "--input",
+                        str(input_path),
+                        "--config",
+                        str(config_path),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 1)
+            self.assertIn(
+                f"No enriched collection found {input_path.parent} process your collection first with "
+                "python3 scripts/discogs_style_enricher.py",
+                stderr.getvalue(),
+            )
+
     def test_parse_args_defaults_to_playlist_report_path(self):
-        with patch.object(mapper, "readable_timestamp", return_value="2026-06-05_15-30-00"):
+        with patch("shared.reports.readable_timestamp", return_value="2026-06-05_15-30-00"):
             args = mapper.parse_args(["--input", "collection/enriched-collection.csv"])
 
         self.assertEqual(args.output, Path("collection/enriched-collection.csv"))

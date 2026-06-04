@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from helpers import read_csv_text
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIRECTORY = PROJECT_ROOT / "scripts"
@@ -36,10 +38,6 @@ from discogs_style_enricher import (  # noqa: E402
     update_missing_metadata,
     validate_discogs_export_fieldnames,
 )
-
-
-def read_csv_text(csv_text):
-    return list(csv.DictReader(io.StringIO(csv_text)))
 
 
 STANDARD_DISCOGS_HEADER = (
@@ -409,9 +407,9 @@ class ReportTests(unittest.TestCase):
             not_sure_release_ids=(),
             output_path=Path("collection/enriched-collection.csv"),
             report_path=Path("reports/report.txt"),
-            cache_path=Path("collection/processing.cache.json"),
+            cache_path=Path("collection/cache/processing.cache.json"),
             processed_export_path=None,
-            seen_terms_path=Path("collection/seen-discogs-terms.json"),
+            seen_terms_path=Path("collection/cache/collected.cache.json"),
             new_styles=("Acid Jazz", "Breaks"),
             new_genres=(),
             seen_terms_initialized=False,
@@ -426,15 +424,19 @@ class ReportTests(unittest.TestCase):
 
             report_text = report_path.read_text(encoding="utf-8")
 
-        self.assertIn("New Discogs terms since last seen-terms snapshot:", report_text)
+        self.assertIn("New Discogs terms since last seen-terms snapshot", report_text)
+        self.assertIn(
+            "Consider mapping useful new styles and genres in the playlist mapper config.",
+            report_text,
+        )
         self.assertIn("Styles:\n- Acid Jazz\n- Breaks", report_text)
         self.assertIn("Genres:\n- None", report_text)
         self.assertLess(
-            report_text.index("New Discogs terms since last seen-terms snapshot:"),
-            report_text.index("Items left blank / not sure:"),
+            report_text.index("New Discogs terms since last seen-terms snapshot"),
+            report_text.index("Items left blank / not sure"),
         )
 
-    def test_write_report_notes_initialized_seen_terms_snapshot(self):
+    def test_write_report_notes_initialized_seen_terms_snapshot_and_new_terms(self):
         summary = enricher.RunSummary(
             input_rows=1,
             master_rows_before=0,
@@ -449,11 +451,11 @@ class ReportTests(unittest.TestCase):
             not_sure_release_ids=(),
             output_path=Path("collection/enriched-collection.csv"),
             report_path=Path("reports/report.txt"),
-            cache_path=Path("collection/processing.cache.json"),
+            cache_path=Path("collection/cache/processing.cache.json"),
             processed_export_path=None,
-            seen_terms_path=Path("collection/seen-discogs-terms.json"),
-            new_styles=(),
-            new_genres=(),
+            seen_terms_path=Path("collection/cache/collected.cache.json"),
+            new_styles=("Deep House", "House"),
+            new_genres=("Electronic",),
             seen_terms_initialized=True,
             seen_styles_count=2,
             seen_genres_count=1,
@@ -466,10 +468,114 @@ class ReportTests(unittest.TestCase):
 
             report_text = report_path.read_text(encoding="utf-8")
 
-        self.assertIn("Seen terms snapshot:", report_text)
-        self.assertIn("- Initialized: collection/seen-discogs-terms.json", report_text)
+        self.assertIn("Seen terms snapshot", report_text)
+        self.assertIn("- Initialized: collection/cache/collected.cache.json", report_text)
         self.assertIn("- Styles tracked: 2", report_text)
         self.assertIn("- Genres tracked: 1", report_text)
+        self.assertIn("New Discogs terms since last seen-terms snapshot", report_text)
+        self.assertIn("Styles:\n- Deep House\n- House", report_text)
+        self.assertIn("Genres:\n- Electronic", report_text)
+
+    def test_write_report_groups_summary_files_terms_and_review_sections(self):
+        summary = enricher.RunSummary(
+            input_rows=1,
+            master_rows_before=0,
+            output_rows=1,
+            appended_rows=1,
+            filled_style_count=1,
+            filled_genre_count=1,
+            preserved_style_count=0,
+            preserved_genre_count=0,
+            blank_count=0,
+            error_count=0,
+            not_sure_release_ids=(),
+            output_path=Path("collection/enriched-collection.csv"),
+            report_path=Path("reports/report.txt"),
+            cache_path=Path("collection/cache/processing.cache.json"),
+            processed_export_path=None,
+            seen_terms_path=Path("collection/cache/collected.cache.json"),
+            new_styles=(),
+            new_genres=(),
+            seen_terms_initialized=False,
+            seen_styles_count=1,
+            seen_genres_count=1,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            report_path = Path(temporary_directory) / "report.txt"
+
+            enricher.write_report(report_path, summary, [])
+
+            report_lines = report_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(
+            report_lines[:24],
+            [
+                "Discogs style and genre enrichment report",
+                "=========================================",
+                "",
+                "Summary",
+                "-------",
+                "- Input export rows: 1",
+                "- Master rows before: 0",
+                "- Output rows: 1",
+                "- Appended rows: 1",
+                "- Filled missing styles: 1",
+                "- Filled missing genres: 1",
+                "- Preserved existing styles: 0",
+                "- Preserved existing genres: 0",
+                "- Left blank / not sure: 0",
+                "- Lookup errors: 0",
+                "",
+                "Files",
+                "-----",
+                "- Output: collection/enriched-collection.csv",
+                "- Cache: collection/cache/processing.cache.json",
+                "",
+                "Items left blank / not sure",
+                "---------------------------",
+                "- None",
+            ],
+        )
+        self.assertNotIn("New Discogs terms since last seen-terms snapshot", report_lines)
+        self.assertNotIn(
+            "Consider mapping useful new styles and genres in the playlist mapper config.",
+            report_lines,
+        )
+
+    def test_print_summary_omits_styles_and_genres_section_when_no_new_terms_were_found(self):
+        summary = enricher.RunSummary(
+            input_rows=1,
+            master_rows_before=0,
+            output_rows=1,
+            appended_rows=1,
+            filled_style_count=1,
+            filled_genre_count=1,
+            preserved_style_count=0,
+            preserved_genre_count=0,
+            blank_count=0,
+            error_count=0,
+            not_sure_release_ids=(),
+            output_path=Path("collection/enriched-collection.csv"),
+            report_path=Path("reports/report.txt"),
+            cache_path=Path("collection/cache/processing.cache.json"),
+            processed_export_path=None,
+            seen_terms_path=Path("collection/cache/collected.cache.json"),
+            new_styles=(),
+            new_genres=(),
+            seen_terms_initialized=False,
+            seen_styles_count=1,
+            seen_genres_count=1,
+        )
+
+        with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            enricher.print_summary(summary)
+
+        summary_text = stdout.getvalue()
+        self.assertIn("Seen terms: collection/cache/collected.cache.json", summary_text)
+        self.assertNotIn("## Styles and Genres", summary_text)
+        self.assertNotIn("New styles: 0", summary_text)
+        self.assertNotIn("New genres: 0", summary_text)
 
     def test_write_report_distinguishes_which_metadata_fields_are_missing(self):
         rows = [
@@ -515,7 +621,7 @@ class ReportTests(unittest.TestCase):
             not_sure_release_ids=("111", "222", "333"),
             output_path=Path("collection/enriched-collection.csv"),
             report_path=Path("reports/report.txt"),
-            cache_path=Path("collection/processing.cache.json"),
+            cache_path=Path("collection/cache/processing.cache.json"),
             processed_export_path=None,
         )
 
@@ -527,16 +633,27 @@ class ReportTests(unittest.TestCase):
             report_text = report_path.read_text(encoding="utf-8")
 
         self.assertIn(
-            "- 111: Style Only Artist - Style Only Title (missing: Style; style: no explicit styles found)",
+            "- Release ID: 111\n"
+            "  Artist: Style Only Artist\n"
+            "  Title: Style Only Title\n"
+            "  Missing: Style\n"
+            "  Notes: style: no explicit styles found",
             report_text,
         )
         self.assertIn(
-            "- 222: Genre Only Artist - Genre Only Title (missing: Genre; genre: no explicit genres found)",
+            "- Release ID: 222\n"
+            "  Artist: Genre Only Artist\n"
+            "  Title: Genre Only Title\n"
+            "  Missing: Genre\n"
+            "  Notes: genre: no explicit genres found",
             report_text,
         )
         self.assertIn(
-            "- 333: Both Missing Artist - Both Missing Title (missing: Style, Genre; "
-            "style: no explicit styles found; genre: no explicit genres found)",
+            "- Release ID: 333\n"
+            "  Artist: Both Missing Artist\n"
+            "  Title: Both Missing Title\n"
+            "  Missing: Style, Genre\n"
+            "  Notes: style: no explicit styles found; genre: no explicit genres found",
             report_text,
         )
 
@@ -559,9 +676,9 @@ class SeenTermsTests(unittest.TestCase):
         self.assertEqual(terms.styles, ("Acid Jazz", "Deep House", "House"))
         self.assertEqual(terms.genres, ("Electronic", "Funk / Soul"))
 
-    def test_missing_seen_terms_file_initializes_without_reporting_current_terms_as_new(self):
+    def test_missing_seen_terms_file_initializes_and_reports_current_terms_as_new(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            seen_terms_path = Path(temporary_directory) / "seen-discogs-terms.json"
+            seen_terms_path = Path(temporary_directory) / "collected.cache.json"
             current_terms = enricher.DiscogsTerms(
                 styles=("Deep House", "House"),
                 genres=("Electronic",),
@@ -572,8 +689,8 @@ class SeenTermsTests(unittest.TestCase):
             payload = json.loads(seen_terms_path.read_text(encoding="utf-8"))
 
         self.assertTrue(update.initialized)
-        self.assertEqual(update.new_styles, ())
-        self.assertEqual(update.new_genres, ())
+        self.assertEqual(update.new_styles, ("Deep House", "House"))
+        self.assertEqual(update.new_genres, ("Electronic",))
         self.assertEqual(payload["schema_version"], 1)
         self.assertEqual(payload["record_type"], "discogs_seen_terms")
         self.assertEqual(payload["styles"], ["Deep House", "House"])
@@ -581,7 +698,7 @@ class SeenTermsTests(unittest.TestCase):
 
     def test_existing_seen_terms_file_reports_only_newly_observed_styles(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            seen_terms_path = Path(temporary_directory) / "seen-discogs-terms.json"
+            seen_terms_path = Path(temporary_directory) / "collected.cache.json"
             seen_terms_path.write_text(
                 json.dumps(
                     {
@@ -611,7 +728,7 @@ class SeenTermsTests(unittest.TestCase):
 
     def test_existing_seen_terms_file_reports_only_newly_observed_genres(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            seen_terms_path = Path(temporary_directory) / "seen-discogs-terms.json"
+            seen_terms_path = Path(temporary_directory) / "collected.cache.json"
             seen_terms_path.write_text(
                 json.dumps(
                     {
@@ -640,7 +757,7 @@ class SeenTermsTests(unittest.TestCase):
 
     def test_malformed_seen_terms_file_fails_clearly(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            seen_terms_path = Path(temporary_directory) / "seen-discogs-terms.json"
+            seen_terms_path = Path(temporary_directory) / "collected.cache.json"
             seen_terms_path.write_text(
                 json.dumps(
                     {
@@ -897,7 +1014,7 @@ class RunEnrichmentTests(unittest.TestCase):
         self.assertEqual(args.export, default_export_path)
         self.assertEqual(args.report.parent, Path("reports"))
         self.assertRegex(args.report.name, r"^enriched-collection_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_report\.txt$")
-        self.assertEqual(args.seen_terms, Path("collection/seen-discogs-terms.json"))
+        self.assertEqual(args.seen_terms, Path("collection/cache/collected.cache.json"))
 
     def test_parse_args_uses_single_csv_from_input_folder_and_default_master(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -913,9 +1030,28 @@ class RunEnrichmentTests(unittest.TestCase):
             self.assertEqual(DEFAULT_MASTER_PATH, Path("collection/enriched-collection.csv"))
             self.assertEqual(args.master, DEFAULT_MASTER_PATH)
             self.assertEqual(args.output, DEFAULT_MASTER_PATH)
-            self.assertEqual(args.cache, Path("collection/processing.cache.json"))
+            self.assertEqual(args.cache, Path("collection/cache/processing.cache.json"))
+            self.assertEqual(args.seen_terms, Path("collection/cache/collected.cache.json"))
             self.assertEqual(args.max_workers, 3)
             self.assertTrue(args.move_processed_export)
+
+    def test_parse_args_puts_default_lookup_cache_in_cache_folder_beside_custom_output(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            export_path = directory / "discogs-export.csv"
+            output_path = directory / "nested" / "enriched.csv"
+            export_path.write_text(STANDARD_DISCOGS_HEADER, encoding="utf-8")
+
+            args = parse_args(
+                [
+                    "--export",
+                    str(export_path),
+                    "--output",
+                    str(output_path),
+                ]
+            )
+
+            self.assertEqual(args.cache, output_path.parent / "cache" / "processing.cache.json")
 
     def test_find_single_csv_export_rejects_multiple_csv_files(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -993,7 +1129,7 @@ class RunEnrichmentTests(unittest.TestCase):
                 timeout_seconds=1,
                 request_interval_seconds=0,
                 refresh_existing=False,
-                seen_terms=directory / "seen-discogs-terms.json",
+                seen_terms=directory / "collected.cache.json",
             )
 
             with patch.object(enricher, "make_http_json_getter", fake_json_getter):
@@ -1019,12 +1155,13 @@ class RunEnrichmentTests(unittest.TestCase):
             self.assertEqual(cache_payload["records"]["30887115"]["genre"]["status"], "filled")
             self.assertIn("Appended rows: 1", report_text)
             self.assertIn("Filled missing genres: 1", report_text)
-            self.assertIn("Seen terms snapshot:", report_text)
+            self.assertIn("Seen terms snapshot", report_text)
+            self.assertIn("New Discogs terms since last seen-terms snapshot", report_text)
             self.assertIn("Left blank / not sure: 0", report_text)
-            self.assertEqual(summary.seen_terms_path, directory / "seen-discogs-terms.json")
+            self.assertEqual(summary.seen_terms_path, directory / "collected.cache.json")
             self.assertTrue(summary.seen_terms_initialized)
-            self.assertEqual(summary.new_styles, ())
-            self.assertEqual(summary.new_genres, ())
+            self.assertEqual(summary.new_styles, ("Ambient", "Deep Techno", "House"))
+            self.assertEqual(summary.new_genres, ("Electronic",))
             self.assertNotIn("Seen Terms", output_fieldnames)
 
     def test_run_enrichment_moves_default_folder_export_after_success(self):
@@ -1067,7 +1204,7 @@ class RunEnrichmentTests(unittest.TestCase):
                 refresh_existing=False,
                 processed_dir=processed_directory,
                 move_processed_export=True,
-                seen_terms=directory / "seen-discogs-terms.json",
+                seen_terms=directory / "collected.cache.json",
             )
 
             with patch.object(enricher, "make_http_json_getter", fake_json_getter):
@@ -1119,7 +1256,7 @@ class RunEnrichmentTests(unittest.TestCase):
                     "--report",
                     str(report_path),
                     "--seen-terms",
-                    str(directory / "seen-discogs-terms.json"),
+                    str(directory / "collected.cache.json"),
                     "--no-progress",
                 ]
             )
@@ -1141,7 +1278,7 @@ class RunEnrichmentTests(unittest.TestCase):
             output_path = directory / "output.csv"
             report_path = directory / "report.txt"
             cache_path = directory / "cache.json"
-            seen_terms_path = directory / "seen-discogs-terms.json"
+            seen_terms_path = directory / "collected.cache.json"
             master_path.write_text(
                 "Catalog#,Artist,Title,Label,Format,Rating,Released,Style,Genre,release_id,CollectionFolder,Date Added,Collection Media Condition,Collection Sleeve Condition,Collection Notes\n"
                 "A1,Existing Artist,Existing Title,Existing Label,LP,5,2024,House,Electronic,111,Collection,2026-01-01,Near Mint,Near Mint,\n",
@@ -1189,7 +1326,7 @@ class RunEnrichmentTests(unittest.TestCase):
         self.assertNotIn("seen", output_text.lower())
         self.assertEqual(summary.new_styles, ("House",))
         self.assertEqual(summary.new_genres, ("Electronic",))
-        self.assertIn("New Discogs terms since last seen-terms snapshot:", report_text)
+        self.assertIn("New Discogs terms since last seen-terms snapshot", report_text)
 
     def test_run_enrichment_rejects_malformed_seen_terms_before_writing_output(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1199,7 +1336,7 @@ class RunEnrichmentTests(unittest.TestCase):
             output_path = directory / "output.csv"
             report_path = directory / "report.txt"
             cache_path = directory / "cache.json"
-            seen_terms_path = directory / "seen-discogs-terms.json"
+            seen_terms_path = directory / "collected.cache.json"
             master_path.write_text(
                 "Catalog#,Artist,Title,Label,Format,Rating,Released,Style,Genre,release_id,CollectionFolder,Date Added,Collection Media Condition,Collection Sleeve Condition,Collection Notes\n"
                 "A1,Existing Artist,Existing Title,Existing Label,LP,5,2024,House,Electronic,111,Collection,2026-01-01,Near Mint,Near Mint,\n",
@@ -1249,7 +1386,7 @@ class RunEnrichmentTests(unittest.TestCase):
             output_path = directory / "output.csv"
             report_path = directory / "report.txt"
             cache_path = directory / "cache.json"
-            seen_terms_path = directory / "seen-discogs-terms.json"
+            seen_terms_path = directory / "collected.cache.json"
             export_path.write_text(
                 STANDARD_DISCOGS_HEADER
                 + "B2,Cauê (6),Revelations,Freestyle Man,12\",5,2024,30887115,Collection,2026-06-04,Near Mint,Near Mint,\n",
@@ -1329,7 +1466,7 @@ class RunEnrichmentTests(unittest.TestCase):
                 refresh_existing=False,
                 processed_dir=processed_directory,
                 move_processed_export=True,
-                seen_terms=directory / "seen-discogs-terms.json",
+                seen_terms=directory / "collected.cache.json",
             )
 
             with patch.object(enricher, "make_http_json_getter", fake_json_getter):

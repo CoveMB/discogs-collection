@@ -6,27 +6,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from helpers import sample_playlist_config as sample_config, write_json
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIRECTORY = PROJECT_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 
 import discogs_playlist_config_printer as printer  # noqa: E402
-
-
-def write_json(path, payload):
-    path.write_text(json.dumps(payload), encoding="utf-8")
-
-
-def sample_config():
-    return {
-        "playlist_prefix": "Discogs - ",
-        "excluded_terms": ["Electronic", "Electro"],
-        "playlists": {
-            "Bossanova": ["Bossa Nova", "Bossanova"],
-            "Breakbeat": ["Breakbeat", "Breaks"],
-        },
-    }
 
 
 class PlaylistConfigPrinterTests(unittest.TestCase):
@@ -46,6 +33,7 @@ class PlaylistConfigPrinterTests(unittest.TestCase):
             self.assertIn("1. Split Style and Genre into comma-separated Discogs terms.", output)
             self.assertIn("4. Check Style aliases first.", output)
             self.assertIn("6. Use Genre aliases only when Style creates no playlist.", output)
+            self.assertIn("8. Allow the same raw term under multiple playlist labels.", output)
             self.assertIn("Playlist prefix: Discogs -", output)
             self.assertIn("Excluded raw Discogs terms:", output)
             self.assertIn("- Electronic", output)

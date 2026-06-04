@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from shared.discogs_columns import GENRE_COLUMN, RELEASE_ID_COLUMN, STYLE_COLUMN
 from shared.files import read_csv_file, write_csv_file
 from shared.playlist_config import (
     DEFAULT_CONFIG_PATH,
@@ -19,16 +20,17 @@ from shared.playlist_config import (
     normalize_playlist_config,
     normalize_term,
 )
-from shared.reports import readable_timestamp
+from shared.reports import (
+    format_report_section,
+    format_report_title,
+    timestamped_report_path,
+    write_text_report,
+)
 from shared.text import split_unique_comma_separated as split_discogs_terms
 
 
-STYLE_COLUMN = "Style"
-GENRE_COLUMN = "Genre"
-RELEASE_ID_COLUMN = "release_id"
 PLAYLISTS_COLUMN = "Playlists"
 DEFAULT_INPUT_PATH = Path("collection/enriched-collection.csv")
-DEFAULT_REPORT_DIRECTORY = Path("reports")
 
 
 @dataclass(frozen=True)
@@ -39,6 +41,7 @@ class PlaylistMappingSummary:
     output_path: Path
     config_path: Path
     report_path: Path
+    playlist_association_lines: tuple[str, ...] = ()
 
 
 def map_row_playlists(row: Mapping[str, str], config: PlaylistConfig) -> str:
@@ -57,17 +60,25 @@ def map_row_playlists(row: Mapping[str, str], config: PlaylistConfig) -> str:
 
 
 def map_terms_to_playlists(terms: Sequence[str], config: PlaylistConfig) -> tuple[str, ...]:
-    term_keys = {
-        normalize_term(term)
-        for term in terms
-        if normalize_term(term) and normalize_term(term) not in config.excluded_term_keys
-    }
+    term_keys = normalized_playlist_term_keys(terms, config.excluded_term_keys)
     playlist_names: list[str] = []
     for playlist_label in config.playlist_labels:
         alias_keys = config.alias_keys_by_label[playlist_label]
         if any(alias_key in term_keys for alias_key in alias_keys):
             playlist_names.append(f"{config.playlist_prefix}{playlist_label}")
     return tuple(playlist_names)
+
+
+def normalized_playlist_term_keys(
+    terms: Sequence[str],
+    excluded_term_keys: frozenset[str],
+) -> frozenset[str]:
+    term_keys: set[str] = set()
+    for term in terms:
+        term_key = normalize_term(term)
+        if term_key and term_key not in excluded_term_keys:
+            term_keys.add(term_key)
+    return frozenset(term_keys)
 
 
 def add_playlist_mappings(
@@ -104,7 +115,7 @@ def build_playlist_output_fieldnames(fieldnames: Sequence[str]) -> list[str]:
 
 
 def default_report_path(output_path: Path) -> Path:
-    return DEFAULT_REPORT_DIRECTORY / f"{output_path.stem}_{readable_timestamp()}_playlist_report.txt"
+    return timestamped_report_path(output_path, "playlist_report")
 
 
 def ensure_config_file(path: Path) -> None:
@@ -116,6 +127,16 @@ def ensure_config_file(path: Path) -> None:
         input("Fill the config, then press Enter to continue.")
     except EOFError as error:
         raise ValueError(f"created playlist map config at {path}; fill the playlist map config and rerun") from error
+
+
+def ensure_enriched_collection_exists(path: Path) -> None:
+    if path.exists():
+        return
+    collection_directory = path.parent
+    raise FileNotFoundError(
+        f"No enriched collection found {collection_directory} process your collection first with "
+        "python3 scripts/discogs_style_enricher.py"
+    )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -131,11 +152,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def run_playlist_mapping(args: argparse.Namespace) -> PlaylistMappingSummary:
+    ensure_enriched_collection_exists(args.input)
     ensure_config_file(args.config)
     config = load_playlist_config(args.config)
     rows, fieldnames = read_csv_file(args.input)
     output_fieldnames, output_rows = add_playlist_mappings(fieldnames, rows, config)
     write_csv_file(args.output, output_fieldnames, output_rows)
+    playlist_association_lines = tuple(format_playlist_association_section_lines(output_rows))
     summary = PlaylistMappingSummary(
         input_rows=len(rows),
         output_rows=len(output_rows),
@@ -143,6 +166,7 @@ def run_playlist_mapping(args: argparse.Namespace) -> PlaylistMappingSummary:
         output_path=args.output,
         config_path=args.config,
         report_path=args.report,
+        playlist_association_lines=playlist_association_lines,
     )
     write_report(args.report, summary, output_rows)
     return summary
@@ -153,29 +177,48 @@ def write_report(
     summary: PlaylistMappingSummary,
     rows: Sequence[Mapping[str, str]],
 ) -> None:
-    lines = [
-        "Discogs playlist mapping report",
-        f"Input rows: {summary.input_rows}",
-        f"Output rows: {summary.output_rows}",
-        f"Input: {summary.input_path}",
-        f"Output: {summary.output_path}",
-        f"Config: {summary.config_path}",
-        "",
-        "Release to playlist associations:",
+    lines = format_report_title("Discogs playlist mapping report")
+    summary_lines = [
+        f"- Input rows: {summary.input_rows}",
+        f"- Output rows: {summary.output_rows}",
     ]
-    lines.extend(format_playlist_association_line(index, row) for index, row in enumerate(rows, start=1))
-    lines.append("")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines), encoding="utf-8")
+    file_lines = [
+        f"- Input: {summary.input_path}",
+        f"- Output: {summary.output_path}",
+        f"- Config: {summary.config_path}",
+    ]
+    lines.extend(format_report_section("Summary", summary_lines))
+    lines.extend(format_report_section("Files", file_lines))
+    association_lines = summary.playlist_association_lines or tuple(format_playlist_association_section_lines(rows))
+    lines.extend(format_report_section("Release to playlist associations", association_lines))
+    write_text_report(path, lines)
 
 
-def format_playlist_association_line(row_number: int, row: Mapping[str, str]) -> str:
+def format_playlist_association_section_lines(rows: Sequence[Mapping[str, str]]) -> list[str]:
+    association_lines: list[str] = []
+    if rows:
+        for index, row in enumerate(rows, start=1):
+            if association_lines:
+                association_lines.append("")
+            association_lines.extend(format_playlist_association_lines(index, row))
+    else:
+        association_lines.append("- None")
+    return association_lines
+
+
+def format_playlist_association_lines(row_number: int, row: Mapping[str, str]) -> list[str]:
     release_id = str(row.get(RELEASE_ID_COLUMN, "") or "").strip()
-    release_label = release_id or f"row {row_number}"
+    release_label_name = "Release ID" if release_id else "Row"
+    release_label = release_id or str(row_number)
     artist = str(row.get("Artist", "") or "")
     title = str(row.get("Title", "") or "")
     playlists = str(row.get(PLAYLISTS_COLUMN, "") or "").strip() or "None"
-    return f"- {release_label}: {artist} - {title} -> {playlists}"
+    return [
+        f"- {release_label_name}: {release_label}",
+        f"  Artist: {artist}",
+        f"  Title: {title}",
+        f"  Playlists: {playlists}",
+    ]
 
 
 def print_summary(summary: PlaylistMappingSummary) -> None:
@@ -183,6 +226,9 @@ def print_summary(summary: PlaylistMappingSummary) -> None:
     print(f"Report: {summary.report_path}")
     print(f"Input rows: {summary.input_rows}")
     print(f"Output rows: {summary.output_rows}")
+    if summary.playlist_association_lines:
+        for line in format_report_section("Release to playlist associations", summary.playlist_association_lines):
+            print(line)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
