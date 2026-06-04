@@ -1147,6 +1147,7 @@ class RunEnrichmentTests(unittest.TestCase):
             self.assertEqual(output_rows[0]["Style"], "House")
             self.assertEqual(output_rows[1]["Style"], "Deep Techno, Ambient")
             self.assertEqual(output_rows[1]["Genre"], "Electronic")
+            self.assertEqual(output_fieldnames[0], "release_id")
             self.assertNotIn("Style Source", output_fieldnames)
             self.assertNotIn("Style Status", output_fieldnames)
             self.assertNotIn("Style Updated At", output_fieldnames)

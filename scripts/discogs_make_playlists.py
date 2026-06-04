@@ -103,7 +103,8 @@ def build_exporter_args(args: argparse.Namespace) -> list[str]:
 
 
 def run_step(label: str, step_main: StepMain, step_args: Sequence[str]) -> int:
-    print(f"Running {label}...")
+    print(f"\n------------------------------------")
+    print(f"\nRunning {label}...")
     exit_code = step_main(step_args)
     return 0 if exit_code is None else int(exit_code)
 

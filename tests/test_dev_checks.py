@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from scripts.dev_checks import check_text_content, is_checkable_text_path
+from scripts.dev_checks import check_text_content, check_text_paths, is_checkable_text_path
 
 
 class DevChecksTest(unittest.TestCase):
@@ -37,6 +37,24 @@ class DevChecksTest(unittest.TestCase):
         self.assertFalse(is_checkable_text_path("collection/enriched-collection.csv"))
         self.assertFalse(is_checkable_text_path("config/playlist-map.json"))
         self.assertFalse(is_checkable_text_path("reports/run_report.txt"))
+
+    def test_check_text_paths_checks_only_project_text_files(self):
+        contents_by_path = {
+            "README.md": b"clean line\n",
+            "scripts/dev_checks.py": b"bad line \n",
+            "collection/private.csv": b"ignored \n",
+            "image.png": b"\xff",
+        }
+
+        findings = check_text_paths(
+            list(contents_by_path),
+            lambda path: contents_by_path[path],
+        )
+
+        self.assertEqual(
+            [finding.format() for finding in findings],
+            ["scripts/dev_checks.py:1: trailing whitespace"],
+        )
 
 
 if __name__ == "__main__":

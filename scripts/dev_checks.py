@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
@@ -86,13 +87,45 @@ def staged_file_content(path: str) -> bytes:
     return process.stdout
 
 
-def check_staged_formatting(paths: list[str]) -> list[Finding]:
+def project_paths() -> list[str]:
+    process = subprocess.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if process.returncode != 0:
+        raise RuntimeError(process.stderr.decode("utf-8", errors="replace").strip())
+
+    return [
+        path_bytes.decode("utf-8", errors="surrogateescape")
+        for path_bytes in process.stdout.split(b"\0")
+        if path_bytes
+    ]
+
+
+def working_tree_file_content(path: str) -> bytes:
+    with open(path, "rb") as file:
+        return file.read()
+
+
+def check_text_paths(paths: list[str], read_content: Callable[[str], bytes]) -> list[Finding]:
     findings: list[Finding] = []
     for path in paths:
         if not is_checkable_text_path(path):
             continue
-        findings.extend(check_text_content(path, staged_file_content(path)))
+        findings.extend(check_text_content(path, read_content(path)))
     return findings
+
+
+def check_staged_formatting(paths: list[str]) -> list[Finding]:
+    return check_text_paths(paths, staged_file_content)
+
+
+def print_findings(findings: list[Finding]) -> None:
+    print("Formatting check failed:", file=sys.stderr)
+    for finding in findings:
+        print(f"  {finding.format()}", file=sys.stderr)
 
 
 def run_staged_checks() -> int:
@@ -100,18 +133,31 @@ def run_staged_checks() -> int:
     if not findings:
         return 0
 
-    print("Formatting check failed:", file=sys.stderr)
-    for finding in findings:
-        print(f"  {finding.format()}", file=sys.stderr)
+    print_findings(findings)
+    return 1
+
+
+def run_all_checks() -> int:
+    findings = check_text_paths(project_paths(), working_tree_file_content)
+    if not findings:
+        return 0
+
+    print_findings(findings)
     return 1
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run local development checks.")
-    parser.add_argument(
+    checks = parser.add_mutually_exclusive_group()
+    checks.add_argument(
         "--staged",
         action="store_true",
         help="check staged project text files for whitespace formatting issues",
+    )
+    checks.add_argument(
+        "--all",
+        action="store_true",
+        help="check project text files for whitespace formatting issues",
     )
     return parser.parse_args(argv)
 
@@ -124,8 +170,14 @@ def main(argv: list[str] | None = None) -> int:
         except RuntimeError as error:
             print(f"dev-checks: {error}", file=sys.stderr)
             return 1
+    if args.all:
+        try:
+            return run_all_checks()
+        except (OSError, RuntimeError) as error:
+            print(f"dev-checks: {error}", file=sys.stderr)
+            return 1
 
-    print("dev-checks: choose a check, for example --staged", file=sys.stderr)
+    print("dev-checks: choose a check, for example --staged or --all", file=sys.stderr)
     return 2
 
 

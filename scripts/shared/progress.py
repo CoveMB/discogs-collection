@@ -23,6 +23,8 @@ class ProgressReporter:
         self.started = False
         self.last_line_length = 0
 
+        print("\n")
+
     def stream_is_terminal(self) -> bool:
         is_terminal = getattr(self.stream, "isatty", None)
         return bool(is_terminal and is_terminal())
@@ -48,7 +50,7 @@ class ProgressReporter:
         self.started = False
         if not self.enabled:
             return
-        self.stream.write("\n\n")
+        self.stream.write("\n")
         self.stream.flush()
 
     def render(self) -> None:

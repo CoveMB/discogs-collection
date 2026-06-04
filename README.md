@@ -39,7 +39,8 @@ The script adds these columns when they are missing:
 
 The enrichment columns are kept together. If the CSV already has `Style`, the
 enrichment block is placed at that position. Otherwise the columns are added
-after `Released` when that column is present.
+after `Released` when that column is present. The output keeps `release_id` as
+the first column when that column exists.
 
 `Style` contains a comma-separated list of styles, for example:
 
@@ -119,6 +120,8 @@ python3 scripts/discogs_style_enricher.py \
    against the enriched master.
 8. When you want TuneMyMusic import files, run
    `python3 scripts/discogs_playlist_exporter.py` against that mapped master.
+9. Upload each generated playlist CSV to TuneMyMusic when you want to create the
+   actual streaming-service playlist.
 
 This workflow avoids redoing work. The enrichment script keeps a local JSON
 cache beside the output CSV, so later runs can reuse earlier release lookups.
@@ -202,10 +205,11 @@ expected fields, prints what each field is for, and waits for you to press Enter
 after filling it in. If stdin is not available, the mapper creates the config
 and stops so you can fill it in before running again.
 
-The mapper preserves existing rows, row order, and custom columns. If the CSV
-already has `Playlists`, that column is updated in place. Otherwise `Playlists`
-is inserted after `Genre` when present, after `Style` when only `Style` is
-present, or at the end as a fallback.
+The mapper preserves existing rows, row order, and custom columns. It writes
+`release_id` as the first column when that column exists. If the CSV already has
+`Playlists`, that column is updated in place. Otherwise `Playlists` is inserted
+after `Genre` when present, after `Style` when only `Style` is present, or at
+the end as a fallback.
 
 To inspect the playlist config without mapping any rows, run:
 
@@ -365,6 +369,47 @@ It stores parsed tracklist data by `release_id`, including empty tracklists and
 notes. It does not store raw Discogs API payloads. If the cache file has an
 unsupported schema, the exporter stops and asks you to delete the old cache or
 choose a new `--cache` path.
+
+## Creating playlists with TuneMyMusic
+
+The exporter only writes local CSV files. To create the actual playlist in
+Spotify, Apple Music, YouTube Music, TIDAL, or another destination service, use
+TuneMyMusic's web transfer flow:
+
+```text
+https://www.tunemymusic.com/transfer
+```
+
+TuneMyMusic's [public transfer docs](https://www.tunemymusic.com/features/transfer)
+list file upload as a supported source, with CSV among the supported file
+formats. They also say transfers match tracks from playlist data such as title,
+artist, album, and unique identifiers when present. The generated playlist CSV
+includes `Track Name`, `Artist Name`, and `Album Name`, plus the local
+`Release Id` audit column.
+
+Use this flow for each generated playlist CSV:
+
+1. Open `https://www.tunemymusic.com/transfer`.
+2. Choose `Upload file` as the source.
+3. Upload one file from `collection/playlists`, for example
+   `collection/playlists/Discogs - House.csv`.
+4. If TuneMyMusic shows a track review step, check that the track names and
+   artist names look right before continuing.
+5. Choose the destination music service and authorize TuneMyMusic for the
+   account where the playlist should be created.
+6. Choose whether to create a new playlist or add tracks to an existing one. For
+   a new playlist, use the generated CSV file name or the playlist label from
+   the `Playlists` column.
+7. Start the transfer.
+8. At the end, review TuneMyMusic's missing-track list. Download its missing
+   tracks CSV when available, then compare it with this tool's playlist export
+   report to decide which tracks need manual cleanup.
+
+Upload one generated CSV at a time when you want one streaming-service playlist
+per local playlist label. TuneMyMusic controls destination-service authorization,
+file-size limits, free-plan limits, matching behavior, and missing-track
+reporting, so check its [FAQ](https://www.tunemymusic.com/help?faq=1) or plan
+page if a large playlist is rejected or the site asks you to upgrade.
 
 ## How rows are merged
 
