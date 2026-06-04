@@ -9,23 +9,31 @@ values are filled from Discogs release metadata.
 from __future__ import annotations
 
 import argparse
-import csv
 import datetime as dt
 import email.utils
 import json
 import os
 import sys
-import tempfile
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TextIO
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+from shared.files import read_csv_file, write_csv_file, write_json_file
+from shared.reports import readable_timestamp
+from shared.text import (
+    is_string_list,
+    join_non_empty as join_notes,
+    sorted_stripped_unique_strings,
+    split_unique_comma_separated,
+    unique_stripped_strings,
+)
 
 
 STYLE_COLUMN = "Style"
@@ -44,9 +52,12 @@ DEFAULT_INPUT_DIRECTORY = Path("export")
 DEFAULT_PROCESSED_DIRECTORY = Path("processed")
 DEFAULT_REPORT_DIRECTORY = Path("reports")
 DEFAULT_USER_AGENT = "DiscogsStyleEnricher/1.0 +https://www.discogs.com"
+DEFAULT_SEEN_TERMS_PATH = DEFAULT_COLLECTION_DIRECTORY / "seen-discogs-terms.json"
 DISCOGS_API_ROOT = "https://api.discogs.com"
 LOOKUP_CACHE_SCHEMA_VERSION = 2
 LOOKUP_CACHE_RECORD_TYPE = "discogs_release_metadata"
+SEEN_TERMS_SCHEMA_VERSION = 1
+SEEN_TERMS_RECORD_TYPE = "discogs_seen_terms"
 ENRICHMENT_COLUMNS = (
     STYLE_COLUMN,
     GENRE_COLUMN,
@@ -123,6 +134,20 @@ class EnrichmentSummary:
 
 
 @dataclass(frozen=True)
+class DiscogsTerms:
+    styles: tuple[str, ...]
+    genres: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SeenTermsUpdate:
+    terms: DiscogsTerms
+    new_styles: tuple[str, ...]
+    new_genres: tuple[str, ...]
+    initialized: bool
+
+
+@dataclass(frozen=True)
 class RunSummary:
     input_rows: int
     master_rows_before: int
@@ -139,6 +164,12 @@ class RunSummary:
     report_path: Path
     cache_path: Path
     processed_export_path: Path | None
+    seen_terms_path: Path | None = None
+    new_styles: tuple[str, ...] = ()
+    new_genres: tuple[str, ...] = ()
+    seen_terms_initialized: bool = False
+    seen_styles_count: int = 0
+    seen_genres_count: int = 0
 
 
 class ProgressReporter:
@@ -333,12 +364,6 @@ def default_discogs_rate_limit(token: str) -> int:
     return DISCOGS_UNAUTHENTICATED_RATE_LIMIT
 
 
-def read_csv_file(path: Path) -> tuple[list[dict[str, str]], list[str]]:
-    with path.open(newline="", encoding="utf-8") as input_file:
-        reader = csv.DictReader(input_file)
-        return list(reader), list(reader.fieldnames or [])
-
-
 def validate_discogs_export_fieldnames(fieldnames: Sequence[str]) -> None:
     if not fieldnames:
         raise ValueError("export CSV is missing a header row")
@@ -382,23 +407,6 @@ def find_single_csv_export(input_directory: Path) -> Path:
             f"expected exactly one CSV export in {input_directory}, found {len(csv_paths)}: {csv_names}"
         )
     return csv_paths[0]
-
-
-def write_csv_file(path: Path, fieldnames: Sequence[str], rows: Sequence[Mapping[str, str]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w",
-        newline="",
-        encoding="utf-8",
-        dir=str(path.parent),
-        delete=False,
-    ) as temporary_file:
-        writer = csv.DictWriter(temporary_file, fieldnames=list(fieldnames), extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({field: row.get(field, "") for field in fieldnames})
-        temporary_path = Path(temporary_file.name)
-    temporary_path.replace(path)
 
 
 def ensure_processed_export_target_available(export_path: Path, processed_directory: Path) -> Path:
@@ -496,10 +504,103 @@ def merge_identity_fieldnames(
 def clean_discogs_values(values: object) -> tuple[str, ...]:
     if not isinstance(values, list):
         return ()
-    cleaned_values = tuple(
-        dict.fromkeys(str(value).strip() for value in values if str(value or "").strip())
+    return unique_stripped_strings(values)
+
+
+def split_discogs_terms(value: str) -> tuple[str, ...]:
+    return split_unique_comma_separated(value)
+
+
+def collect_discogs_terms(rows: Sequence[Mapping[str, str]]) -> DiscogsTerms:
+    styles: set[str] = set()
+    genres: set[str] = set()
+    for row in rows:
+        styles.update(split_discogs_terms(str(row.get(STYLE_COLUMN, "") or "")))
+        genres.update(split_discogs_terms(str(row.get(GENRE_COLUMN, "") or "")))
+    return DiscogsTerms(styles=tuple(sorted(styles)), genres=tuple(sorted(genres)))
+
+
+def load_seen_terms(path: Path) -> DiscogsTerms | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"unsupported seen terms file {path}: malformed JSON") from error
+
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("schema_version") != SEEN_TERMS_SCHEMA_VERSION
+        or payload.get("record_type") != SEEN_TERMS_RECORD_TYPE
+        or not is_string_list(payload.get("styles"))
+        or not is_string_list(payload.get("genres"))
+    ):
+        raise ValueError(
+            f"unsupported seen terms file {path}: expected schema_version {SEEN_TERMS_SCHEMA_VERSION} "
+            f"and record_type {SEEN_TERMS_RECORD_TYPE}"
+        )
+    return DiscogsTerms(
+        styles=normalize_seen_term_list(payload["styles"]),
+        genres=normalize_seen_term_list(payload["genres"]),
     )
-    return cleaned_values
+
+
+def normalize_seen_term_list(values: Sequence[str]) -> tuple[str, ...]:
+    return sorted_stripped_unique_strings(values)
+
+
+def save_seen_terms(path: Path, terms: DiscogsTerms) -> None:
+    write_json_file(
+        path,
+        {
+            "schema_version": SEEN_TERMS_SCHEMA_VERSION,
+            "record_type": SEEN_TERMS_RECORD_TYPE,
+            "styles": list(normalize_seen_term_list(terms.styles)),
+            "genres": list(normalize_seen_term_list(terms.genres)),
+        },
+    )
+
+
+def prepare_seen_terms_update(path: Path, current_terms: DiscogsTerms) -> SeenTermsUpdate:
+    return prepare_seen_terms_update_from_previous(load_seen_terms(path), current_terms)
+
+
+def prepare_seen_terms_update_from_previous(
+    previous_terms: DiscogsTerms | None,
+    current_terms: DiscogsTerms,
+) -> SeenTermsUpdate:
+    normalized_current_terms = DiscogsTerms(
+        styles=normalize_seen_term_list(current_terms.styles),
+        genres=normalize_seen_term_list(current_terms.genres),
+    )
+    if previous_terms is None:
+        return SeenTermsUpdate(
+            terms=normalized_current_terms,
+            new_styles=(),
+            new_genres=(),
+            initialized=True,
+        )
+
+    previous_styles = set(previous_terms.styles)
+    previous_genres = set(previous_terms.genres)
+    current_styles = set(normalized_current_terms.styles)
+    current_genres = set(normalized_current_terms.genres)
+    merged_terms = DiscogsTerms(
+        styles=tuple(sorted(previous_styles | current_styles)),
+        genres=tuple(sorted(previous_genres | current_genres)),
+    )
+    return SeenTermsUpdate(
+        terms=merged_terms,
+        new_styles=tuple(sorted(current_styles - previous_styles)),
+        new_genres=tuple(sorted(current_genres - previous_genres)),
+        initialized=False,
+    )
+
+
+def update_seen_terms(path: Path, current_terms: DiscogsTerms) -> SeenTermsUpdate:
+    update = prepare_seen_terms_update(path, current_terms)
+    save_seen_terms(path, update.terms)
+    return update
 
 
 def parse_styles_from_api_payload(payload: Mapping[str, object] | None) -> tuple[str, ...]:
@@ -618,10 +719,6 @@ def fetch_json_or_note(
 
 def format_source_failure(source_name: str, error: Exception) -> str:
     return f"{source_name} failed: {type(error).__name__}: {error}"
-
-
-def join_notes(notes: Iterable[str]) -> str:
-    return "; ".join(note for note in notes if note)
 
 
 def update_missing_metadata(
@@ -1040,6 +1137,8 @@ def run_enrichment(args: argparse.Namespace) -> RunSummary:
     processed_directory = getattr(args, "processed_dir", DEFAULT_PROCESSED_DIRECTORY)
     if move_processed_export_enabled:
         ensure_processed_export_target_available(args.export, processed_directory)
+    seen_terms_path = getattr(args, "seen_terms", DEFAULT_SEEN_TERMS_PATH)
+    previous_seen_terms = load_seen_terms(seen_terms_path) if seen_terms_path else None
 
     if args.master.exists():
         master_rows, master_fieldnames = read_csv_file(args.master)
@@ -1072,7 +1171,15 @@ def run_enrichment(args: argparse.Namespace) -> RunSummary:
         progress=ProgressReporter() if getattr(args, "progress", False) else None,
         max_workers=getattr(args, "max_workers", DEFAULT_MAX_WORKERS),
     )
+    seen_terms_update: SeenTermsUpdate | None = None
+    if seen_terms_path:
+        seen_terms_update = prepare_seen_terms_update_from_previous(
+            previous_seen_terms,
+            collect_discogs_terms(merged_rows),
+        )
     write_csv_file(args.output, output_fieldnames, merged_rows)
+    if seen_terms_path and seen_terms_update:
+        save_seen_terms(seen_terms_path, seen_terms_update.terms)
     run_summary = RunSummary(
         input_rows=len(export_rows),
         master_rows_before=len(master_rows),
@@ -1089,6 +1196,12 @@ def run_enrichment(args: argparse.Namespace) -> RunSummary:
         report_path=args.report,
         cache_path=args.cache,
         processed_export_path=None,
+        seen_terms_path=seen_terms_path,
+        new_styles=seen_terms_update.new_styles if seen_terms_update else (),
+        new_genres=seen_terms_update.new_genres if seen_terms_update else (),
+        seen_terms_initialized=seen_terms_update.initialized if seen_terms_update else False,
+        seen_styles_count=len(seen_terms_update.terms.styles) if seen_terms_update else 0,
+        seen_genres_count=len(seen_terms_update.terms.genres) if seen_terms_update else 0,
     )
     write_report(args.report, run_summary, merged_rows)
     if move_processed_export_enabled and run_summary.error_count == 0:
@@ -1099,10 +1212,6 @@ def run_enrichment(args: argparse.Namespace) -> RunSummary:
 
 def utc_timestamp() -> str:
     return dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def readable_timestamp() -> str:
-    return dt.datetime.now().replace(microsecond=0).strftime("%Y-%m-%d_%H-%M-%S")
 
 
 def default_report_path(output_path: Path) -> Path:
@@ -1129,9 +1238,9 @@ def write_report(path: Path, summary: RunSummary, rows: Sequence[Mapping[str, st
         f"Lookup errors: {summary.error_count}",
         f"Output: {summary.output_path}",
         f"Cache: {summary.cache_path}",
-        "",
-        "Items left blank / not sure:",
     ]
+    lines.extend(format_seen_terms_report_section(summary))
+    lines.extend(["", "Items left blank / not sure:"])
     if summary.not_sure_release_ids:
         lines.extend(format_not_sure_line(release_id, rows_by_release_id.get(release_id, {})) for release_id in summary.not_sure_release_ids)
     else:
@@ -1139,6 +1248,33 @@ def write_report(path: Path, summary: RunSummary, rows: Sequence[Mapping[str, st
     lines.append("")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def format_seen_terms_report_section(summary: RunSummary) -> list[str]:
+    if not summary.seen_terms_path:
+        return []
+    if summary.seen_terms_initialized:
+        return [
+            "",
+            "Seen terms snapshot:",
+            f"- Initialized: {summary.seen_terms_path}",
+            f"- Styles tracked: {summary.seen_styles_count}",
+            f"- Genres tracked: {summary.seen_genres_count}",
+        ]
+    return [
+        "",
+        "New Discogs terms since last seen-terms snapshot:",
+        "Styles:",
+        *format_term_bullets(summary.new_styles),
+        "Genres:",
+        *format_term_bullets(summary.new_genres),
+    ]
+
+
+def format_term_bullets(terms: Sequence[str]) -> list[str]:
+    if not terms:
+        return ["- None"]
+    return [f"- {term}" for term in terms]
 
 
 def format_not_sure_line(release_id: str, row: Mapping[str, str]) -> str:
@@ -1181,6 +1317,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, help="Output enriched master CSV. Defaults to --master.")
     parser.add_argument("--report", type=Path, help="Text report path. Defaults to reports/<output-name>_<timestamp>_report.txt.")
     parser.add_argument("--cache", type=Path, help="Lookup cache JSON path. Defaults to processing.cache.json beside output CSV.")
+    parser.add_argument("--seen-terms", type=Path, default=DEFAULT_SEEN_TERMS_PATH, help="Seen Discogs terms JSON path. Defaults to collection/seen-discogs-terms.json.")
+    parser.add_argument("--no-seen-terms", action="store_true", help="Disable seen Discogs terms tracking for this run.")
     parser.add_argument("--discogs-token", default=os.environ.get("DISCOGS_TOKEN", ""), help="Optional Discogs personal access token. Defaults to DISCOGS_TOKEN.")
     parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT, help="User-Agent sent to Discogs.")
     parser.add_argument("--timeout-seconds", type=int, default=30, help="HTTP timeout per request.")
@@ -1198,6 +1336,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parsed_args.output = parsed_args.output or parsed_args.master
     parsed_args.report = parsed_args.report or default_report_path(parsed_args.output)
     parsed_args.cache = parsed_args.cache or default_cache_path(parsed_args.output)
+    if parsed_args.no_seen_terms:
+        parsed_args.seen_terms = None
     return parsed_args
 
 
@@ -1205,6 +1345,8 @@ def print_summary(summary: RunSummary) -> None:
     print(f"Output: {summary.output_path}")
     print(f"Report: {summary.report_path}")
     print(f"Cache: {summary.cache_path}")
+    if summary.seen_terms_path:
+        print(f"Seen terms: {summary.seen_terms_path}")
     if summary.processed_export_path:
         print(f"Processed export: {summary.processed_export_path}")
     print(f"Input export rows: {summary.input_rows}")
@@ -1217,6 +1359,9 @@ def print_summary(summary: RunSummary) -> None:
     print(f"Preserved existing genres: {summary.preserved_genre_count}")
     print(f"Left blank / not sure: {summary.blank_count}")
     print(f"Lookup errors: {summary.error_count}")
+    if summary.seen_terms_path:
+        print(f"New styles: {len(summary.new_styles)}")
+        print(f"New genres: {len(summary.new_genres)}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

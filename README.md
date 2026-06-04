@@ -91,7 +91,10 @@ python3 scripts/discogs_style_enricher.py \
 2. Put that CSV in `export`. Leave exactly one CSV in that folder.
 3. Run `python3 scripts/discogs_style_enricher.py`.
 4. Open the generated report and check rows listed as blank, not sure, or error.
-5. Keep `collection/enriched-collection.csv` as your master for the next run.
+5. Review any new Discogs style or genre terms listed in the report.
+6. Keep `collection/enriched-collection.csv` as your master for the next run.
+7. When you want playlist labels, run `python3 scripts/discogs_playlist_mapper.py`
+   against the enriched master.
 
 This workflow avoids redoing work. The script keeps a local JSON cache beside the
 output CSV, so later runs can reuse earlier release lookups.
@@ -99,6 +102,93 @@ output CSV, so later runs can reuse earlier release lookups.
 The `export` folder may contain non-CSV files, but it must contain exactly one
 CSV. If it contains zero CSV files or more than one CSV file, the script stops
 before doing any lookups.
+
+## Playlist mapper
+
+`scripts/discogs_playlist_mapper.py` is a separate local step. It reads an
+enriched master CSV, reads a curated playlist map JSON, and adds or updates a
+`Playlists` column. It does not call Spotify and it does not change raw
+Discogs `Style` or `Genre` values.
+
+Run it after enrichment:
+
+```bash
+python3 scripts/discogs_playlist_mapper.py
+```
+
+By default it uses:
+
+```text
+--input collection/enriched-collection.csv
+--output collection/enriched-collection.csv
+--config config/playlist-map.json
+```
+
+The mapper also writes a report by default:
+
+```text
+reports/<output-name>_<YYYY-MM-DD_HH-MM-SS>_playlist_report.txt
+```
+
+The report lists every row by `release_id`, artist, and title, followed by the
+playlist names written for that row. Rows with no mapped playlist are listed as
+`None`.
+
+If the config file does not exist, the mapper creates an empty config with the
+expected fields, prints what each field is for, and waits for you to press Enter
+after filling it in. If stdin is not available, the mapper creates the config
+and stops so you can fill it in before running again.
+
+To inspect the playlist config without mapping any rows, run:
+
+```bash
+python3 scripts/discogs_playlist_config_printer.py
+```
+
+The printer uses `config/playlist-map.json` by default. If the file is missing,
+it creates a blank config and prints it. It does not read or write the collection
+CSV.
+
+The config shape is:
+
+```json
+{
+  "playlist_prefix": "Discogs - ",
+  "excluded_terms": ["Electronic", "Electro"],
+  "playlists": {
+    "Bossanova": ["Bossa Nova", "Bossanova"],
+    "Breakbeat": ["Breakbeat", "Breaks"],
+    "House": ["House", "Deep House", "Acid House"]
+  }
+}
+```
+
+`playlist_prefix` is prepended to each output playlist name. With the config
+above, `House` becomes `Discogs - House`.
+
+`excluded_terms` are cleanup rules for raw Discogs terms that should never create
+playlist labels. They are exact term rules with case-insensitive matching.
+
+`playlists` maps each canonical playlist label to the raw Discogs style or genre
+aliases that should create that playlist. The canonical label casing is kept in
+the output.
+
+Mapping rules:
+
+- `Style` and `Genre` are parsed as comma-separated term lists.
+- Matching is case-insensitive and trims whitespace.
+- `Style` is checked first.
+- If `Style` creates one or more playlists, `Genre` is ignored for that row.
+- If `Style` creates no playlist, `Genre` is used as the fallback.
+- One row can receive multiple playlists.
+- Duplicate source terms do not duplicate playlist names.
+- Playlist order follows the order of `playlists` in the config.
+- Rows with no matching term get a blank `Playlists` value.
+
+The mapper validates the config before writing output. It rejects malformed JSON,
+missing or invalid `playlists`, invalid `excluded_terms`, aliases used by more
+than one playlist, and aliases that appear in both `excluded_terms` and
+`playlists`.
 
 ## How rows are merged
 
@@ -230,6 +320,69 @@ The report summarizes the run:
 - release IDs left blank or not sure, with artist, title, which metadata fields
   are missing, and style or genre notes when present
 
+## Seen Discogs terms
+
+The enrichment script also keeps a local seen-terms sidecar file:
+
+```text
+collection/seen-discogs-terms.json
+```
+
+This file records raw Discogs style and genre terms that have already appeared in
+your enriched master. It is a term registry, not playlist config. It does not
+store release IDs, collection history, playlist labels, or rules.
+
+The default schema is:
+
+```json
+{
+  "schema_version": 1,
+  "record_type": "discogs_seen_terms",
+  "styles": ["Deep House", "Disco", "House"],
+  "genres": ["Electronic", "Funk / Soul"]
+}
+```
+
+After each enrichment run, the script collects comma-separated terms from the
+current output rows, compares them with the seen-terms file, writes newly seen
+styles and genres into the report, then updates the file with the union of old
+and current terms. Stored terms are sorted alphabetically so diffs stay stable.
+
+On the first run, if the seen-terms file does not exist, the script creates it
+from the current output terms and reports that the snapshot was initialized. It
+does not list every current term as new on that first initialization.
+
+If the seen-terms file exists but is malformed, the script fails clearly before
+writing the enriched CSV or updating the sidecar. It does not reset the file.
+
+Report examples:
+
+```text
+New Discogs terms since last seen-terms snapshot:
+Styles:
+- Acid Jazz
+- Breaks
+Genres:
+- None
+```
+
+or, on first initialization:
+
+```text
+Seen terms snapshot:
+- Initialized: collection/seen-discogs-terms.json
+- Styles tracked: 42
+- Genres tracked: 8
+```
+
+Use `--seen-terms PATH` to store this sidecar somewhere else. Use
+`--no-seen-terms` for a run that should not read or update the sidecar.
+
+New terms in the enrichment report are review prompts. Add a term to
+`config/playlist-map.json` only when you want that raw Discogs term to create a
+playlist label. Leaving a term only in `seen-discogs-terms.json` just prevents
+repeated alerts for a term you have already reviewed.
+
 ## Refreshing existing metadata
 
 By default, existing `Style` and `Genre` values are treated as user-approved data
@@ -284,6 +437,12 @@ script could not find explicit style or genre data and chose not to guess.
 --cache PATH
     Lookup cache JSON path. Defaults to processing.cache.json beside the output CSV.
 
+--seen-terms PATH
+    Seen Discogs terms JSON path. Defaults to collection/seen-discogs-terms.json.
+
+--no-seen-terms
+    Disable seen Discogs terms tracking for this run.
+
 --discogs-token TOKEN
     Optional Discogs personal access token. Defaults to DISCOGS_TOKEN.
 
@@ -305,6 +464,30 @@ script could not find explicit style or genre data and chose not to guess.
 
 --no-progress
     Disable the interactive terminal progress bar.
+```
+
+Playlist mapper options:
+
+```text
+--input PATH
+    Enriched Discogs master CSV. Defaults to collection/enriched-collection.csv.
+
+--output PATH
+    Output CSV. Defaults to --input.
+
+--config PATH
+    Playlist map JSON. Defaults to config/playlist-map.json.
+
+--report PATH
+    Text report path. Defaults to
+    reports/<output-name>_<timestamp>_playlist_report.txt.
+```
+
+Playlist config printer options:
+
+```text
+--config PATH
+    Playlist map JSON. Defaults to config/playlist-map.json.
 ```
 
 ## Requirements

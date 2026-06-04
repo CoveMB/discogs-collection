@@ -394,6 +394,83 @@ class ProgressReporterTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
+    def test_write_report_lists_new_discogs_terms_before_not_sure_rows(self):
+        summary = enricher.RunSummary(
+            input_rows=1,
+            master_rows_before=0,
+            output_rows=1,
+            appended_rows=1,
+            filled_style_count=0,
+            filled_genre_count=0,
+            preserved_style_count=1,
+            preserved_genre_count=1,
+            blank_count=0,
+            error_count=0,
+            not_sure_release_ids=(),
+            output_path=Path("collection/enriched-collection.csv"),
+            report_path=Path("reports/report.txt"),
+            cache_path=Path("collection/processing.cache.json"),
+            processed_export_path=None,
+            seen_terms_path=Path("collection/seen-discogs-terms.json"),
+            new_styles=("Acid Jazz", "Breaks"),
+            new_genres=(),
+            seen_terms_initialized=False,
+            seen_styles_count=3,
+            seen_genres_count=1,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            report_path = Path(temporary_directory) / "report.txt"
+
+            enricher.write_report(report_path, summary, [])
+
+            report_text = report_path.read_text(encoding="utf-8")
+
+        self.assertIn("New Discogs terms since last seen-terms snapshot:", report_text)
+        self.assertIn("Styles:\n- Acid Jazz\n- Breaks", report_text)
+        self.assertIn("Genres:\n- None", report_text)
+        self.assertLess(
+            report_text.index("New Discogs terms since last seen-terms snapshot:"),
+            report_text.index("Items left blank / not sure:"),
+        )
+
+    def test_write_report_notes_initialized_seen_terms_snapshot(self):
+        summary = enricher.RunSummary(
+            input_rows=1,
+            master_rows_before=0,
+            output_rows=1,
+            appended_rows=1,
+            filled_style_count=0,
+            filled_genre_count=0,
+            preserved_style_count=1,
+            preserved_genre_count=1,
+            blank_count=0,
+            error_count=0,
+            not_sure_release_ids=(),
+            output_path=Path("collection/enriched-collection.csv"),
+            report_path=Path("reports/report.txt"),
+            cache_path=Path("collection/processing.cache.json"),
+            processed_export_path=None,
+            seen_terms_path=Path("collection/seen-discogs-terms.json"),
+            new_styles=(),
+            new_genres=(),
+            seen_terms_initialized=True,
+            seen_styles_count=2,
+            seen_genres_count=1,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            report_path = Path(temporary_directory) / "report.txt"
+
+            enricher.write_report(report_path, summary, [])
+
+            report_text = report_path.read_text(encoding="utf-8")
+
+        self.assertIn("Seen terms snapshot:", report_text)
+        self.assertIn("- Initialized: collection/seen-discogs-terms.json", report_text)
+        self.assertIn("- Styles tracked: 2", report_text)
+        self.assertIn("- Genres tracked: 1", report_text)
+
     def test_write_report_distinguishes_which_metadata_fields_are_missing(self):
         rows = [
             {
@@ -462,6 +539,125 @@ class ReportTests(unittest.TestCase):
             "style: no explicit styles found; genre: no explicit genres found)",
             report_text,
         )
+
+
+class SeenTermsTests(unittest.TestCase):
+    def test_split_discogs_terms_trims_and_deduplicates_comma_separated_values(self):
+        self.assertEqual(
+            enricher.split_discogs_terms(" House, , Deep House, House "),
+            ("House", "Deep House"),
+        )
+
+    def test_collect_discogs_terms_reads_trimmed_unique_styles_and_genres(self):
+        rows = [
+            {"Style": "House, Deep House, House", "Genre": "Electronic"},
+            {"Style": "Acid Jazz", "Genre": "Electronic, Funk / Soul"},
+        ]
+
+        terms = enricher.collect_discogs_terms(rows)
+
+        self.assertEqual(terms.styles, ("Acid Jazz", "Deep House", "House"))
+        self.assertEqual(terms.genres, ("Electronic", "Funk / Soul"))
+
+    def test_missing_seen_terms_file_initializes_without_reporting_current_terms_as_new(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            seen_terms_path = Path(temporary_directory) / "seen-discogs-terms.json"
+            current_terms = enricher.DiscogsTerms(
+                styles=("Deep House", "House"),
+                genres=("Electronic",),
+            )
+
+            update = enricher.update_seen_terms(seen_terms_path, current_terms)
+
+            payload = json.loads(seen_terms_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(update.initialized)
+        self.assertEqual(update.new_styles, ())
+        self.assertEqual(update.new_genres, ())
+        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["record_type"], "discogs_seen_terms")
+        self.assertEqual(payload["styles"], ["Deep House", "House"])
+        self.assertEqual(payload["genres"], ["Electronic"])
+
+    def test_existing_seen_terms_file_reports_only_newly_observed_styles(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            seen_terms_path = Path(temporary_directory) / "seen-discogs-terms.json"
+            seen_terms_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "record_type": "discogs_seen_terms",
+                        "styles": ["House"],
+                        "genres": ["Electronic"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            update = enricher.update_seen_terms(
+                seen_terms_path,
+                enricher.DiscogsTerms(
+                    styles=("House", "Acid Jazz", "House"),
+                    genres=("Electronic",),
+                ),
+            )
+            payload = json.loads(seen_terms_path.read_text(encoding="utf-8"))
+
+        self.assertFalse(update.initialized)
+        self.assertEqual(update.new_styles, ("Acid Jazz",))
+        self.assertEqual(update.new_genres, ())
+        self.assertEqual(payload["styles"], ["Acid Jazz", "House"])
+        self.assertEqual(payload["genres"], ["Electronic"])
+
+    def test_existing_seen_terms_file_reports_only_newly_observed_genres(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            seen_terms_path = Path(temporary_directory) / "seen-discogs-terms.json"
+            seen_terms_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "record_type": "discogs_seen_terms",
+                        "styles": ["House"],
+                        "genres": ["Electronic"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            update = enricher.update_seen_terms(
+                seen_terms_path,
+                enricher.DiscogsTerms(
+                    styles=("House",),
+                    genres=("Electronic", "Funk / Soul"),
+                ),
+            )
+            payload = json.loads(seen_terms_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(update.new_styles, ())
+        self.assertEqual(update.new_genres, ("Funk / Soul",))
+        self.assertEqual(payload["styles"], ["House"])
+        self.assertEqual(payload["genres"], ["Electronic", "Funk / Soul"])
+
+    def test_malformed_seen_terms_file_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            seen_terms_path = Path(temporary_directory) / "seen-discogs-terms.json"
+            seen_terms_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "record_type": "discogs_seen_terms",
+                        "styles": "House",
+                        "genres": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "unsupported seen terms file"):
+                enricher.update_seen_terms(
+                    seen_terms_path,
+                    enricher.DiscogsTerms(styles=("House",), genres=()),
+                )
 
 
 class LookupTests(unittest.TestCase):
@@ -701,6 +897,7 @@ class RunEnrichmentTests(unittest.TestCase):
         self.assertEqual(args.export, default_export_path)
         self.assertEqual(args.report.parent, Path("reports"))
         self.assertRegex(args.report.name, r"^enriched-collection_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_report\.txt$")
+        self.assertEqual(args.seen_terms, Path("collection/seen-discogs-terms.json"))
 
     def test_parse_args_uses_single_csv_from_input_folder_and_default_master(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -796,6 +993,7 @@ class RunEnrichmentTests(unittest.TestCase):
                 timeout_seconds=1,
                 request_interval_seconds=0,
                 refresh_existing=False,
+                seen_terms=directory / "seen-discogs-terms.json",
             )
 
             with patch.object(enricher, "make_http_json_getter", fake_json_getter):
@@ -821,7 +1019,13 @@ class RunEnrichmentTests(unittest.TestCase):
             self.assertEqual(cache_payload["records"]["30887115"]["genre"]["status"], "filled")
             self.assertIn("Appended rows: 1", report_text)
             self.assertIn("Filled missing genres: 1", report_text)
+            self.assertIn("Seen terms snapshot:", report_text)
             self.assertIn("Left blank / not sure: 0", report_text)
+            self.assertEqual(summary.seen_terms_path, directory / "seen-discogs-terms.json")
+            self.assertTrue(summary.seen_terms_initialized)
+            self.assertEqual(summary.new_styles, ())
+            self.assertEqual(summary.new_genres, ())
+            self.assertNotIn("Seen Terms", output_fieldnames)
 
     def test_run_enrichment_moves_default_folder_export_after_success(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -863,6 +1067,7 @@ class RunEnrichmentTests(unittest.TestCase):
                 refresh_existing=False,
                 processed_dir=processed_directory,
                 move_processed_export=True,
+                seen_terms=directory / "seen-discogs-terms.json",
             )
 
             with patch.object(enricher, "make_http_json_getter", fake_json_getter):
@@ -913,6 +1118,8 @@ class RunEnrichmentTests(unittest.TestCase):
                     str(cache_path),
                     "--report",
                     str(report_path),
+                    "--seen-terms",
+                    str(directory / "seen-discogs-terms.json"),
                     "--no-progress",
                 ]
             )
@@ -925,6 +1132,168 @@ class RunEnrichmentTests(unittest.TestCase):
             self.assertFalse(export_path.exists())
             self.assertTrue(processed_path.exists())
             self.assertEqual(summary.processed_export_path, processed_path)
+
+    def test_run_enrichment_reports_new_seen_terms_without_changing_csv_output(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            master_path = directory / "master.csv"
+            export_path = directory / "export.csv"
+            output_path = directory / "output.csv"
+            report_path = directory / "report.txt"
+            cache_path = directory / "cache.json"
+            seen_terms_path = directory / "seen-discogs-terms.json"
+            master_path.write_text(
+                "Catalog#,Artist,Title,Label,Format,Rating,Released,Style,Genre,release_id,CollectionFolder,Date Added,Collection Media Condition,Collection Sleeve Condition,Collection Notes\n"
+                "A1,Existing Artist,Existing Title,Existing Label,LP,5,2024,House,Electronic,111,Collection,2026-01-01,Near Mint,Near Mint,\n",
+                encoding="utf-8",
+            )
+            export_path.write_text(
+                STANDARD_DISCOGS_HEADER
+                + "A1,Existing Artist,Existing Title,Existing Label,LP,5,2024,111,Collection,2026-01-01,Near Mint,Near Mint,\n",
+                encoding="utf-8",
+            )
+            seen_terms_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "record_type": "discogs_seen_terms",
+                        "styles": [],
+                        "genres": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            args = argparse.Namespace(
+                export=export_path,
+                master=master_path,
+                output=output_path,
+                report=report_path,
+                cache=cache_path,
+                user_agent="test",
+                discogs_token="",
+                timeout_seconds=1,
+                request_interval_seconds=0,
+                refresh_existing=False,
+                seen_terms=seen_terms_path,
+            )
+
+            summary = run_enrichment(args)
+
+            output_text = output_path.read_text(encoding="utf-8")
+            output_rows = read_csv_text(output_text)
+            report_text = report_path.read_text(encoding="utf-8")
+
+        self.assertEqual(output_rows[0]["Style"], "House")
+        self.assertEqual(output_rows[0]["Genre"], "Electronic")
+        self.assertNotIn("seen", output_text.lower())
+        self.assertEqual(summary.new_styles, ("House",))
+        self.assertEqual(summary.new_genres, ("Electronic",))
+        self.assertIn("New Discogs terms since last seen-terms snapshot:", report_text)
+
+    def test_run_enrichment_rejects_malformed_seen_terms_before_writing_output(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            master_path = directory / "master.csv"
+            export_path = directory / "export.csv"
+            output_path = directory / "output.csv"
+            report_path = directory / "report.txt"
+            cache_path = directory / "cache.json"
+            seen_terms_path = directory / "seen-discogs-terms.json"
+            master_path.write_text(
+                "Catalog#,Artist,Title,Label,Format,Rating,Released,Style,Genre,release_id,CollectionFolder,Date Added,Collection Media Condition,Collection Sleeve Condition,Collection Notes\n"
+                "A1,Existing Artist,Existing Title,Existing Label,LP,5,2024,House,Electronic,111,Collection,2026-01-01,Near Mint,Near Mint,\n",
+                encoding="utf-8",
+            )
+            export_path.write_text(
+                STANDARD_DISCOGS_HEADER
+                + "A1,Existing Artist,Existing Title,Existing Label,LP,5,2024,111,Collection,2026-01-01,Near Mint,Near Mint,\n",
+                encoding="utf-8",
+            )
+            output_path.write_text("sentinel\n", encoding="utf-8")
+            seen_terms_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "record_type": "discogs_seen_terms",
+                        "styles": "House",
+                        "genres": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                export=export_path,
+                master=master_path,
+                output=output_path,
+                report=report_path,
+                cache=cache_path,
+                user_agent="test",
+                discogs_token="",
+                timeout_seconds=1,
+                request_interval_seconds=0,
+                refresh_existing=False,
+                seen_terms=seen_terms_path,
+            )
+
+            with self.assertRaisesRegex(ValueError, "unsupported seen terms file"):
+                run_enrichment(args)
+
+            self.assertEqual(output_path.read_text(encoding="utf-8"), "sentinel\n")
+            self.assertFalse(report_path.exists())
+
+    def test_run_enrichment_rejects_malformed_seen_terms_before_lookup_or_cache_write(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            export_path = directory / "export.csv"
+            output_path = directory / "output.csv"
+            report_path = directory / "report.txt"
+            cache_path = directory / "cache.json"
+            seen_terms_path = directory / "seen-discogs-terms.json"
+            export_path.write_text(
+                STANDARD_DISCOGS_HEADER
+                + "B2,Cauê (6),Revelations,Freestyle Man,12\",5,2024,30887115,Collection,2026-06-04,Near Mint,Near Mint,\n",
+                encoding="utf-8",
+            )
+            seen_terms_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "record_type": "discogs_seen_terms",
+                        "styles": "House",
+                        "genres": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def fake_json_getter(_user_agent, _token, _timeout_seconds, _request_interval_seconds=0):
+                def get_json(_url):
+                    raise AssertionError("Discogs lookup should not start when seen terms are malformed")
+
+                return get_json
+
+            args = argparse.Namespace(
+                export=export_path,
+                master=output_path,
+                output=output_path,
+                report=report_path,
+                cache=cache_path,
+                user_agent="test",
+                discogs_token="",
+                timeout_seconds=1,
+                request_interval_seconds=0,
+                refresh_existing=False,
+                seen_terms=seen_terms_path,
+            )
+
+            with patch.object(enricher, "make_http_json_getter", fake_json_getter):
+                with self.assertRaisesRegex(ValueError, "unsupported seen terms file"):
+                    run_enrichment(args)
+
+            self.assertFalse(output_path.exists())
+            self.assertFalse(report_path.exists())
+            self.assertFalse(cache_path.exists())
 
     def test_run_enrichment_keeps_export_in_input_folder_when_lookup_errors(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -960,6 +1329,7 @@ class RunEnrichmentTests(unittest.TestCase):
                 refresh_existing=False,
                 processed_dir=processed_directory,
                 move_processed_export=True,
+                seen_terms=directory / "seen-discogs-terms.json",
             )
 
             with patch.object(enricher, "make_http_json_getter", fake_json_getter):
