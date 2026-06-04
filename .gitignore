@@ -1,0 +1,36 @@
+# macOS
+.DS_Store
+
+# Python runtime and test artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local virtual environments and editor state
+.venv/
+venv/
+env/
+.idea/
+
+# Python packaging/build output
+build/
+dist/
+*.egg-info/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Private Discogs collection data and generated workflow artifacts
+
+**/*.csv
+**/*.style-cache.json
+**/*.style-report.txt
+**/*-style-report.txt
+reports/*_report.txt
