@@ -393,6 +393,77 @@ class ProgressReporterTests(unittest.TestCase):
         self.assertEqual(stream.getvalue(), "")
 
 
+class ReportTests(unittest.TestCase):
+    def test_write_report_distinguishes_which_metadata_fields_are_missing(self):
+        rows = [
+            {
+                "release_id": "111",
+                "Artist": "Style Only Artist",
+                "Title": "Style Only Title",
+                "Style": "",
+                "Genre": "Electronic",
+                "Style Notes": "no explicit styles found",
+                "Genre Notes": "",
+            },
+            {
+                "release_id": "222",
+                "Artist": "Genre Only Artist",
+                "Title": "Genre Only Title",
+                "Style": "House",
+                "Genre": "",
+                "Style Notes": "",
+                "Genre Notes": "no explicit genres found",
+            },
+            {
+                "release_id": "333",
+                "Artist": "Both Missing Artist",
+                "Title": "Both Missing Title",
+                "Style": "",
+                "Genre": "",
+                "Style Notes": "no explicit styles found",
+                "Genre Notes": "no explicit genres found",
+            },
+        ]
+        summary = enricher.RunSummary(
+            input_rows=3,
+            master_rows_before=0,
+            output_rows=3,
+            appended_rows=3,
+            filled_style_count=0,
+            filled_genre_count=0,
+            preserved_style_count=0,
+            preserved_genre_count=0,
+            blank_count=3,
+            error_count=0,
+            not_sure_release_ids=("111", "222", "333"),
+            output_path=Path("collection/enriched-collection.csv"),
+            report_path=Path("reports/report.txt"),
+            cache_path=Path("collection/processing.cache.json"),
+            processed_export_path=None,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            report_path = Path(temporary_directory) / "report.txt"
+
+            enricher.write_report(report_path, summary, rows)
+
+            report_text = report_path.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "- 111: Style Only Artist - Style Only Title (missing: Style; style: no explicit styles found)",
+            report_text,
+        )
+        self.assertIn(
+            "- 222: Genre Only Artist - Genre Only Title (missing: Genre; genre: no explicit genres found)",
+            report_text,
+        )
+        self.assertIn(
+            "- 333: Both Missing Artist - Both Missing Title (missing: Style, Genre; "
+            "style: no explicit styles found; genre: no explicit genres found)",
+            report_text,
+        )
+
+
 class LookupTests(unittest.TestCase):
     def test_parse_styles_from_api_payload_returns_clean_tuple(self):
         payload = {"styles": ["Deep Techno", "Ambient", "", None]}

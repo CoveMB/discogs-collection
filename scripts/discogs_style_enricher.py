@@ -146,7 +146,7 @@ class ProgressReporter:
         self,
         stream: TextIO | None = None,
         width: int = 24,
-        label: str = "Adding releases genres",
+        label: str = "Enriching rows",
         enabled: bool | None = None,
     ) -> None:
         self.stream = stream or sys.stderr
@@ -1146,11 +1146,23 @@ def format_not_sure_line(release_id: str, row: Mapping[str, str]) -> str:
     title = row.get("Title", "")
     notes = join_notes(
         [
+            format_missing_metadata_fields(row),
             format_field_note("style", row.get(STYLE_NOTES_COLUMN, "")),
             format_field_note("genre", row.get(GENRE_NOTES_COLUMN, "")),
         ]
     )
     return f"- {release_id}: {artist} - {title} ({notes})"
+
+
+def format_missing_metadata_fields(row: Mapping[str, str]) -> str:
+    missing_fields = [
+        field_name
+        for field_name, column_name in (("Style", STYLE_COLUMN), ("Genre", GENRE_COLUMN))
+        if not str(row.get(column_name, "") or "").strip()
+    ]
+    if not missing_fields:
+        return ""
+    return f"missing: {', '.join(missing_fields)}"
 
 
 def format_field_note(field_name: str, note: str | None) -> str:

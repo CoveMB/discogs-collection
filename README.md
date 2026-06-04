@@ -227,8 +227,8 @@ The report summarizes the run:
 - blank or not sure count
 - lookup error count
 - output and cache paths
-- release IDs left blank or not sure, with artist, title, style notes, and genre
-  notes when present
+- release IDs left blank or not sure, with artist, title, which metadata fields
+  are missing, and style or genre notes when present
 
 ## Refreshing existing metadata
 
