@@ -2,12 +2,15 @@
 
 ## Project purpose
 
-This project contains a small Python CLI for enriching Discogs collection export
-CSV files with explicit style and genre metadata from Discogs.
+This project contains small Python CLIs for working with Discogs collection
+export CSV files. The main workflow enriches releases with explicit style and
+genre metadata from Discogs, maps those terms to local playlist labels, and can
+export TuneMyMusic-style CSV files per playlist.
 
-The tool should stay focused on one job: read Discogs export rows, use
-`release_id` to find explicit Discogs style and genre data, and write an
-enriched CSV with audit columns.
+The tool should stay focused on this workflow: read Discogs export rows, use
+`release_id` to find explicit Discogs metadata, write an enriched CSV with audit
+columns, map configured playlist labels, and export reviewable playlist CSVs
+from Discogs tracklists.
 
 Do not add style or genre guessing, fuzzy matching, machine learning, broad
 scraping, or collection management features unless the user asks for them.
@@ -82,6 +85,10 @@ The tool should:
 - record source, status, notes, and update time
 - write a report listing rows left blank or errored
 - cache lookup results by `release_id`
+- map configured playlist labels into the durable master CSV
+- export one TuneMyMusic-style CSV per playlist from Discogs tracklists
+- write export reports for missing playlist labels, missing `release_id`, empty
+  tracklists, and release-level fallback rows
 
 Use `--refresh-existing` only when the user wants existing `Style` and `Genre`
 values replaced.

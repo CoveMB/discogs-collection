@@ -21,7 +21,6 @@ from discogs_style_enricher import (  # noqa: E402
     DEFAULT_MASTER_PATH,
     DiscogsRateLimiter,
     MetadataFieldLookup,
-    ProgressReporter,
     ReleaseMetadataLookup,
     build_output_fieldnames,
     ensure_processed_export_target_available,
@@ -38,6 +37,7 @@ from discogs_style_enricher import (  # noqa: E402
     update_missing_metadata,
     validate_discogs_export_fieldnames,
 )
+from shared.progress import ProgressReporter  # noqa: E402
 
 
 STANDARD_DISCOGS_HEADER = (
@@ -274,7 +274,7 @@ class EnrichmentTests(unittest.TestCase):
             {"release_id": "222", "Style": "", "Genre": ""},
         ]
         progress_stream = TerminalStream()
-        progress = ProgressReporter(stream=progress_stream)
+        progress = ProgressReporter(stream=progress_stream, label="Enriching rows")
 
         def lookup_metadata(release_id):
             return ReleaseMetadataLookup(
@@ -367,7 +367,7 @@ class NonTerminalStream(io.StringIO):
 class ProgressReporterTests(unittest.TestCase):
     def test_progress_reporter_updates_same_terminal_line_with_percentage(self):
         stream = TerminalStream()
-        progress = ProgressReporter(stream=stream, width=10)
+        progress = ProgressReporter(stream=stream, width=10, label="Enriching rows")
 
         progress.start(total=4)
         progress.update(current=2)

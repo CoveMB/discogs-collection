@@ -95,6 +95,8 @@ python3 scripts/discogs_style_enricher.py \
 6. Keep `collection/enriched-collection.csv` as your master for the next run.
 7. When you want playlist labels, run `python3 scripts/discogs_playlist_mapper.py`
    against the enriched master.
+8. When you want TuneMyMusic import files, run
+   `python3 scripts/discogs_playlist_exporter.py` against that mapped master.
 
 This workflow avoids redoing work. The script keeps a local JSON cache beside the
 output CSV, so later runs can reuse earlier release lookups.
@@ -192,6 +194,76 @@ Mapping rules:
 The mapper validates the config before writing output. It rejects malformed JSON,
 missing or invalid `playlists`, invalid `excluded_terms`, and aliases that
 appear in both `excluded_terms` and `playlists`.
+
+## TuneMyMusic playlist exporter
+
+`scripts/discogs_playlist_exporter.py` reads a playlist-mapped enriched master
+CSV and writes one TuneMyMusic-style CSV per playlist. It does not call Spotify,
+does not need Spotify credentials, and does not write to any external service.
+
+Run it after the playlist mapper:
+
+```bash
+python3 scripts/discogs_playlist_exporter.py
+```
+
+By default it uses:
+
+```text
+--input collection/enriched-collection.csv
+--output-dir collection/playlists
+--cache collection/cache/playlist-tracks.cache.json
+```
+
+Each playlist in the `Playlists` column gets its own file:
+
+```text
+collection/playlists/<playlist-name>.csv
+```
+
+The exporter keeps the CSV shape that worked in TuneMyMusic:
+
+```text
+Position, Record Rank, Track Number, Track Name, Artist Name, Album Name,
+Record Year, Release Type, Spotify Search Query, Availability Note,
+Version Note, Source URL, Discogs Search URL, HHV Store Check Terms
+```
+
+Despite the `Spotify Search Query` column name, the script only builds local
+search text from track, artist, and album names. It does not call Spotify.
+
+For each release row with a playlist, the exporter uses `release_id` to fetch the
+Discogs release tracklist, caches the parsed tracklist, and writes one output row
+per track. If a release belongs to more than one playlist, its tracks are written
+to each matching playlist CSV. `Position` is the row number inside that playlist
+file. `Record Rank` is the release order inside that playlist. `Track Number` is
+the track order inside the release.
+
+Rows with no playlist are skipped. Rows with a playlist but no `release_id`, a
+failed lookup, or an empty Discogs tracklist are still exported as one
+release-level fallback row, using the release title as the track name. The report
+lists those fallback rows so you can review them before importing.
+
+When run in an interactive terminal, the exporter shows row progress on `stderr`
+with a same-line progress bar, row count, and percentage. Progress counts input
+rows as the exporter scans them, including rows skipped because they have no
+playlist. You can turn it off with `--no-progress`.
+
+The report defaults to:
+
+```text
+reports/playlists_<YYYY-MM-DD_HH-MM-SS>_playlist_export_report.txt
+```
+
+The exporter uses the same Discogs token environment variable as the enrichment
+script:
+
+```bash
+export DISCOGS_TOKEN="your-token"
+```
+
+It can run without a token, but a token usually gives better Discogs API rate
+limits. Cached releases are not fetched again.
 
 ## How rows are merged
 
@@ -500,6 +572,41 @@ Playlist mapper options:
 --report PATH
     Text report path. Defaults to
     reports/<output-name>_<timestamp>_playlist_report.txt.
+```
+
+TuneMyMusic playlist exporter options:
+
+```text
+--input PATH
+    Playlist-mapped enriched master CSV. Defaults to
+    collection/enriched-collection.csv.
+
+--output-dir PATH
+    Directory for per-playlist CSVs. Defaults to collection/playlists.
+
+--report PATH
+    Text report path. Defaults to
+    reports/playlists_<timestamp>_playlist_export_report.txt.
+
+--cache PATH
+    Discogs tracklist cache JSON. Defaults to
+    collection/cache/playlist-tracks.cache.json.
+
+--discogs-token TOKEN
+    Optional Discogs personal access token. Defaults to DISCOGS_TOKEN.
+
+--user-agent TEXT
+    User-Agent sent to Discogs.
+
+--timeout-seconds SECONDS
+    HTTP timeout per request. Defaults to 30.
+
+--request-interval-seconds SECONDS
+    Minimum delay between Discogs requests. Defaults to header-aware throttling
+    with no extra fixed delay.
+
+--no-progress
+    Disable the interactive terminal progress bar.
 ```
 
 Playlist config printer options:
