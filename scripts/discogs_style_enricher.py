@@ -30,6 +30,7 @@ from shared.progress import ProgressReporter
 from shared.reports import (
     format_report_section,
     format_report_title,
+    print_report_section,
     timestamped_report_path,
     write_text_report,
 )
@@ -1315,30 +1316,41 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def print_summary(summary: RunSummary) -> None:
-    print(f"\n## Files")
-    print(f"\nOutput: {summary.output_path}")
-    print(f"Report: {summary.report_path}")
-    print(f"Cache: {summary.cache_path}")
+    file_lines = [
+        f"Output: {summary.output_path}",
+        f"Report: {summary.report_path}",
+        f"Cache: {summary.cache_path}",
+    ]
     if summary.seen_terms_path:
-        print(f"Seen terms: {summary.seen_terms_path}")
+        file_lines.append(f"Seen terms: {summary.seen_terms_path}")
     if summary.processed_export_path:
-        print(f"Processed export: {summary.processed_export_path}")
-    print(f"\n## Processed")
-    print(f"\nInput export rows: {summary.input_rows}")
-    print(f"Master rows before: {summary.master_rows_before}")
-    print(f"Output rows: {summary.output_rows}")
-    print(f"Appended rows: {summary.appended_rows}")
-    print(f"Filled missing styles: {summary.filled_style_count}")
-    print(f"Filled missing genres: {summary.filled_genre_count}")
-    print(f"Preserved existing styles: {summary.preserved_style_count}")
-    print(f"Preserved existing genres: {summary.preserved_genre_count}")
-    print(f"Left blank / not sure: {summary.blank_count}")
-    print(f"Lookup errors: {summary.error_count}")
+        file_lines.append(f"Processed export: {summary.processed_export_path}")
+    print_report_section("Files", file_lines)
+    print_report_section(
+        "Processed",
+        [
+            f"Input export rows: {summary.input_rows}",
+            f"Master rows before: {summary.master_rows_before}",
+            f"Output rows: {summary.output_rows}",
+            f"Appended rows: {summary.appended_rows}",
+            f"Filled missing styles: {summary.filled_style_count}",
+            f"Filled missing genres: {summary.filled_genre_count}",
+            f"Preserved existing styles: {summary.preserved_style_count}",
+            f"Preserved existing genres: {summary.preserved_genre_count}",
+            f"Left blank / not sure: {summary.blank_count}",
+            f"Lookup errors: {summary.error_count}",
+        ],
+    )
     if summary.seen_terms_path and has_new_discogs_terms(summary):
-        print(f"\n## Styles and Genres")
-        print(f"\nNew styles or genres found, add them to your playlist mapper config if desired: {summary.seen_terms_path}\n")
-        print(f"New styles: {len(summary.new_styles)}")
-        print(f"New genres: {len(summary.new_genres)}")
+        print_report_section(
+            "Styles and Genres",
+            [
+                f"New styles or genres found, add them to your playlist mapper config if desired: {summary.seen_terms_path}",
+                "",
+                f"New styles: {len(summary.new_styles)}",
+                f"New genres: {len(summary.new_genres)}",
+            ],
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

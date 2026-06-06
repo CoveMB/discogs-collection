@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import re
@@ -11,7 +12,6 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import quote_plus
 
 from discogs_style_enricher import (
     DEFAULT_REQUEST_INTERVAL_SECONDS,
@@ -24,6 +24,7 @@ from shared.progress import ProgressReporter
 from shared.reports import (
     format_report_section,
     format_report_title,
+    print_report_section,
     timestamped_report_path,
     write_text_report,
 )
@@ -39,20 +40,12 @@ DISCOGS_API_ROOT = "https://api.discogs.com"
 TRACKLIST_CACHE_SCHEMA_VERSION = 1
 TRACKLIST_CACHE_RECORD_TYPE = "discogs_release_tracklist"
 TUNEMYMUSIC_COLUMNS = (
-    "Position",
-    "Record Rank",
+    "Release Id",
+    "Album Name",
     "Track Number",
     "Track Name",
     "Artist Name",
-    "Album Name",
-    "Record Year",
-    "Release Type",
     "Spotify Search Query",
-    "Availability Note",
-    "Version Note",
-    "Source URL",
-    "Discogs Search URL",
-    "HHV Store Check Terms",
 )
 
 
@@ -80,6 +73,39 @@ class PlaylistExportFile:
     row_count: int
 
 
+ReleaseReportKey = tuple[str, str, str]
+TrackReportKey = tuple[str, str, str, str, str]
+
+
+@dataclass(frozen=True)
+class ReleaseReportEntry:
+    key: ReleaseReportKey
+    release_id: str
+    artist_name: str
+    album_name: str
+    track_row_count: int
+
+
+@dataclass(frozen=True)
+class TrackReportEntry:
+    key: TrackReportKey
+    release_id: str
+    artist_name: str
+    album_name: str
+    track_number: str
+    track_name: str
+
+
+@dataclass(frozen=True)
+class PlaylistReleaseChange:
+    playlist_name: str
+    path: Path
+    added_releases: tuple[ReleaseReportEntry, ...]
+    removed_releases: tuple[ReleaseReportEntry, ...]
+    added_tracks: tuple[TrackReportEntry, ...] = ()
+    notes: tuple[str, ...] = ()
+
+
 @dataclass(frozen=True)
 class PlaylistExportSummary:
     input_rows: int
@@ -91,6 +117,7 @@ class PlaylistExportSummary:
     output_directory: Path
     report_path: Path
     playlist_files: tuple[PlaylistExportFile, ...]
+    playlist_release_changes: tuple[PlaylistReleaseChange, ...]
     review_notes: tuple[str, ...]
 
 
@@ -99,25 +126,10 @@ class ReleaseExportRecord:
     row_number: int
     row: Mapping[str, str]
     lookup: ReleaseTracklistLookup | None
-    fallback_reason: str
 
 
 def release_api_url(release_id: str) -> str:
     return f"{DISCOGS_API_ROOT}/releases/{release_id}"
-
-
-def discogs_release_url(release_id: str) -> str:
-    clean_release_id = release_id.strip()
-    if not clean_release_id:
-        return ""
-    return f"https://www.discogs.com/release/{clean_release_id}"
-
-
-def discogs_search_url(artist_name: str, album_name: str) -> str:
-    search_terms = " ".join(value for value in (artist_name.strip(), album_name.strip()) if value)
-    if not search_terms:
-        return ""
-    return f"https://www.discogs.com/search/?type=all&q={quote_plus(search_terms)}"
 
 
 def export_playlist_csvs(
@@ -154,13 +166,26 @@ def export_playlist_csvs(
             progress.finish()
 
     playlist_files: list[PlaylistExportFile] = []
+    playlist_release_changes: list[PlaylistReleaseChange] = []
+    written_playlist_paths: set[Path] = set()
     track_row_count = 0
     fallback_row_count = 0
     playlist_paths = build_playlist_paths(records_by_playlist.keys(), output_directory)
     for playlist_name, records in records_by_playlist.items():
         output_rows, playlist_fallback_count = build_playlist_output_rows(records)
         output_path = playlist_paths[playlist_name]
+        previous_rows, previous_notes = read_existing_playlist_rows_for_report(output_path, review_notes)
+        playlist_release_changes.append(
+            build_playlist_release_change(
+                playlist_name=playlist_name,
+                path=output_path,
+                previous_rows=previous_rows,
+                current_rows=output_rows,
+                notes=previous_notes,
+            )
+        )
         write_csv_file(output_path, TUNEMYMUSIC_COLUMNS, output_rows)
+        written_playlist_paths.add(output_path)
         playlist_files.append(
             PlaylistExportFile(
                 playlist_name=playlist_name,
@@ -170,6 +195,14 @@ def export_playlist_csvs(
         )
         track_row_count += len(output_rows)
         fallback_row_count += playlist_fallback_count
+
+    playlist_release_changes.extend(
+        build_stale_playlist_release_changes(
+            output_directory=output_directory,
+            written_playlist_paths=written_playlist_paths,
+            review_notes=review_notes,
+        )
+    )
 
     summary = PlaylistExportSummary(
         input_rows=len(rows),
@@ -181,6 +214,7 @@ def export_playlist_csvs(
         output_directory=output_directory,
         report_path=report_path,
         playlist_files=tuple(playlist_files),
+        playlist_release_changes=tuple(playlist_release_changes),
         review_notes=tuple(review_notes),
     )
     write_report(report_path, summary)
@@ -202,21 +236,21 @@ def build_release_export_record(
     if not release_id:
         reason = "release_id is missing"
         review_notes.append(f"Row {row_number}: {reason}")
-        return ReleaseExportRecord(row_number=row_number, row=row, lookup=None, fallback_reason=reason)
+        return ReleaseExportRecord(row_number=row_number, row=row, lookup=None)
 
     try:
         lookup = lookup_tracklist(row)
     except Exception as error:  # noqa: BLE001 - export a reviewable fallback instead of dropping the row.
         reason = f"tracklist lookup failed: {type(error).__name__}: {error}"
         review_notes.append(f"Release ID {release_id}: {reason}")
-        return ReleaseExportRecord(row_number=row_number, row=row, lookup=None, fallback_reason=reason)
+        return ReleaseExportRecord(row_number=row_number, row=row, lookup=None)
 
     if not lookup.tracks:
         reason = first_note_or_default(lookup.notes, "no Discogs tracklist found")
         review_notes.append(f"Release ID {release_id}: {reason}")
-        return ReleaseExportRecord(row_number=row_number, row=row, lookup=lookup, fallback_reason=reason)
+        return ReleaseExportRecord(row_number=row_number, row=row, lookup=lookup)
 
-    return ReleaseExportRecord(row_number=row_number, row=row, lookup=lookup, fallback_reason="")
+    return ReleaseExportRecord(row_number=row_number, row=row, lookup=lookup)
 
 
 def first_note_or_default(notes: Sequence[str], default: str) -> str:
@@ -232,34 +266,23 @@ def build_playlist_output_rows(
 ) -> tuple[list[dict[str, str]], int]:
     output_rows: list[dict[str, str]] = []
     fallback_count = 0
-    for record_rank, record in enumerate(records, start=1):
-        release_rows, release_fallback_count = build_release_output_rows(
-            record=record,
-            record_rank=record_rank,
-            starting_position=len(output_rows) + 1,
-        )
+    for record in records:
+        release_rows, release_fallback_count = build_release_output_rows(record)
         output_rows.extend(release_rows)
         fallback_count += release_fallback_count
     return output_rows, fallback_count
 
 
-def build_release_output_rows(
-    record: ReleaseExportRecord,
-    record_rank: int,
-    starting_position: int,
-) -> tuple[list[dict[str, str]], int]:
+def build_release_output_rows(record: ReleaseExportRecord) -> tuple[list[dict[str, str]], int]:
     lookup = record.lookup
     if lookup and lookup.tracks:
         return (
             [
                 build_tunemymusic_row(
-                    position=starting_position + track_index - 1,
-                    record_rank=record_rank,
                     track_number=track_index,
                     track=track,
                     row=record.row,
                     lookup=lookup,
-                    version_note="Discogs release tracklist.",
                 )
                 for track_index, track in enumerate(lookup.tracks, start=1)
             ],
@@ -272,17 +295,13 @@ def build_release_output_rows(
         title=clean_cell(record.row.get("Title", "")) or fallback_lookup.album_name,
         artist_name=fallback_lookup.artist_name,
     )
-    version_note = f"Release-level fallback row because {strip_terminal_period(record.fallback_reason)}."
     return (
         [
             build_tunemymusic_row(
-                position=starting_position,
-                record_rank=record_rank,
                 track_number=1,
                 track=fallback_track,
                 row=record.row,
                 lookup=fallback_lookup,
-                version_note=version_note,
             )
         ],
         1,
@@ -290,33 +309,187 @@ def build_release_output_rows(
 
 
 def build_tunemymusic_row(
-    position: int,
-    record_rank: int,
     track_number: int,
     track: DiscogsTrack,
     row: Mapping[str, str],
     lookup: ReleaseTracklistLookup,
-    version_note: str,
 ) -> dict[str, str]:
     artist_name = track.artist_name or lookup.artist_name
     album_name = lookup.album_name or clean_cell(row.get("Title", ""))
     release_id = clean_cell(row.get(RELEASE_ID_COLUMN, ""))
     return {
-        "Position": str(position),
-        "Record Rank": str(record_rank),
+        "Release Id": release_id,
+        "Album Name": album_name,
         "Track Number": str(track_number),
         "Track Name": track.title,
         "Artist Name": artist_name,
-        "Album Name": album_name,
-        "Record Year": lookup.record_year or record_year_from_row(row),
-        "Release Type": release_type_from_row(row),
         "Spotify Search Query": build_search_query(track.title, artist_name, album_name),
-        "Availability Note": "Generated from Discogs text metadata; TuneMyMusic should match from track, artist, and album names.",
-        "Version Note": version_note,
-        "Source URL": discogs_release_url(release_id),
-        "Discogs Search URL": discogs_search_url(artist_name, album_name),
-        "HHV Store Check Terms": build_store_check_terms(artist_name, album_name),
     }
+
+
+def release_report_key(row: Mapping[str, str]) -> ReleaseReportKey:
+    release_id = clean_cell(row.get("Release Id", ""))
+    if release_id:
+        return ("release_id", release_id, "")
+    return (
+        "missing_release_id",
+        clean_cell(row.get("Artist Name", "")).casefold(),
+        clean_cell(row.get("Album Name", "")).casefold(),
+    )
+
+
+def release_report_entry_from_rows(key: ReleaseReportKey, rows: Sequence[Mapping[str, str]]) -> ReleaseReportEntry:
+    first_row = rows[0]
+    return ReleaseReportEntry(
+        key=key,
+        release_id=clean_cell(first_row.get("Release Id", "")),
+        artist_name=clean_cell(first_row.get("Artist Name", "")),
+        album_name=clean_cell(first_row.get("Album Name", "")),
+        track_row_count=len(rows),
+    )
+
+
+def release_report_entries_from_rows(rows: Sequence[Mapping[str, str]]) -> tuple[ReleaseReportEntry, ...]:
+    rows_by_key: dict[ReleaseReportKey, list[Mapping[str, str]]] = {}
+    key_order: list[ReleaseReportKey] = []
+    for row in rows:
+        key = release_report_key(row)
+        if key not in rows_by_key:
+            rows_by_key[key] = []
+            key_order.append(key)
+        rows_by_key[key].append(row)
+    return tuple(release_report_entry_from_rows(key, rows_by_key[key]) for key in key_order)
+
+
+def compare_release_entries(
+    previous_entries: Sequence[ReleaseReportEntry],
+    current_entries: Sequence[ReleaseReportEntry],
+) -> tuple[tuple[ReleaseReportEntry, ...], tuple[ReleaseReportEntry, ...]]:
+    previous_by_key = {entry.key: entry for entry in previous_entries}
+    current_by_key = {entry.key: entry for entry in current_entries}
+    added = tuple(entry for entry in current_entries if entry.key not in previous_by_key)
+    removed = tuple(entry for entry in previous_entries if entry.key not in current_by_key)
+    return added, removed
+
+
+def track_report_key(row: Mapping[str, str]) -> TrackReportKey:
+    return (
+        clean_cell(row.get("Release Id", "")),
+        clean_cell(row.get("Album Name", "")).casefold(),
+        clean_cell(row.get("Artist Name", "")).casefold(),
+        clean_cell(row.get("Track Number", "")),
+        clean_cell(row.get("Track Name", "")).casefold(),
+    )
+
+
+def track_report_entry_from_row(key: TrackReportKey, row: Mapping[str, str]) -> TrackReportEntry:
+    return TrackReportEntry(
+        key=key,
+        release_id=clean_cell(row.get("Release Id", "")),
+        artist_name=clean_cell(row.get("Artist Name", "")),
+        album_name=clean_cell(row.get("Album Name", "")),
+        track_number=clean_cell(row.get("Track Number", "")),
+        track_name=clean_cell(row.get("Track Name", "")),
+    )
+
+
+def track_report_entries_from_rows(rows: Sequence[Mapping[str, str]]) -> tuple[TrackReportEntry, ...]:
+    entries: list[TrackReportEntry] = []
+    seen_keys: set[TrackReportKey] = set()
+    for row in rows:
+        key = track_report_key(row)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        entries.append(track_report_entry_from_row(key, row))
+    return tuple(entries)
+
+
+def compare_track_entries(
+    previous_entries: Sequence[TrackReportEntry],
+    current_entries: Sequence[TrackReportEntry],
+) -> tuple[TrackReportEntry, ...]:
+    previous_keys = {entry.key for entry in previous_entries}
+    return tuple(entry for entry in current_entries if entry.key not in previous_keys)
+
+
+def read_existing_playlist_rows_for_report(path: Path, review_notes: list[str]) -> tuple[list[dict[str, str]], tuple[str, ...]]:
+    if not path.exists():
+        return [], ()
+    try:
+        rows, fieldnames = read_csv_file(path)
+    except (OSError, UnicodeDecodeError, csv.Error) as error:
+        note = f"{path}: previous playlist CSV could not be read; release change report skipped: {error}"
+        review_notes.append(note)
+        return [], (note,)
+
+    missing_columns = [column for column in TUNEMYMUSIC_COLUMNS if column not in fieldnames]
+    if missing_columns:
+        note = (
+            f"{path}: previous playlist CSV is missing TuneMyMusic columns; "
+            f"release change report skipped: {', '.join(missing_columns)}"
+        )
+        review_notes.append(note)
+        return [], (note,)
+    return rows, ()
+
+
+def build_playlist_release_change(
+    playlist_name: str,
+    path: Path,
+    previous_rows: Sequence[Mapping[str, str]],
+    current_rows: Sequence[Mapping[str, str]],
+    notes: Sequence[str] = (),
+) -> PlaylistReleaseChange:
+    previous_entries = release_report_entries_from_rows(previous_rows)
+    current_entries = release_report_entries_from_rows(current_rows)
+    if notes:
+        added_releases: tuple[ReleaseReportEntry, ...] = ()
+        removed_releases: tuple[ReleaseReportEntry, ...] = ()
+        added_tracks: tuple[TrackReportEntry, ...] = ()
+    else:
+        added_releases, removed_releases = compare_release_entries(previous_entries, current_entries)
+        added_tracks = compare_track_entries(
+            previous_entries=track_report_entries_from_rows(previous_rows),
+            current_entries=track_report_entries_from_rows(current_rows),
+        )
+    return PlaylistReleaseChange(
+        playlist_name=playlist_name,
+        path=path,
+        added_releases=added_releases,
+        removed_releases=removed_releases,
+        added_tracks=added_tracks,
+        notes=tuple(notes),
+    )
+
+
+def build_stale_playlist_release_changes(
+    output_directory: Path,
+    written_playlist_paths: set[Path],
+    review_notes: list[str],
+) -> tuple[PlaylistReleaseChange, ...]:
+    if not output_directory.exists():
+        return ()
+
+    changes: list[PlaylistReleaseChange] = []
+    for path in sorted(output_directory.glob("*.csv")):
+        if path in written_playlist_paths:
+            continue
+        previous_rows, previous_notes = read_existing_playlist_rows_for_report(path, review_notes)
+        previous_entries = release_report_entries_from_rows(previous_rows)
+        if not previous_entries and not previous_notes:
+            continue
+        stale_note = "previous playlist file was not regenerated in this run; file left unchanged"
+        changes.append(
+            PlaylistReleaseChange(
+                playlist_name=path.stem,
+                path=path,
+                added_releases=(),
+                removed_releases=previous_entries,
+                notes=tuple(previous_notes) + (stale_note,),
+            )
+        )
+    return tuple(changes)
 
 
 def fallback_lookup_from_row(row: Mapping[str, str]) -> ReleaseTracklistLookup:
@@ -332,27 +505,7 @@ def fallback_lookup_from_row(row: Mapping[str, str]) -> ReleaseTracklistLookup:
 
 
 def build_search_query(track_name: str, artist_name: str, album_name: str) -> str:
-    return " ".join(value for value in (track_name.strip(), artist_name.strip(), album_name.strip()) if value)
-
-
-def build_store_check_terms(artist_name: str, album_name: str) -> str:
-    return " ".join(value for value in (artist_name.strip(), album_name.strip()) if value)
-
-
-def release_type_from_row(row: Mapping[str, str]) -> str:
-    terms = [term.strip() for term in clean_cell(row.get("Format", "")).split(",") if term.strip()]
-    term_keys = {term.casefold() for term in terms}
-    if "album" in term_keys and "lp" in term_keys:
-        return "Album / LP"
-    if "album" in term_keys:
-        return "Album"
-    if "lp" in term_keys:
-        return "LP"
-    if "single" in term_keys:
-        return "Single"
-    if "compilation" in term_keys:
-        return "Compilation"
-    return " / ".join(terms[:2]) if terms else "Release"
+    return " ".join(value for value in (artist_name.strip(), track_name.strip(), album_name.strip()) if value)
 
 
 def build_playlist_paths(playlist_names: Sequence[str], output_directory: Path) -> dict[str, Path]:
@@ -626,20 +779,69 @@ def write_report(path: Path, summary: PlaylistExportSummary) -> None:
         for playlist_file in summary.playlist_files
     ] or ["- None"]
     lines.extend(format_report_section("Playlist CSVs", playlist_lines))
+    lines.extend(
+        format_report_section(
+            "Playlist release changes",
+            format_playlist_release_change_lines(summary.playlist_release_changes),
+        )
+    )
     lines.extend(format_report_section("Review notes", list(summary.review_notes) or ["- None"]))
     write_text_report(path, lines)
 
 
+def format_release_change_entry(entry: ReleaseReportEntry) -> str:
+    release_id = entry.release_id or "missing release_id"
+    track_word = "track row" if entry.track_row_count == 1 else "track rows"
+    return f"{release_id} | {entry.artist_name} | {entry.album_name} | {entry.track_row_count} {track_word}"
+
+
+def format_playlist_release_change_lines(changes: Sequence[PlaylistReleaseChange]) -> list[str]:
+    lines: list[str] = []
+    reportable_changes = [
+        change
+        for change in changes
+        if change.added_releases or change.removed_releases or change.notes
+    ]
+    for change in reportable_changes:
+        lines.append(f"- {change.playlist_name}:")
+        lines.append(f"  File: {change.path}")
+        for note in change.notes:
+            lines.append(f"  Note: {note}")
+        lines.append("  Added releases:")
+        if change.added_releases:
+            lines.extend(f"    - {format_release_change_entry(entry)}" for entry in change.added_releases)
+        else:
+            lines.append("    - None")
+        lines.append("  Removed releases:")
+        if change.removed_releases:
+            lines.extend(f"    - {format_release_change_entry(entry)}" for entry in change.removed_releases)
+        else:
+            lines.append("    - None")
+    return lines or ["- None"]
+
+
 def print_summary(summary: PlaylistExportSummary) -> None:
-    print(f"Output directory: {summary.output_directory}")
-    print(f"Report: {summary.report_path}")
-    print(f"Input rows: {summary.input_rows}")
-    print(f"Exported playlists: {summary.playlist_count}")
-    print(f"Output track rows: {summary.track_row_count}")
-    print(f"Release-level fallback rows: {summary.fallback_row_count}")
-    print(f"Skipped rows without playlists: {summary.skipped_unassigned_count}")
-    for playlist_file in summary.playlist_files:
-        print(f"- {playlist_file.playlist_name}: {playlist_file.path}")
+    print_report_section(
+        "Files",
+        [
+            f"Output directory: {summary.output_directory}",
+            f"Report: {summary.report_path}",
+        ],
+    )
+    print_report_section(
+        "Processed",
+        [
+            f"Input rows: {summary.input_rows}",
+            f"Exported playlists: {summary.playlist_count}",
+            f"Output track rows: {summary.track_row_count}",
+            f"Release-level fallback rows: {summary.fallback_row_count}",
+            f"Skipped rows without playlists: {summary.skipped_unassigned_count}",
+        ],
+    )
+    print_report_section(
+        "Playlist Release Changes",
+        format_playlist_release_change_lines(summary.playlist_release_changes),
+    )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -664,10 +866,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def clean_cell(value: object) -> str:
     return str(value or "").strip()
-
-
-def strip_terminal_period(value: str) -> str:
-    return value.strip().rstrip(".")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

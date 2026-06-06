@@ -1,0 +1,21 @@
+#!/bin/sh
+set -eu
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+python_bin="${PYTHON:-python3}"
+
+if ! command -v "$python_bin" >/dev/null 2>&1; then
+    echo "pre-commit: $python_bin is not available" >&2
+    exit 1
+fi
+
+echo "pre-commit: checking staged formatting"
+"$python_bin" scripts/dev_checks.py --staged
+
+echo "pre-commit: running Python syntax lint"
+"$python_bin" -m compileall -q scripts tests
+
+echo "pre-commit: running unit tests"
+"$python_bin" -m unittest discover -s tests

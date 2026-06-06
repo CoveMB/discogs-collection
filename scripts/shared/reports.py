@@ -30,6 +30,11 @@ def format_report_section(title: str, lines: Iterable[str]) -> list[str]:
     return ["", title, "-" * len(title), *lines]
 
 
+def print_report_section(title: str, lines: Iterable[str]) -> None:
+    for line in format_report_section(title, lines):
+        print(line)
+
+
 def write_text_report(path: Path, lines: Iterable[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")

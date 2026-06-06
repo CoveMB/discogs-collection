@@ -23,6 +23,7 @@ from shared.playlist_config import (
 from shared.reports import (
     format_report_section,
     format_report_title,
+    print_report_section,
     timestamped_report_path,
     write_text_report,
 )
@@ -222,13 +223,22 @@ def format_playlist_association_lines(row_number: int, row: Mapping[str, str]) -
 
 
 def print_summary(summary: PlaylistMappingSummary) -> None:
-    print(f"Output: {summary.output_path}")
-    print(f"Report: {summary.report_path}")
-    print(f"Input rows: {summary.input_rows}")
-    print(f"Output rows: {summary.output_rows}")
+    print_report_section(
+        "Files",
+        [
+            f"Output: {summary.output_path}",
+            f"Report: {summary.report_path}",
+        ],
+    )
+    print_report_section(
+        "Processed",
+        [
+            f"Input rows: {summary.input_rows}",
+            f"Output rows: {summary.output_rows}",
+        ],
+    )
     if summary.playlist_association_lines:
-        for line in format_report_section("Release to playlist associations", summary.playlist_association_lines):
-            print(line)
+        print_report_section("Release to playlist associations", summary.playlist_association_lines)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

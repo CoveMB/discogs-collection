@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from shared.files import write_json_file
+from shared.reports import format_report_section
 
 
 DEFAULT_CONFIG_PATH = Path("config/playlist-map.json")
@@ -125,28 +126,24 @@ def format_playlist_config_overview(path: Path, config: PlaylistConfig, created:
             "6. Use Genre aliases only when Style creates no playlist.",
             "7. Keep playlist order from the playlists object in the config.",
             "8. Allow the same raw term under multiple playlist labels.",
-            "",
-            "Current playlist config:",
-            f"Playlist prefix: {config.playlist_prefix or '(none)'}",
-            "",
-            "Excluded raw Discogs terms:",
         ]
     )
-    if config.excluded_terms:
-        lines.extend(f"- {term}" for term in config.excluded_terms)
-    else:
-        lines.append("- None configured.")
+    lines.extend(format_report_section("Playlist prefix", [config.playlist_prefix or "(none)"]))
 
-    lines.extend(["", "Playlist labels and raw Discogs terms:"])
+    excluded_term_lines = [f"- {term}" for term in config.excluded_terms] or ["- None configured."]
+    lines.extend(format_report_section("Excluded raw Discogs terms", excluded_term_lines))
+
+    playlist_lines: list[str] = []
     if config.playlist_labels:
         for playlist_label in config.playlist_labels:
             output_playlist_name = f"{config.playlist_prefix}{playlist_label}"
             raw_aliases = config.raw_aliases_by_label[playlist_label]
             raw_aliases_text = ", ".join(raw_aliases) if raw_aliases else "None"
-            lines.append(f"- {playlist_label} -> {output_playlist_name}")
-            lines.append(f"  Raw Discogs terms: {raw_aliases_text}")
+            playlist_lines.append(f"- {playlist_label} -> {output_playlist_name}")
+            playlist_lines.append(f"  Raw Discogs terms: {raw_aliases_text}")
     else:
-        lines.append("No playlists configured yet.")
+        playlist_lines.append("No playlists configured yet.")
+    lines.extend(format_report_section("Playlist labels and raw Discogs terms", playlist_lines))
 
     lines.append("")
     return "\n".join(lines)

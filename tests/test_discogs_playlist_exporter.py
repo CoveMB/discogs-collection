@@ -1,4 +1,5 @@
 import csv
+import contextlib
 import io
 import sys
 import tempfile
@@ -121,17 +122,22 @@ class PlaylistExporterTests(unittest.TestCase):
             self.assertEqual(summary.fallback_row_count, 0)
             self.assertEqual(summary.skipped_unassigned_count, 0)
             self.assertEqual(list(breakbeat_rows[0].keys()), list(exporter.TUNEMYMUSIC_COLUMNS))
-            self.assertEqual([row["Position"] for row in breakbeat_rows], ["1", "2", "3"])
-            self.assertEqual([row["Record Rank"] for row in breakbeat_rows], ["1", "1", "2"])
+            self.assertEqual(
+                list(breakbeat_rows[0].keys()),
+                [
+                    "Release Id",
+                    "Album Name",
+                    "Track Number",
+                    "Track Name",
+                    "Artist Name",
+                    "Spotify Search Query",
+                ],
+            )
+            self.assertEqual([row["Release Id"] for row in breakbeat_rows], ["111", "111", "222"])
             self.assertEqual([row["Track Number"] for row in breakbeat_rows], ["1", "2", "1"])
             self.assertEqual(breakbeat_rows[1]["Artist Name"], "Guest Artist")
             self.assertEqual(breakbeat_rows[2]["Album Name"], "Beta Album")
-            self.assertEqual(breakbeat_rows[2]["Record Year"], "2001")
-            self.assertEqual(breakbeat_rows[2]["Release Type"], "Album")
-            self.assertIn("Beta One", breakbeat_rows[2]["Spotify Search Query"])
-            self.assertIn("Beta Artist", breakbeat_rows[2]["Spotify Search Query"])
-            self.assertIn("Beta Album", breakbeat_rows[2]["Spotify Search Query"])
-            self.assertEqual(breakbeat_rows[2]["Source URL"], "https://www.discogs.com/release/222")
+            self.assertEqual(breakbeat_rows[2]["Spotify Search Query"], "Beta Artist Beta One Beta Album")
             self.assertEqual(len(house_rows), 1)
             self.assertEqual(house_rows[0]["Track Name"], "Beta One")
             self.assertIn(str(breakbeat_path), report_path.read_text(encoding="utf-8"))
@@ -173,11 +179,144 @@ class PlaylistExporterTests(unittest.TestCase):
             self.assertEqual(summary.fallback_row_count, 2)
             self.assertEqual(summary.skipped_unassigned_count, 1)
             self.assertEqual([row["Track Name"] for row in rows], ["Alpha Album", "Missing Album"])
-            self.assertEqual(rows[0]["Version Note"], "Release-level fallback row because no Discogs tracklist found.")
-            self.assertEqual(rows[1]["Version Note"], "Release-level fallback row because release_id is missing.")
+            self.assertEqual([row["Release Id"] for row in rows], ["111", ""])
             self.assertIn("Release ID 111: no Discogs tracklist found", report_text)
             self.assertIn("Row 2: release_id is missing", report_text)
             self.assertIn("Skipped rows without playlists: 1", report_text)
+
+    def test_report_lists_added_and_removed_releases_per_playlist_without_changing_rewrite_behavior(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            input_path = directory / "enriched-collection.csv"
+            output_directory = directory / "playlists"
+            report_path = directory / "playlist-export-report.txt"
+            output_directory.mkdir()
+            existing_playlist_path = output_directory / "Discogs - Breakbeat.csv"
+            existing_playlist_path.write_text(
+                "Release Id,Album Name,Track Number,Track Name,Artist Name,Spotify Search Query\n"
+                "111,Alpha Album,1,Alpha One,Alpha Artist,Alpha Artist Alpha One Alpha Album\n"
+                "333,Gamma Album,1,Gamma One,Gamma Artist,Gamma Artist Gamma One Gamma Album\n",
+                encoding="utf-8",
+            )
+            input_path.write_text(
+                "release_id,Artist,Title,Released,Format,Playlists\n"
+                '111,Alpha Artist,Alpha Album,1997,"Vinyl, LP, Album",Discogs - Breakbeat\n'
+                '222,Beta Artist,Beta Album,2001,"CD, Album",Discogs - Breakbeat\n',
+                encoding="utf-8",
+            )
+            lookups = {
+                "111": exporter.ReleaseTracklistLookup(
+                    release_id="111",
+                    artist_name="Alpha Artist",
+                    album_name="Alpha Album",
+                    record_year="1997",
+                    tracks=(exporter.DiscogsTrack(position="A1", title="Alpha One", artist_name="Alpha Artist"),),
+                    notes=(),
+                ),
+                "222": exporter.ReleaseTracklistLookup(
+                    release_id="222",
+                    artist_name="Beta Artist",
+                    album_name="Beta Album",
+                    record_year="2001",
+                    tracks=(exporter.DiscogsTrack(position="1", title="Beta One", artist_name="Beta Artist"),),
+                    notes=(),
+                ),
+            }
+
+            summary = exporter.export_playlist_csvs(
+                input_path=input_path,
+                output_directory=output_directory,
+                report_path=report_path,
+                lookup_tracklist=lambda row: lookups[row["release_id"]],
+            )
+
+            rewritten_rows = read_csv_file(existing_playlist_path)
+            report_text = report_path.read_text(encoding="utf-8")
+
+            self.assertEqual([row["Release Id"] for row in rewritten_rows], ["111", "222"])
+            self.assertEqual(summary.track_row_count, 2)
+            self.assertEqual(
+                [entry.track_name for entry in summary.playlist_release_changes[0].added_tracks],
+                ["Beta One"],
+            )
+            self.assertIn("Playlist release changes", report_text)
+            self.assertIn("- Discogs - Breakbeat:", report_text)
+            self.assertIn("Added releases:", report_text)
+            self.assertIn("222 | Beta Artist | Beta Album | 1 track row", report_text)
+            self.assertIn("Removed releases:", report_text)
+            self.assertIn("333 | Gamma Artist | Gamma Album | 1 track row", report_text)
+
+    def test_report_lists_stale_playlist_file_releases_as_removed_without_deleting_file(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            input_path = directory / "enriched-collection.csv"
+            output_directory = directory / "playlists"
+            report_path = directory / "playlist-export-report.txt"
+            output_directory.mkdir()
+            stale_path = output_directory / "Discogs - Old.csv"
+            stale_path.write_text(
+                "Release Id,Album Name,Track Number,Track Name,Artist Name,Spotify Search Query\n"
+                "999,Old Album,1,Old Track,Old Artist,Old Artist Old Track Old Album\n",
+                encoding="utf-8",
+            )
+            input_path.write_text(
+                "release_id,Artist,Title,Released,Format,Playlists\n"
+                '111,Alpha Artist,Alpha Album,1997,"Vinyl, LP, Album",Discogs - Breakbeat\n',
+                encoding="utf-8",
+            )
+            lookup = exporter.ReleaseTracklistLookup(
+                release_id="111",
+                artist_name="Alpha Artist",
+                album_name="Alpha Album",
+                record_year="1997",
+                tracks=(exporter.DiscogsTrack(position="A1", title="Alpha One", artist_name="Alpha Artist"),),
+                notes=(),
+            )
+
+            exporter.export_playlist_csvs(
+                input_path=input_path,
+                output_directory=output_directory,
+                report_path=report_path,
+                lookup_tracklist=lambda row: lookup,
+            )
+
+            report_text = report_path.read_text(encoding="utf-8")
+            self.assertTrue(stale_path.exists())
+            self.assertIn("- Discogs - Old:", report_text)
+            self.assertIn("previous playlist file was not regenerated in this run; file left unchanged", report_text)
+            self.assertIn("999 | Old Artist | Old Album | 1 track row", report_text)
+
+    def test_release_change_report_handles_missing_release_ids_by_artist_and_album(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            input_path = directory / "enriched-collection.csv"
+            output_directory = directory / "playlists"
+            report_path = directory / "playlist-export-report.txt"
+            output_directory.mkdir()
+            existing_playlist_path = output_directory / "Discogs - Breakbeat.csv"
+            existing_playlist_path.write_text(
+                "Release Id,Album Name,Track Number,Track Name,Artist Name,Spotify Search Query\n"
+                ",Old Missing Album,1,Old Missing Album,Old Missing Artist,Old Missing Artist Old Missing Album Old Missing Album\n",
+                encoding="utf-8",
+            )
+            input_path.write_text(
+                "release_id,Artist,Title,Released,Format,Playlists\n"
+                ',New Missing Artist,New Missing Album,1997,"Vinyl, LP, Album",Discogs - Breakbeat\n',
+                encoding="utf-8",
+            )
+
+            exporter.export_playlist_csvs(
+                input_path=input_path,
+                output_directory=output_directory,
+                report_path=report_path,
+                lookup_tracklist=lambda row: (_ for _ in ()).throw(
+                    AssertionError("missing release_id should not be looked up")
+                ),
+            )
+
+            report_text = report_path.read_text(encoding="utf-8")
+            self.assertIn("missing release_id | New Missing Artist | New Missing Album | 1 track row", report_text)
+            self.assertIn("missing release_id | Old Missing Artist | Old Missing Album | 1 track row", report_text)
 
     def test_discogs_payload_parser_flattens_sub_tracks_and_prefers_track_artists(self):
         row = {
@@ -228,6 +367,76 @@ class PlaylistExporterTests(unittest.TestCase):
 
         self.assertTrue(default_args.progress)
         self.assertFalse(quiet_args.progress)
+
+    def test_print_summary_includes_playlist_release_changes(self):
+        summary = exporter.PlaylistExportSummary(
+            input_rows=1,
+            playlist_count=1,
+            track_row_count=1,
+            fallback_row_count=0,
+            skipped_unassigned_count=0,
+            input_path=Path("collection/enriched-collection.csv"),
+            output_directory=Path("collection/playlists"),
+            report_path=Path("reports/playlists_report.txt"),
+            playlist_files=(
+                exporter.PlaylistExportFile(
+                    playlist_name="Discogs - Breakbeat",
+                    path=Path("collection/playlists/Discogs - Breakbeat.csv"),
+                    row_count=1,
+                ),
+            ),
+            playlist_release_changes=(
+                exporter.PlaylistReleaseChange(
+                    playlist_name="Discogs - Breakbeat",
+                    path=Path("collection/playlists/Discogs - Breakbeat.csv"),
+                    added_releases=(
+                        exporter.ReleaseReportEntry(
+                            key=("release_id", "222", ""),
+                            release_id="222",
+                            artist_name="Beta Artist",
+                            album_name="Beta Album",
+                            track_row_count=1,
+                        ),
+                    ),
+                    removed_releases=(),
+                    added_tracks=(
+                        exporter.TrackReportEntry(
+                            key=("222", "beta album", "beta artist", "1", "beta one"),
+                            release_id="222",
+                            artist_name="Beta Artist",
+                            album_name="Beta Album",
+                            track_number="1",
+                            track_name="Beta One",
+                        ),
+                    ),
+                ),
+            ),
+            review_notes=(),
+        )
+        output = io.StringIO()
+
+        with contextlib.redirect_stdout(output):
+            exporter.print_summary(summary)
+
+        self.assertNotIn("Added Tracks By Playlist", output.getvalue())
+        self.assertNotIn("Beta Artist | Beta One | Beta Album | track 1 | Release ID 222", output.getvalue())
+        self.assertNotIn("- Discogs - Breakbeat: collection/playlists/Discogs - Breakbeat.csv", output.getvalue())
+        self.assertIn("Playlist Release Changes\n------------------------", output.getvalue())
+        self.assertIn("222 | Beta Artist | Beta Album | 1 track row", output.getvalue())
+
+    def test_format_playlist_release_change_lines_collapses_unchanged_playlists(self):
+        lines = exporter.format_playlist_release_change_lines(
+            (
+                exporter.PlaylistReleaseChange(
+                    playlist_name="Discogs - Techno",
+                    path=Path("collection/playlists/Discogs - Techno.csv"),
+                    added_releases=(),
+                    removed_releases=(),
+                ),
+            )
+        )
+
+        self.assertEqual(lines, ["- None"])
 
 
 class TerminalStream(io.StringIO):

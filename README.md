@@ -1,16 +1,33 @@
-# Discogs metadata enricher
+# Discogs collection tools
 
-`scripts/discogs_style_enricher.py` enriches a Discogs collection export CSV with
-explicit release style and genre data from Discogs. It reads the `release_id` in
-each row, looks up the matching Discogs release, and writes the styles and
-genres into `Style` and `Genre` columns.
+This repo contains small Python CLIs for working with Discogs collection export
+CSVs. The main workflow is:
+
+1. Enrich a Discogs export with explicit `Style` and `Genre` metadata from the
+   Discogs release API.
+2. Map those Discogs terms to local playlist labels.
+3. Export one TuneMyMusic-style CSV per playlist from Discogs tracklists.
+
+The durable file is the enriched master CSV. By default that file is:
+
+```text
+collection/enriched-collection.csv
+```
+
+The scripts are local-first. They read and write CSV, JSON cache, and plain text
+report files on disk. The enrichment and playlist exporter scripts can call
+Discogs. They do not call Spotify, TuneMyMusic, or any other music service.
+
+`scripts/discogs_style_enricher.py` reads the `release_id` in each row, looks up
+the matching Discogs release, and writes the explicit Discogs styles and genres
+into `Style` and `Genre` columns.
 
 The tool is built for repeat use. Keep one enriched CSV as your master file,
 then merge each new Discogs collection export into that master. Existing rows
 and already-filled style or genre values are preserved by default. New rows are
 appended, and only missing metadata is looked up.
 
-## What the tool changes
+## What the enricher changes
 
 The script adds these columns when they are missing:
 
@@ -47,6 +64,11 @@ The audit columns explain what happened:
 
 Lookup source and status are not written as CSV columns. They are kept in the
 local JSON cache for audit/debug use.
+
+If an older CSV still has `Style Source`, `Style Status`, or `Style Updated At`,
+the current output drops those legacy columns. When `Updated At` is blank and
+`Style Updated At` exists, the script copies that legacy timestamp into
+`Updated At`.
 
 Rows with existing `Style` or `Genre` values are left alone unless you pass
 `--refresh-existing`. Preservation is field-specific, so a row with an existing
@@ -98,12 +120,46 @@ python3 scripts/discogs_style_enricher.py \
 8. When you want TuneMyMusic import files, run
    `python3 scripts/discogs_playlist_exporter.py` against that mapped master.
 
-This workflow avoids redoing work. The script keeps a local JSON cache beside the
-output CSV, so later runs can reuse earlier release lookups.
+This workflow avoids redoing work. The enrichment script keeps a local JSON
+cache beside the output CSV, so later runs can reuse earlier release lookups.
 
 The `export` folder may contain non-CSV files, but it must contain exactly one
 CSV. If it contains zero CSV files or more than one CSV file, the script stops
 before doing any lookups.
+
+## One-command playlist workflow
+
+To run enrichment, playlist mapping, and TuneMyMusic export one after the other,
+use:
+
+```bash
+python3 scripts/discogs_make_playlists.py
+```
+
+With no options, the command uses the same defaults as the three individual
+scripts:
+
+- enrich from `export` into `collection/enriched-collection.csv`
+- map playlists in `collection/enriched-collection.csv`
+- export playlist CSVs into `collection/playlists`
+
+The command stops before the next step when a step exits with a nonzero status.
+For example, if enrichment reports lookup errors, mapping and playlist export do
+not run. Check the enrichment report, then rerun after the issue is resolved.
+
+The child enrichment and exporter scripts still read `DISCOGS_TOKEN` from the
+environment. The combined command does not have a separate token option.
+
+Common path overrides are available when you want the same master file or config
+used across the full workflow:
+
+```bash
+python3 scripts/discogs_make_playlists.py \
+  --export export/latest-discogs-export.csv \
+  --master collection/enriched-collection.csv \
+  --config config/playlist-map.json \
+  --playlist-output-dir collection/playlists
+```
 
 ## Playlist mapper
 
@@ -126,6 +182,9 @@ By default it uses:
 --config config/playlist-map.json
 ```
 
+The mapper writes back to the input master by default. Pass `--output` when you
+want to review the mapped CSV before replacing the master.
+
 The mapper also writes a report by default:
 
 ```text
@@ -142,6 +201,11 @@ If the config file does not exist, the mapper creates an empty config with the
 expected fields, prints what each field is for, and waits for you to press Enter
 after filling it in. If stdin is not available, the mapper creates the config
 and stops so you can fill it in before running again.
+
+The mapper preserves existing rows, row order, and custom columns. If the CSV
+already has `Playlists`, that column is updated in place. Otherwise `Playlists`
+is inserted after `Genre` when present, after `Style` when only `Style` is
+present, or at the end as a fallback.
 
 To inspect the playlist config without mapping any rows, run:
 
@@ -192,8 +256,9 @@ Mapping rules:
 - Rows with no matching term get a blank `Playlists` value.
 
 The mapper validates the config before writing output. It rejects malformed JSON,
-missing or invalid `playlists`, invalid `excluded_terms`, and aliases that
-appear in both `excluded_terms` and `playlists`.
+missing or invalid `playlists`, invalid `excluded_terms`, empty playlist labels,
+empty aliases, non-string aliases, and aliases that appear in both
+`excluded_terms` and `playlists`.
 
 ## TuneMyMusic playlist exporter
 
@@ -221,28 +286,38 @@ Each playlist in the `Playlists` column gets its own file:
 collection/playlists/<playlist-name>.csv
 ```
 
-The exporter keeps the CSV shape that worked in TuneMyMusic:
+Playlist file names come from the playlist labels. Characters that are not safe
+in file names are replaced with `_`, repeated whitespace is collapsed, an empty
+label becomes `playlist.csv`, and case-insensitive name collisions get a suffix
+such as ` (2)`.
+
+The exporter writes a small TuneMyMusic import CSV:
 
 ```text
-Position, Record Rank, Track Number, Track Name, Artist Name, Album Name,
-Record Year, Release Type, Spotify Search Query, Availability Note,
-Version Note, Source URL, Discogs Search URL, HHV Store Check Terms
+Release Id, Album Name, Track Number, Track Name, Artist Name,
+Spotify Search Query
 ```
 
 Despite the `Spotify Search Query` column name, the script only builds local
-search text from track, artist, and album names. It does not call Spotify.
+search text from artist, track, and album names. It does not call Spotify.
+`Release Id` keeps each playlist row linked back to the enriched master CSV.
 
 For each release row with a playlist, the exporter uses `release_id` to fetch the
 Discogs release tracklist, caches the parsed tracklist, and writes one output row
 per track. If a release belongs to more than one playlist, its tracks are written
-to each matching playlist CSV. `Position` is the row number inside that playlist
-file. `Record Rank` is the release order inside that playlist. `Track Number` is
-the track order inside the release.
+to each matching playlist CSV. `Track Number` is the track order inside the
+release export, starting at `1`. It is not the raw Discogs track position.
+
+Discogs tracklists can contain headings, indexes, and nested `sub_tracks`. The
+exporter flattens usable `sub_tracks`, skips non-track headings, and uses a
+track-level artist when Discogs supplies one. Otherwise it falls back to the
+release artist.
 
 Rows with no playlist are skipped. Rows with a playlist but no `release_id`, a
 failed lookup, or an empty Discogs tracklist are still exported as one
 release-level fallback row, using the release title as the track name. The report
-lists those fallback rows so you can review them before importing.
+lists those fallback rows so you can review them before importing. Rows without
+`release_id` are not sent to Discogs.
 
 When run in an interactive terminal, the exporter shows row progress on `stderr`
 with a same-line progress bar, row count, and percentage. Progress counts input
@@ -255,6 +330,21 @@ The report defaults to:
 reports/playlists_<YYYY-MM-DD_HH-MM-SS>_playlist_export_report.txt
 ```
 
+The report contains summary counts, output file paths, playlist CSV row counts,
+release changes by playlist, and review notes for uncertain rows. The terminal
+summary prints the same release changes.
+
+The exporter rewrites playlist CSVs from the current mapped master each time it
+runs. Before rewriting a playlist CSV, it compares the new rows with the
+previous TuneMyMusic CSV in the output directory. Release changes appear once per
+release, even when a release exports multiple track rows. For rows without
+`Release Id`, the comparison falls back to artist and album names.
+
+If an old playlist CSV is no longer generated, the report lists its releases as
+removed from the current export, but leaves the file in place. If a previous CSV
+cannot be read, or if it is missing the current TuneMyMusic columns, the exporter
+skips the release-change comparison for that file and writes a review note.
+
 The exporter uses the same Discogs token environment variable as the enrichment
 script:
 
@@ -264,6 +354,17 @@ export DISCOGS_TOKEN="your-token"
 
 It can run without a token, but a token usually gives better Discogs API rate
 limits. Cached releases are not fetched again.
+
+The playlist tracklist cache defaults to:
+
+```text
+collection/cache/playlist-tracks.cache.json
+```
+
+It stores parsed tracklist data by `release_id`, including empty tracklists and
+notes. It does not store raw Discogs API payloads. If the cache file has an
+unsupported schema, the exporter stops and asks you to delete the old cache or
+choose a new `--cache` path.
 
 ## How rows are merged
 
@@ -280,6 +381,10 @@ row. Enrichment columns are ignored for this matching step, so existing
 
 Custom columns that already exist in the master are preserved. New export fields
 are also kept in the output.
+
+CSV and JSON outputs are written through a temporary file in the destination
+folder and then replaced into place. That keeps normal successful writes from
+partially overwriting the master file.
 
 ## How metadata is looked up
 
@@ -490,16 +595,84 @@ cached results are reused.
 
 ## Exit codes
 
-The script prints a run summary at the end.
+Each script prints a run summary at the end.
 
-- Exit code `0` means the run finished without lookup errors.
-- Exit code `2` means the run finished, but at least one lookup ended with
-  an error status.
+- `discogs_style_enricher.py` returns `0` when the run finishes without lookup
+  errors.
+- `discogs_style_enricher.py` returns `2` when the run finishes, but at least
+  one lookup ended with an error status.
+- `discogs_style_enricher.py` returns `1` for handled file, directory, processed
+  export collision, and validation errors.
+- `discogs_playlist_mapper.py` and `discogs_playlist_exporter.py` return `0` on
+  success and `1` for handled file, config, cache, and input validation errors.
+- `discogs_make_playlists.py` returns `0` when all three steps return `0`.
+  Otherwise it returns the first nonzero step exit code and skips later steps.
 
 Rows with blank lookup status are not treated as command failures. They mean the
 script could not find explicit style or genre data and chose not to guess.
+Argument parsing errors use Python `argparse` behavior, which prints usage text
+and exits before the script's run summary.
 
 ## Full command reference
+
+Combined workflow options:
+
+```text
+--export PATH
+    Specific Discogs collection export CSV passed to the enricher.
+
+--input-dir PATH
+    Folder containing one Discogs export CSV passed to the enricher.
+
+--processed-dir PATH
+    Folder where default-folder exports are moved after enrichment.
+
+--master PATH
+    Enriched master CSV used by all three steps. When set, the mapper reads
+    from and writes to this path, and the exporter reads from this path.
+
+--config PATH
+    Playlist map JSON passed to the mapper.
+
+--playlist-output-dir PATH
+    Directory for per-playlist TuneMyMusic CSV files.
+
+--enrichment-cache PATH
+    Discogs style and genre lookup cache JSON passed to the enricher as
+    --cache.
+
+--tracklist-cache PATH
+    Discogs tracklist lookup cache JSON passed to the exporter as --cache.
+
+--enrichment-report PATH
+    Enrichment report path.
+
+--mapping-report PATH
+    Playlist mapping report path.
+
+--playlist-report PATH
+    Playlist export report path.
+
+--refresh-existing
+    Ask the enricher to replace existing Style and Genre values.
+
+--no-seen-terms
+    Disable seen Discogs terms tracking in the enricher.
+
+--no-progress
+    Disable progress output in enrichment and playlist export.
+
+--timeout-seconds SECONDS
+    HTTP timeout per Discogs request for enrichment and playlist export.
+
+--request-interval-seconds SECONDS
+    Minimum delay between Discogs requests for enrichment and playlist export.
+
+--max-workers COUNT
+    Maximum concurrent uncached enrichment lookups.
+```
+
+Style enricher options:
 
 ```text
 --export PATH
@@ -640,3 +813,17 @@ Run the unit tests with:
 ```bash
 python3 -m unittest discover -s tests
 ```
+
+## Pre-commit hook
+
+The repo has a tracked hook at `.githooks/pre-commit`. This checkout is
+configured to use it with:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Before each commit, the hook checks staged project text files for trailing
+whitespace and missing final newlines, runs Python syntax linting with
+`compileall`, and runs the unit tests. It skips private workflow data folders
+such as `collection`, `config`, `export`, `processed`, and `reports`.
