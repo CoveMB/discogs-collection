@@ -9,7 +9,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from shared.discogs_columns import GENRE_COLUMN, RELEASE_ID_COLUMN, STYLE_COLUMN
+from shared.discogs_columns import GENRE_COLUMN, RELEASE_ID_COLUMN, STYLE_COLUMN, move_release_id_to_front
 from shared.files import read_csv_file, write_csv_file
 from shared.playlist_config import (
     DEFAULT_CONFIG_PATH,
@@ -103,7 +103,7 @@ def validate_input_fieldnames(fieldnames: Sequence[str]) -> None:
 
 
 def build_playlist_output_fieldnames(fieldnames: Sequence[str]) -> list[str]:
-    output_fieldnames = list(dict.fromkeys(fieldnames))
+    output_fieldnames = move_release_id_to_front(list(dict.fromkeys(fieldnames)))
     if PLAYLISTS_COLUMN in output_fieldnames:
         return output_fieldnames
     if GENRE_COLUMN in output_fieldnames:

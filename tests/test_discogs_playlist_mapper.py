@@ -104,24 +104,26 @@ class PlaylistMapperTests(unittest.TestCase):
             "",
         )
 
-    def test_existing_columns_and_row_order_are_preserved(self):
+    def test_existing_columns_and_row_order_are_preserved_with_release_id_first(self):
         rows = read_csv_text(
-            "Catalog#,Artist,Style,Genre,Custom\n"
-            "A1,First,House,Electronic,keep\n"
-            "B2,Second,,Breaks,also keep\n"
+            "Catalog#,Artist,Style,Genre,release_id,Custom\n"
+            "A1,First,House,Electronic,111,keep\n"
+            "B2,Second,,Breaks,222,also keep\n"
         )
-        fieldnames = ["Catalog#", "Artist", "Style", "Genre", "Custom"]
+        fieldnames = ["Catalog#", "Artist", "Style", "Genre", "release_id", "Custom"]
         config = mapper.normalize_playlist_config(sample_config())
 
         output_fieldnames, output_rows = mapper.add_playlist_mappings(fieldnames, rows, config)
 
         self.assertEqual(
             output_fieldnames,
-            ["Catalog#", "Artist", "Style", "Genre", "Playlists", "Custom"],
+            ["release_id", "Catalog#", "Artist", "Style", "Genre", "Playlists", "Custom"],
         )
         self.assertEqual([row["Artist"] for row in output_rows], ["First", "Second"])
         self.assertEqual(output_rows[0]["Custom"], "keep")
         self.assertEqual(output_rows[1]["Custom"], "also keep")
+        self.assertEqual(output_rows[0]["release_id"], "111")
+        self.assertEqual(output_rows[1]["release_id"], "222")
         self.assertEqual(output_rows[0]["Playlists"], "Discogs - House")
         self.assertEqual(output_rows[1]["Playlists"], "Discogs - Breakbeat")
 

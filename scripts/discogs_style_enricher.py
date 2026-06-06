@@ -24,7 +24,7 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from shared.discogs_columns import GENRE_COLUMN, RELEASE_ID_COLUMN, STYLE_COLUMN
+from shared.discogs_columns import GENRE_COLUMN, RELEASE_ID_COLUMN, STYLE_COLUMN, move_release_id_to_front
 from shared.files import read_csv_file, write_csv_file, write_json_file
 from shared.progress import ProgressReporter
 from shared.reports import (
@@ -382,11 +382,11 @@ def build_output_fieldnames(input_fieldnames: Sequence[str]) -> list[str]:
         if fieldname not in CSV_ENRICHMENT_COLUMNS
     ]
     insertion_index = find_enrichment_insert_index(unique_fieldnames, output_fieldnames)
-    return [
+    return move_release_id_to_front([
         *output_fieldnames[:insertion_index],
         *CSV_ENRICHMENT_COLUMNS,
         *output_fieldnames[insertion_index:],
-    ]
+    ])
 
 
 def find_enrichment_insert_index(unique_fieldnames: Sequence[str], output_fieldnames: Sequence[str]) -> int:

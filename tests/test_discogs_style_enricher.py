@@ -56,6 +56,7 @@ class FieldnameTests(unittest.TestCase):
         self.assertEqual(
             output_fields,
             [
+                "release_id",
                 "Catalog#",
                 "Artist",
                 "Title",
@@ -65,7 +66,6 @@ class FieldnameTests(unittest.TestCase):
                 "Style Notes",
                 "Genre Notes",
                 "Updated At",
-                "release_id",
             ],
         )
         for column_name in ("Style", "Genre", "Style Notes", "Genre Notes", "Updated At"):
