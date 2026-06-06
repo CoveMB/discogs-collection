@@ -18,6 +18,18 @@ The scripts are local-first. They read and write CSV, JSON cache, and plain text
 report files on disk. The enrichment and playlist exporter scripts can call
 Discogs. They do not call Spotify, TuneMyMusic, or any other music service.
 
+## Get a Discogs collection export
+
+Start with a Discogs collection export CSV, not a Marketplace inventory export.
+In Discogs, open your Collection page from your dashboard or the profile menu.
+Use the collection settings/options area to choose `Export My Collection`.
+Discogs redirects you to the Export page. Select `Collection` from the dropdown,
+choose `Request Data Export`, then download the CSV after Discogs says the file
+is available.
+
+Discogs documents this flow in its Collection feature help page:
+<https://support.discogs.com/hc/en-us/articles/360007331534-How-Does-The-Collection-Feature-Work>
+
 `scripts/discogs_style_enricher.py` reads the `release_id` in each row, looks up
 the matching Discogs release, and writes the explicit Discogs styles and genres
 into `Style` and `Genre` columns.
