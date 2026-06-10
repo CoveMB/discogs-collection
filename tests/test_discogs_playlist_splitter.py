@@ -1,6 +1,7 @@
 import csv
 import contextlib
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -113,6 +114,22 @@ class PlaylistSplitterTests(unittest.TestCase):
         )
         self.assertEqual(len(plan.warnings), 2)
         self.assertTrue(all("blank Release Id" in warning for warning in plan.warnings))
+
+    def test_release_grouping_can_be_disabled_to_fill_split_files(self):
+        rows = [
+            playlist_row("111", 1),
+            playlist_row("111", 2),
+            playlist_row("111", 3),
+            playlist_row("222", 1),
+        ]
+
+        plan = splitter.plan_split_chunks(rows, max_rows=2, keep_release_tracks_together=False)
+
+        self.assertEqual(
+            [(chunk.start_row_number, chunk.end_row_number) for chunk in plan.chunks],
+            [(1, 2), (3, 4)],
+        )
+        self.assertEqual(plan.warnings, ())
 
     def test_max_rows_less_than_one_raises_value_error(self):
         with self.assertRaises(ValueError):
@@ -330,6 +347,142 @@ class PlaylistSplitterTests(unittest.TestCase):
             self.assertEqual(len(read_csv_file(splits_directory / "1-1.csv")), 1)
             self.assertTrue((splits_directory / "2-2.csv").exists())
 
+    def test_write_stable_splits_can_append_new_rows_into_latest_split(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_folder = directory / "playlists" / "House"
+            master_path = playlist_folder / "House.csv"
+            splits_directory = playlist_folder / splitter.PLAYLIST_SPLITS_DIRECTORY_NAME
+            first_rows = [playlist_row("111", 1)]
+            write_master(master_path, first_rows + [playlist_row("222", 1), playlist_row("333", 1)])
+            write_split(splits_directory / "1-1.csv", first_rows)
+
+            summary = splitter.write_stable_splits(
+                master_path,
+                max_rows=3,
+                create_new_split_files_for_new_releases=False,
+            )
+
+            self.assertFalse((splits_directory / "1-1.csv").exists())
+            self.assertEqual(len(read_csv_file(splits_directory / "1-3.csv")), 3)
+            self.assertEqual([path.name for path in summary.updated_split_paths], ["1-3.csv"])
+            self.assertEqual(summary.written_split_paths, ())
+
+    def test_update_playlist_splits_report_lists_updated_latest_split(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            output_directory = directory / "playlists"
+            report_path = directory / "split-report.txt"
+            playlist_folder = output_directory / "House"
+            master_path = playlist_folder / "House.csv"
+            splits_directory = playlist_folder / splitter.PLAYLIST_SPLITS_DIRECTORY_NAME
+            first_rows = [playlist_row("111", 1)]
+            write_master(master_path, first_rows + [playlist_row("222", 1)])
+            write_split(splits_directory / "1-1.csv", first_rows)
+
+            splitter.update_playlist_splits_with_report(
+                output_directory,
+                report_path,
+                "all",
+                max_rows=2,
+                create_new_split_files_for_new_releases=False,
+            )
+
+            report_text = report_path.read_text(encoding="utf-8")
+            self.assertIn("Split CSVs updated: 1", report_text)
+            self.assertIn("Updated split CSVs:", report_text)
+            self.assertIn(str(splits_directory / "1-2.csv"), report_text)
+
+    def test_write_stable_splits_append_mode_creates_new_file_after_latest_split_is_full(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_folder = directory / "playlists" / "House"
+            master_path = playlist_folder / "House.csv"
+            splits_directory = playlist_folder / splitter.PLAYLIST_SPLITS_DIRECTORY_NAME
+            first_rows = [playlist_row("111", 1), playlist_row("222", 1)]
+            write_master(master_path, first_rows + [playlist_row("333", 1)])
+            write_split(splits_directory / "1-2.csv", first_rows)
+
+            summary = splitter.write_stable_splits(
+                master_path,
+                max_rows=2,
+                create_new_split_files_for_new_releases=False,
+            )
+
+            self.assertTrue((splits_directory / "1-2.csv").exists())
+            self.assertTrue((splits_directory / "3-3.csv").exists())
+            self.assertEqual(summary.updated_split_paths, ())
+            self.assertEqual([path.name for path in summary.written_split_paths], ["3-3.csv"])
+
+    def test_write_stable_splits_append_mode_fails_when_latest_split_is_stale(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_folder = directory / "playlists" / "House"
+            master_path = playlist_folder / "House.csv"
+            splits_directory = playlist_folder / splitter.PLAYLIST_SPLITS_DIRECTORY_NAME
+            master_rows = [playlist_row("111", 1), playlist_row("222", 1)]
+            stale_rows = [playlist_row("111", 1)]
+            stale_rows[0]["Track Name"] = "Manual Edit"
+            write_master(master_path, master_rows)
+            write_split(splits_directory / "1-1.csv", stale_rows)
+
+            with self.assertRaises(ValueError) as context:
+                splitter.write_stable_splits(
+                    master_path,
+                    max_rows=3,
+                    create_new_split_files_for_new_releases=False,
+                )
+
+            self.assertIn("latest split content differs", str(context.exception))
+            self.assertTrue((splits_directory / "1-1.csv").exists())
+            self.assertFalse((splits_directory / "1-2.csv").exists())
+
+    def test_write_stable_splits_append_mode_respects_release_grouping(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_folder = directory / "playlists" / "House"
+            master_path = playlist_folder / "House.csv"
+            splits_directory = playlist_folder / splitter.PLAYLIST_SPLITS_DIRECTORY_NAME
+            first_rows = [playlist_row("111", 1), playlist_row("222", 1)]
+            new_release_rows = [playlist_row("333", 1), playlist_row("333", 2)]
+            write_master(master_path, first_rows + new_release_rows)
+            write_split(splits_directory / "1-2.csv", first_rows)
+
+            summary = splitter.write_stable_splits(
+                master_path,
+                max_rows=3,
+                keep_release_tracks_together=True,
+                create_new_split_files_for_new_releases=False,
+            )
+
+            self.assertTrue((splits_directory / "1-2.csv").exists())
+            self.assertTrue((splits_directory / "3-4.csv").exists())
+            self.assertEqual(summary.updated_split_paths, ())
+            self.assertEqual(len(read_csv_file(splits_directory / "3-4.csv")), 2)
+
+    def test_write_stable_splits_append_mode_can_split_release_when_grouping_disabled(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_folder = directory / "playlists" / "House"
+            master_path = playlist_folder / "House.csv"
+            splits_directory = playlist_folder / splitter.PLAYLIST_SPLITS_DIRECTORY_NAME
+            first_rows = [playlist_row("111", 1), playlist_row("222", 1)]
+            new_release_rows = [playlist_row("333", 1), playlist_row("333", 2)]
+            write_master(master_path, first_rows + new_release_rows)
+            write_split(splits_directory / "1-2.csv", first_rows)
+
+            summary = splitter.write_stable_splits(
+                master_path,
+                max_rows=3,
+                keep_release_tracks_together=False,
+                create_new_split_files_for_new_releases=False,
+            )
+
+            self.assertFalse((splits_directory / "1-2.csv").exists())
+            self.assertTrue((splits_directory / "1-3.csv").exists())
+            self.assertTrue((splits_directory / "4-4.csv").exists())
+            self.assertEqual([path.name for path in summary.updated_split_paths], ["1-3.csv"])
+
     def test_write_stable_splits_warns_when_first_new_row_continues_last_preserved_release(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
@@ -535,6 +688,110 @@ class PlaylistSplitterTests(unittest.TestCase):
             self.assertEqual(stderr.getvalue(), "")
             self.assertTrue((splits_directory / "1-501.csv").exists())
             self.assertTrue(report_path.exists())
+
+    def test_cli_uses_workflow_config_when_max_rows_is_not_passed(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            output_directory = directory / "playlists"
+            report_path = directory / "split-report.txt"
+            workflow_config_path = directory / "workflow.json"
+            workflow_config_path.write_text(
+                json.dumps(
+                    {
+                        "max_rows_per_split": 2,
+                        "keep_release_tracks_together": False,
+                        "create_new_split_files_for_new_releases": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            splits_directory = output_directory / "House" / "splits"
+            write_master(
+                output_directory / "House" / "House.csv",
+                [playlist_row("111", 1), playlist_row("111", 2), playlist_row("111", 3)],
+            )
+
+            result = splitter.main(
+                [
+                    "--output-dir",
+                    str(output_directory),
+                    "--report",
+                    str(report_path),
+                    "--workflow-config",
+                    str(workflow_config_path),
+                ]
+            )
+
+            self.assertEqual(result, 0)
+            self.assertTrue((splits_directory / "1-2.csv").exists())
+            self.assertTrue((splits_directory / "3-3.csv").exists())
+
+    def test_cli_uses_workflow_config_to_append_into_latest_split(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            output_directory = directory / "playlists"
+            report_path = directory / "split-report.txt"
+            workflow_config_path = directory / "workflow.json"
+            workflow_config_path.write_text(
+                json.dumps(
+                    {
+                        "max_rows_per_split": 2,
+                        "create_new_split_files_for_new_releases": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            playlist_folder = output_directory / "House"
+            splits_directory = playlist_folder / "splits"
+            first_rows = [playlist_row("111", 1)]
+            write_master(playlist_folder / "House.csv", first_rows + [playlist_row("222", 1)])
+            write_split(splits_directory / "1-1.csv", first_rows)
+
+            result = splitter.main(
+                [
+                    "--output-dir",
+                    str(output_directory),
+                    "--report",
+                    str(report_path),
+                    "--workflow-config",
+                    str(workflow_config_path),
+                ]
+            )
+
+            self.assertEqual(result, 0)
+            self.assertFalse((splits_directory / "1-1.csv").exists())
+            self.assertTrue((splits_directory / "1-2.csv").exists())
+            self.assertIn("Split CSVs updated: 1", report_path.read_text(encoding="utf-8"))
+
+    def test_cli_max_rows_overrides_workflow_config(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            output_directory = directory / "playlists"
+            report_path = directory / "split-report.txt"
+            workflow_config_path = directory / "workflow.json"
+            workflow_config_path.write_text('{"max_rows_per_split": 2}\n', encoding="utf-8")
+            splits_directory = output_directory / "House" / "splits"
+            write_master(
+                output_directory / "House" / "House.csv",
+                [playlist_row("111", 1), playlist_row("222", 1), playlist_row("333", 1)],
+            )
+
+            result = splitter.main(
+                [
+                    "--output-dir",
+                    str(output_directory),
+                    "--report",
+                    str(report_path),
+                    "--workflow-config",
+                    str(workflow_config_path),
+                    "--max-rows",
+                    "3",
+                ]
+            )
+
+            self.assertEqual(result, 0)
+            self.assertTrue((splits_directory / "1-3.csv").exists())
+            self.assertFalse((splits_directory / "1-2.csv").exists())
 
     def test_cli_default_without_regenerate_stable_updates_all_playlist_folders(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

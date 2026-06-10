@@ -24,6 +24,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--processed-dir", type=Path, help="Folder where default-folder exports are moved after enrichment.")
     parser.add_argument("--master", type=Path, help="Enriched master CSV used by all three steps.")
     parser.add_argument("--config", type=Path, help="Playlist map JSON passed to the mapper.")
+    parser.add_argument("--workflow-config", type=Path, help="Workflow JSON config passed to the splitter.")
     parser.add_argument("--playlist-output-dir", type=Path, help="Directory for per-playlist TuneMyMusic CSV files.")
     parser.add_argument("--enrichment-cache", type=Path, help="Discogs style and genre lookup cache JSON.")
     parser.add_argument("--tracklist-cache", type=Path, help="Discogs tracklist lookup cache JSON.")
@@ -42,6 +43,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Minimum delay between Discogs requests for enrichment and playlist export.",
     )
     parser.add_argument("--max-workers", type=int, help="Maximum concurrent uncached enrichment lookups.")
+    parser.add_argument("--max-rows", type=int, help="Maximum rows per split CSV, overriding workflow config.")
     args = parser.parse_args(argv)
     validate_args(parser, args)
     return args
@@ -54,6 +56,8 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--request-interval-seconds must be non-negative")
     if args.max_workers is not None and args.max_workers < 1:
         parser.error("--max-workers must be at least 1")
+    if args.max_rows is not None and args.max_rows < 1:
+        parser.error("--max-rows must be at least 1")
 
 
 def append_option(arguments: list[str], option: str, value: object | None) -> None:
@@ -109,7 +113,9 @@ def build_splitter_args(args: argparse.Namespace) -> list[str]:
     arguments: list[str] = []
     append_option(arguments, "--output-dir", args.playlist_output_dir)
     append_option(arguments, "--report", args.split_report)
+    append_option(arguments, "--workflow-config", args.workflow_config)
     append_option(arguments, "--regenerate", args.regenerate_splits)
+    append_option(arguments, "--max-rows", args.max_rows)
     return arguments
 
 

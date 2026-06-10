@@ -68,6 +68,8 @@ class DiscogsMakePlaylistsTests(unittest.TestCase):
                     "collection/custom-master.csv",
                     "--config",
                     "config/custom-playlists.json",
+                    "--workflow-config",
+                    "config/workflow.json",
                     "--playlist-output-dir",
                     "collection/custom-playlists",
                     "--enrichment-cache",
@@ -93,6 +95,8 @@ class DiscogsMakePlaylistsTests(unittest.TestCase):
                     "0.25",
                     "--max-workers",
                     "2",
+                    "--max-rows",
+                    "250",
                 ]
             )
 
@@ -160,8 +164,12 @@ class DiscogsMakePlaylistsTests(unittest.TestCase):
                         "collection/custom-playlists",
                         "--report",
                         "reports/splits.txt",
+                        "--workflow-config",
+                        "config/workflow.json",
                         "--regenerate",
                         "Evening Listening",
+                        "--max-rows",
+                        "250",
                     ],
                 ),
             ],

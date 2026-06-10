@@ -25,11 +25,16 @@ from shared.reports import (
     readable_timestamp,
     write_text_report,
 )
+from shared.workflow_config import (
+    DEFAULT_MAX_ROWS_PER_SPLIT,
+    DEFAULT_WORKFLOW_CONFIG_PATH,
+    WorkflowConfig,
+    load_or_create_workflow_config,
+)
 
 
 PLAYLIST_SPLITS_DIRECTORY_NAME = "splits"
 DEFAULT_OUTPUT_DIRECTORY = Path("collection/playlists")
-DEFAULT_MAX_ROWS_PER_SPLIT = 500
 RANGE_FILENAME_PATTERN = re.compile(r"^(\d+)-(\d+)\.csv$")
 
 
@@ -54,6 +59,7 @@ class PlaylistSplitSummary:
     regenerated_split_paths: tuple[Path, ...]
     preserved_split_paths: tuple[Path, ...]
     warnings: tuple[str, ...]
+    updated_split_paths: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -75,7 +81,39 @@ class SplitGroup:
         return self.start_row_number + len(self.rows) - 1
 
 
-def plan_split_chunks(rows: Sequence[Mapping[str, str]], max_rows: int = DEFAULT_MAX_ROWS_PER_SPLIT) -> SplitPlan:
+def plan_split_chunks(
+    rows: Sequence[Mapping[str, str]],
+    max_rows: int = DEFAULT_MAX_ROWS_PER_SPLIT,
+    keep_release_tracks_together: bool = True,
+) -> SplitPlan:
+    if keep_release_tracks_together:
+        return plan_release_grouped_split_chunks(rows, max_rows=max_rows)
+    return plan_row_count_split_chunks(rows, max_rows=max_rows)
+
+
+def plan_row_count_split_chunks(rows: Sequence[Mapping[str, str]], max_rows: int = DEFAULT_MAX_ROWS_PER_SPLIT) -> SplitPlan:
+    if max_rows < 1:
+        raise ValueError("max_rows must be at least 1")
+
+    clean_rows = tuple({str(key): str(value or "") for key, value in row.items()} for row in rows)
+    chunks: list[SplitChunk] = []
+    for offset in range(0, len(clean_rows), max_rows):
+        split_rows = clean_rows[offset : offset + max_rows]
+        start_row_number = offset + 1
+        chunks.append(
+            SplitChunk(
+                start_row_number=start_row_number,
+                end_row_number=start_row_number + len(split_rows) - 1,
+                rows=tuple(split_rows),
+            )
+        )
+    return SplitPlan(chunks=tuple(chunks), warnings=())
+
+
+def plan_release_grouped_split_chunks(
+    rows: Sequence[Mapping[str, str]],
+    max_rows: int = DEFAULT_MAX_ROWS_PER_SPLIT,
+) -> SplitPlan:
     if max_rows < 1:
         raise ValueError("max_rows must be at least 1")
 
@@ -183,10 +221,14 @@ def build_release_groups(rows: Sequence[Mapping[str, str]]) -> tuple[list[SplitG
     return groups, warnings
 
 
-def write_regenerated_splits(master_path: Path, max_rows: int = DEFAULT_MAX_ROWS_PER_SPLIT) -> PlaylistSplitSummary:
+def write_regenerated_splits(
+    master_path: Path,
+    max_rows: int = DEFAULT_MAX_ROWS_PER_SPLIT,
+    keep_release_tracks_together: bool = True,
+) -> PlaylistSplitSummary:
     rows, fieldnames = read_csv_file(master_path)
     validate_master_fieldnames(master_path, fieldnames)
-    plan = plan_split_chunks(rows, max_rows=max_rows)
+    plan = plan_split_chunks(rows, max_rows=max_rows, keep_release_tracks_together=keep_release_tracks_together)
     playlist_folder_path = master_path.parent
     if playlist_folder_path.is_symlink():
         raise ValueError(f"{playlist_folder_path}: playlist folder symlinks are not supported")
@@ -272,7 +314,12 @@ def read_existing_split_files(splits_directory: Path) -> tuple[tuple[ExistingSpl
     return tuple(sorted_splits), tuple(warnings)
 
 
-def write_stable_splits(master_path: Path, max_rows: int = DEFAULT_MAX_ROWS_PER_SPLIT) -> PlaylistSplitSummary:
+def write_stable_splits(
+    master_path: Path,
+    max_rows: int = DEFAULT_MAX_ROWS_PER_SPLIT,
+    keep_release_tracks_together: bool = True,
+    create_new_split_files_for_new_releases: bool = True,
+) -> PlaylistSplitSummary:
     rows, fieldnames = read_csv_file(master_path)
     validate_master_fieldnames(master_path, fieldnames)
     master_rows = tuple(normalize_tunemymusic_rows(rows))
@@ -283,32 +330,78 @@ def write_stable_splits(master_path: Path, max_rows: int = DEFAULT_MAX_ROWS_PER_
     existing_splits, read_warnings = read_existing_split_files(splits_directory)
     if not existing_splits:
         if read_warnings:
-            return write_initial_stable_splits(master_path, master_rows, tuple(read_warnings), max_rows=max_rows)
-        return write_regenerated_splits(master_path, max_rows=max_rows)
+            return write_initial_stable_splits(
+                master_path,
+                master_rows,
+                tuple(read_warnings),
+                max_rows=max_rows,
+                keep_release_tracks_together=keep_release_tracks_together,
+            )
+        return write_regenerated_splits(
+            master_path,
+            max_rows=max_rows,
+            keep_release_tracks_together=keep_release_tracks_together,
+        )
 
     warnings = list(read_warnings)
     preserved_split_paths: list[Path] = []
+    latest_existing_split = existing_splits[-1]
     for existing_split in existing_splits:
         expected_rows = master_rows[existing_split.start_row_number - 1 : existing_split.end_row_number]
         if existing_split.rows != expected_rows:
+            if existing_split is latest_existing_split and not create_new_split_files_for_new_releases:
+                raise ValueError(
+                    f"{existing_split.path}: latest split content differs from current master rows "
+                    f"{existing_split.start_row_number}-{existing_split.end_row_number}; "
+                    "append mode would rewrite it. Run --regenerate for this playlist after reviewing the mismatch."
+                )
             warnings.append(
                 f"{existing_split.path}: existing split content differs from current master rows "
                 f"{existing_split.start_row_number}-{existing_split.end_row_number}; preserved without rewrite."
             )
-        preserved_split_paths.append(existing_split.path)
+        if create_new_split_files_for_new_releases or existing_split is not latest_existing_split:
+            preserved_split_paths.append(existing_split.path)
 
     highest_existing_end_row_number = max(split.end_row_number for split in existing_splits)
     new_rows = master_rows[highest_existing_end_row_number:]
-    plan = plan_split_chunks(new_rows, max_rows=max_rows)
-    boundary_warning = release_boundary_warning(existing_splits[-1], new_rows, highest_existing_end_row_number)
-    if boundary_warning:
-        warnings.append(boundary_warning)
-    warnings.extend(plan.warnings)
-
     written_split_paths: list[Path] = []
+    updated_split_paths: list[Path] = []
+    remaining_new_rows: Sequence[Mapping[str, str]] = new_rows
+    new_row_offset = highest_existing_end_row_number
+
+    if create_new_split_files_for_new_releases:
+        boundary_warning = release_boundary_warning(latest_existing_split, new_rows, highest_existing_end_row_number)
+        if boundary_warning:
+            warnings.append(boundary_warning)
+    else:
+        append_rows, remaining_new_rows, append_warnings = split_rows_for_latest_append(
+            latest_existing_split,
+            new_rows,
+            max_rows=max_rows,
+            keep_release_tracks_together=keep_release_tracks_together,
+        )
+        warnings.extend(append_warnings)
+        if append_rows:
+            updated_rows = (*latest_existing_split.rows, *append_rows)
+            updated_end_row_number = latest_existing_split.end_row_number + len(append_rows)
+            updated_split_path = splits_directory / f"{latest_existing_split.start_row_number}-{updated_end_row_number}.csv"
+            write_csv_file(updated_split_path, TUNEMYMUSIC_COLUMNS, updated_rows)
+            if updated_split_path != latest_existing_split.path:
+                latest_existing_split.path.unlink()
+            updated_split_paths.append(updated_split_path)
+            new_row_offset = updated_end_row_number
+        else:
+            preserved_split_paths.append(latest_existing_split.path)
+
+    plan = plan_split_chunks(
+        remaining_new_rows,
+        max_rows=max_rows,
+        keep_release_tracks_together=keep_release_tracks_together,
+    )
+    warnings.extend(plan.warnings)
     for chunk in plan.chunks:
-        start_row_number = highest_existing_end_row_number + chunk.start_row_number
-        end_row_number = highest_existing_end_row_number + chunk.end_row_number
+        start_row_number = new_row_offset + chunk.start_row_number
+        end_row_number = new_row_offset + chunk.end_row_number
         split_path = splits_directory / f"{start_row_number}-{end_row_number}.csv"
         write_csv_file(split_path, TUNEMYMUSIC_COLUMNS, chunk.rows)
         written_split_paths.append(split_path)
@@ -320,6 +413,7 @@ def write_stable_splits(master_path: Path, max_rows: int = DEFAULT_MAX_ROWS_PER_
         regenerated_split_paths=(),
         preserved_split_paths=tuple(preserved_split_paths),
         warnings=tuple(warnings),
+        updated_split_paths=tuple(updated_split_paths),
     )
 
 
@@ -352,13 +446,65 @@ def release_boundary_warning(
     )
 
 
+def split_rows_for_latest_append(
+    latest_existing_split: ExistingSplitFile,
+    new_rows: Sequence[Mapping[str, str]],
+    max_rows: int,
+    keep_release_tracks_together: bool,
+) -> tuple[tuple[dict[str, str], ...], tuple[Mapping[str, str], ...], tuple[str, ...]]:
+    if not new_rows:
+        return (), (), ()
+
+    capacity = max_rows - len(latest_existing_split.rows)
+    if capacity <= 0:
+        return (), tuple(new_rows), ()
+
+    if not keep_release_tracks_together:
+        append_rows = tuple(dict(row) for row in new_rows[:capacity])
+        return append_rows, tuple(new_rows[capacity:]), ()
+
+    groups, warnings = build_release_groups(new_rows)
+    append_count = 0
+    for group in groups:
+        remaining_capacity = capacity - append_count
+        if remaining_capacity <= 0:
+            break
+        if len(group.rows) <= remaining_capacity:
+            append_count += len(group.rows)
+            continue
+        if len(group.rows) > max_rows and append_count == 0:
+            append_count += remaining_capacity
+            warnings.append(
+                f"Release Id {group.release_id} has {len(group.rows)} new rows, exceeding max_rows {max_rows}; "
+                "split across the latest split file and a new split file."
+            )
+        break
+
+    if append_count == 0:
+        trailing_release_id = latest_existing_split.rows[-1].get("Release Id", "").strip()
+        first_new_release_id = str(new_rows[0].get("Release Id", "") or "").strip()
+        if trailing_release_id and trailing_release_id == first_new_release_id:
+            warnings.append(
+                f"Release Id {first_new_release_id} continues from latest split {latest_existing_split.path.name}, "
+                f"but appending it would exceed max_rows {max_rows}; write remaining tracks to a new split file."
+            )
+
+    append_rows = tuple(dict(row) for row in new_rows[:append_count])
+    return append_rows, tuple(new_rows[append_count:]), tuple(warnings)
+
+
 def write_initial_stable_splits(
     master_path: Path,
     master_rows: Sequence[Mapping[str, str]],
     read_warnings: tuple[str, ...],
     max_rows: int = DEFAULT_MAX_ROWS_PER_SPLIT,
+    keep_release_tracks_together: bool = True,
 ) -> PlaylistSplitSummary:
-    plan = plan_split_chunks(master_rows, max_rows=max_rows)
+    plan = plan_split_chunks(
+        master_rows,
+        max_rows=max_rows,
+        keep_release_tracks_together=keep_release_tracks_together,
+    )
     splits_directory = master_path.parent / PLAYLIST_SPLITS_DIRECTORY_NAME
     written_split_paths: list[Path] = []
     for chunk in plan.chunks:
@@ -433,9 +579,17 @@ def regenerate_playlist_splits(
     report_path: Path,
     target: str,
     max_rows: int = DEFAULT_MAX_ROWS_PER_SPLIT,
+    keep_release_tracks_together: bool = True,
 ) -> tuple[PlaylistSplitSummary, ...]:
     master_paths = resolve_master_paths(output_directory, target)
-    summaries = tuple(write_regenerated_splits(master_path, max_rows=max_rows) for master_path in master_paths)
+    summaries = tuple(
+        write_regenerated_splits(
+            master_path,
+            max_rows=max_rows,
+            keep_release_tracks_together=keep_release_tracks_together,
+        )
+        for master_path in master_paths
+    )
     write_report(report_path, output_directory, target, summaries)
     return summaries
 
@@ -444,9 +598,19 @@ def update_playlist_splits(
     output_directory: Path,
     target: str,
     max_rows: int = DEFAULT_MAX_ROWS_PER_SPLIT,
+    keep_release_tracks_together: bool = True,
+    create_new_split_files_for_new_releases: bool = True,
 ) -> tuple[PlaylistSplitSummary, ...]:
     master_paths = resolve_master_paths(output_directory, target)
-    return tuple(write_stable_splits(master_path, max_rows=max_rows) for master_path in master_paths)
+    return tuple(
+        write_stable_splits(
+            master_path,
+            max_rows=max_rows,
+            keep_release_tracks_together=keep_release_tracks_together,
+            create_new_split_files_for_new_releases=create_new_split_files_for_new_releases,
+        )
+        for master_path in master_paths
+    )
 
 
 def update_playlist_splits_with_report(
@@ -454,8 +618,16 @@ def update_playlist_splits_with_report(
     report_path: Path,
     target: str,
     max_rows: int = DEFAULT_MAX_ROWS_PER_SPLIT,
+    keep_release_tracks_together: bool = True,
+    create_new_split_files_for_new_releases: bool = True,
 ) -> tuple[PlaylistSplitSummary, ...]:
-    summaries = update_playlist_splits(output_directory, target, max_rows=max_rows)
+    summaries = update_playlist_splits(
+        output_directory,
+        target,
+        max_rows=max_rows,
+        keep_release_tracks_together=keep_release_tracks_together,
+        create_new_split_files_for_new_releases=create_new_split_files_for_new_releases,
+    )
     write_report(report_path, output_directory, target, summaries)
     return summaries
 
@@ -481,6 +653,7 @@ def write_report(
                 f"- Split CSVs written: {sum(len(summary.written_split_paths) for summary in summaries)}",
                 f"- Split CSVs preserved: {sum(len(summary.preserved_split_paths) for summary in summaries)}",
                 f"- Split CSVs regenerated: {sum(len(summary.regenerated_split_paths) for summary in summaries)}",
+                f"- Split CSVs updated: {sum(len(summary.updated_split_paths) for summary in summaries)}",
             ],
         )
     )
@@ -497,6 +670,9 @@ def write_report(
         if summary.regenerated_split_paths:
             playlist_lines.append("  Regenerated split CSVs:")
             playlist_lines.extend(f"    - {path}" for path in summary.regenerated_split_paths)
+        if summary.updated_split_paths:
+            playlist_lines.append("  Updated split CSVs:")
+            playlist_lines.extend(f"    - {path}" for path in summary.updated_split_paths)
         if summary.preserved_split_paths:
             playlist_lines.append("  Preserved split CSVs:")
             playlist_lines.extend(f"    - {path}" for path in summary.preserved_split_paths)
@@ -519,7 +695,21 @@ def print_summary(report_path: Path, summaries: Sequence[PlaylistSplitSummary]) 
         [
             f"Playlists: {len(summaries)}",
             f"Split CSVs written: {sum(len(summary.written_split_paths) for summary in summaries)}",
+            f"Split CSVs updated: {sum(len(summary.updated_split_paths) for summary in summaries)}",
         ],
+    )
+
+
+def resolve_workflow_config(args: argparse.Namespace) -> WorkflowConfig:
+    config = load_or_create_workflow_config(args.workflow_config)
+    if args.max_rows is None:
+        return config
+    if args.max_rows < 1:
+        raise ValueError("--max-rows must be at least 1")
+    return WorkflowConfig(
+        max_rows_per_split=args.max_rows,
+        keep_release_tracks_together=config.keep_release_tracks_together,
+        create_new_split_files_for_new_releases=config.create_new_split_files_for_new_releases,
     )
 
 
@@ -528,7 +718,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIRECTORY, help="Directory containing playlist folders. Defaults to collection/playlists.")
     parser.add_argument("--report", type=Path, help="Text report path. Defaults to reports/playlist_splits_<timestamp>_report.txt.")
     parser.add_argument("--regenerate", nargs="?", const="all", help="Playlist folder/display name to regenerate, or all. Defaults to stable update for all playlists.")
-    parser.add_argument("--max-rows", type=int, default=DEFAULT_MAX_ROWS_PER_SPLIT, help="Maximum rows per split CSV. Defaults to 500.")
+    parser.add_argument("--workflow-config", type=Path, default=DEFAULT_WORKFLOW_CONFIG_PATH, help="Workflow JSON config. Defaults to config/workflow.json.")
+    parser.add_argument("--max-rows", type=int, help="Maximum rows per split CSV. Overrides workflow config.")
     args = parser.parse_args(argv)
     args.report = args.report or default_report_path()
     return args
@@ -537,20 +728,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = parse_args(argv)
+        workflow_config = resolve_workflow_config(args)
         target = args.regenerate or "all"
         if args.regenerate is None:
             summaries = update_playlist_splits_with_report(
                 output_directory=args.output_dir,
                 report_path=args.report,
                 target=target,
-                max_rows=args.max_rows,
+                max_rows=workflow_config.max_rows_per_split,
+                keep_release_tracks_together=workflow_config.keep_release_tracks_together,
+                create_new_split_files_for_new_releases=workflow_config.create_new_split_files_for_new_releases,
             )
         else:
             summaries = regenerate_playlist_splits(
                 output_directory=args.output_dir,
                 report_path=args.report,
                 target=target,
-                max_rows=args.max_rows,
+                max_rows=workflow_config.max_rows_per_split,
+                keep_release_tracks_together=workflow_config.keep_release_tracks_together,
             )
     except (FileNotFoundError, NotADirectoryError, ValueError, csv.Error) as error:
         print(f"Error: {error}", file=sys.stderr)

@@ -162,7 +162,8 @@ With no options, the command uses the same defaults as the individual scripts:
 - enrich from `export` into `collection/enriched-collection.csv`
 - map playlists in `collection/enriched-collection.csv`
 - export playlist master CSVs into folders under `collection/playlists`
-- write split CSVs under each playlist folder, defaulting to 500 rows per file
+- write split CSVs under each playlist folder, using `config/workflow.json`
+  when it exists and creating it with 500-row defaults when it does not
 
 The command stops before the next step when a step exits with a nonzero status.
 For example, if enrichment reports lookup errors, mapping, playlist export, and
@@ -180,6 +181,7 @@ python3 scripts/discogs_make_playlists.py \
   --export export/latest-discogs-export.csv \
   --master collection/enriched-collection.csv \
   --config config/playlist-map.json \
+  --workflow-config config/workflow.json \
   --playlist-output-dir collection/playlists \
   --split-report reports/playlist_splits.txt
 ```
@@ -428,6 +430,36 @@ regeneration.
 Release rows are kept together when they fit within the configured row limit. By
 default that limit is 500 rows. If one release has more rows than the configured
 limit, that release can be split across files and the report includes a warning.
+
+The splitter reads `config/workflow.json` by default and creates it with these
+settings if it does not exist:
+
+```json
+{
+  "max_rows_per_split": 500,
+  "keep_release_tracks_together": true,
+  "create_new_split_files_for_new_releases": true
+}
+```
+
+`max_rows_per_split` sets the default split row limit. `--max-rows` overrides it
+for one run.
+
+When `keep_release_tracks_together` is `true`, the splitter keeps rows from the
+same `Release Id` in the same split file when they fit within the row limit. Set
+it to `false` to fill each split file up to the row limit, even if that splits a
+release across files.
+
+When `create_new_split_files_for_new_releases` is `true`, stable update mode
+keeps existing split files unchanged and writes new split files after the highest
+existing range. Set it to `false` to append new rows into the latest split file
+until it reaches the row limit, then create later split files as needed. In that
+mode, the latest split must still match the current master rows for its range. If
+it does not, the splitter fails instead of rewriting possible manual edits or
+stale data.
+
+Unknown keys in `workflow.json` are rejected so spelling mistakes do not get
+ignored.
 
 To regenerate split files, pass a target:
 
@@ -759,6 +791,10 @@ Combined workflow options:
 --config PATH
     Playlist map JSON passed to the mapper.
 
+--workflow-config PATH
+    Workflow JSON config passed to the splitter. Defaults to
+    config/workflow.json when omitted by the splitter.
+
 --playlist-output-dir PATH
     Directory for per-playlist folders, playlist master CSVs, and split CSVs.
 
@@ -783,6 +819,9 @@ Combined workflow options:
 
 --regenerate-splits TARGET
     Playlist folder/display name to regenerate, or all, passed to the splitter.
+
+--max-rows COUNT
+    Maximum rows per split CSV, overriding workflow config.
 
 --refresh-existing
     Ask the enricher to replace existing Style and Genre values.
@@ -929,9 +968,12 @@ Playlist splitter options:
     option is present without a target, it regenerates all playlists. If omitted,
     the splitter uses stable update mode for all playlists.
 
+--workflow-config PATH
+    Workflow JSON config. Defaults to config/workflow.json, created with default
+    values if missing.
+
 --max-rows COUNT
-    Maximum rows per split CSV. Defaults to 500; use a larger value only when
-    your playlist import tool supports larger files.
+    Maximum rows per split CSV. Overrides workflow config for one run.
 ```
 
 Playlist config printer options:
