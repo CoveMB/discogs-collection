@@ -10,6 +10,7 @@ from pathlib import Path
 
 import discogs_playlist_exporter as exporter
 import discogs_playlist_mapper as mapper
+import discogs_playlist_splitter as splitter
 import discogs_style_enricher as enricher
 
 
@@ -29,6 +30,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--enrichment-report", type=Path, help="Enrichment report path.")
     parser.add_argument("--mapping-report", type=Path, help="Playlist mapping report path.")
     parser.add_argument("--playlist-report", type=Path, help="Playlist export report path.")
+    parser.add_argument("--split-report", type=Path, help="Playlist split report path.")
+    parser.add_argument("--regenerate-splits", help="Playlist folder/display name to regenerate, or all, passed to the splitter.")
     parser.add_argument("--refresh-existing", action="store_true", help="Ask the enricher to replace existing Style and Genre values.")
     parser.add_argument("--no-seen-terms", action="store_true", help="Disable seen Discogs terms tracking in the enricher.")
     parser.add_argument("--no-progress", action="store_true", help="Disable progress output in enrichment and playlist export.")
@@ -102,6 +105,14 @@ def build_exporter_args(args: argparse.Namespace) -> list[str]:
     return arguments
 
 
+def build_splitter_args(args: argparse.Namespace) -> list[str]:
+    arguments: list[str] = []
+    append_option(arguments, "--output-dir", args.playlist_output_dir)
+    append_option(arguments, "--report", args.split_report)
+    append_option(arguments, "--regenerate", args.regenerate_splits)
+    return arguments
+
+
 def run_step(label: str, step_main: StepMain, step_args: Sequence[str]) -> int:
     print(f"\n------------------------------------")
     print(f"\nRunning {label}...")
@@ -114,6 +125,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         ("Discogs style enricher", enricher.main, build_enricher_args(args)),
         ("Discogs playlist mapper", mapper.main, build_mapper_args(args)),
         ("Discogs playlist exporter", exporter.main, build_exporter_args(args)),
+        ("Discogs playlist splitter", splitter.main, build_splitter_args(args)),
     )
     for index, (label, step_main, step_args) in enumerate(steps):
         exit_code = run_step(label, step_main, step_args)

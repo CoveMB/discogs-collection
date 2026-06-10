@@ -4,13 +4,15 @@
 
 This project contains small Python CLIs for working with Discogs collection
 export CSV files. The main workflow enriches releases with explicit style and
-genre metadata from Discogs, maps those terms to local playlist labels, and can
-export TuneMyMusic-style CSV files per playlist.
+genre metadata from Discogs, maps those terms to local playlist labels, exports
+TuneMyMusic-style master CSV files per playlist, and creates split CSVs for
+playlist import batches.
 
 The tool should stay focused on this workflow: read Discogs export rows, use
 `release_id` to find explicit Discogs metadata, write an enriched CSV with audit
-columns, map configured playlist labels, and export reviewable playlist CSVs
-from Discogs tracklists.
+columns, map configured playlist labels, export reviewable playlist CSVs from
+Discogs tracklists, and write split CSVs in each playlist folder with a 500-row
+default batch size.
 
 Do not add style or genre guessing, fuzzy matching, machine learning, broad
 scraping, or collection management features unless the user asks for them.
@@ -75,9 +77,10 @@ The enriched CSV is the durable master file.
 
 The tool should:
 
-- merge a new Discogs export into the master
+- merge a new Discogs export into the master by `release_id`
 - preserve existing rows and existing filled `Style` and `Genre` values by default
-- append only new export rows
+- refresh existing release IDs in place, append new release IDs, and report
+  skipped export rows with missing or duplicate `release_id`
 - add missing enrichment columns
 - fill missing styles and genres from Discogs release API data
 - fall back to Discogs master API styles and genres when available
@@ -86,7 +89,8 @@ The tool should:
 - write a report listing rows left blank or errored
 - cache lookup results by `release_id`
 - map configured playlist labels into the durable master CSV
-- export one TuneMyMusic-style CSV per playlist from Discogs tracklists
+- export one TuneMyMusic-style master CSV per playlist from Discogs tracklists
+- create split CSVs from playlist master CSVs, defaulting to 500 rows per file
 - write export reports for missing playlist labels, missing `release_id`, empty
   tracklists, and release-level fallback rows
 

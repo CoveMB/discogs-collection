@@ -472,7 +472,8 @@ def build_stale_playlist_release_changes(
         return ()
 
     changes: list[PlaylistReleaseChange] = []
-    for path in sorted(output_directory.glob("*.csv")):
+    for folder_path in sorted(path for path in output_directory.iterdir() if path.is_dir()):
+        path = playlist_master_path(folder_path)
         if path in written_playlist_paths:
             continue
         previous_rows, previous_notes = read_existing_playlist_rows_for_report(path, review_notes)
@@ -482,7 +483,7 @@ def build_stale_playlist_release_changes(
         stale_note = "previous playlist file was not regenerated in this run; file left unchanged"
         changes.append(
             PlaylistReleaseChange(
-                playlist_name=path.stem,
+                playlist_name=folder_path.name,
                 path=path,
                 added_releases=(),
                 removed_releases=previous_entries,
@@ -509,18 +510,41 @@ def build_search_query(track_name: str, artist_name: str, album_name: str) -> st
 
 
 def build_playlist_paths(playlist_names: Sequence[str], output_directory: Path) -> dict[str, Path]:
+    return {
+        playlist_name: playlist_master_path(folder_path)
+        for playlist_name, folder_path in build_playlist_folder_paths(playlist_names, output_directory).items()
+    }
+
+
+def build_playlist_folder_paths(playlist_names: Sequence[str], output_directory: Path) -> dict[str, Path]:
     paths: dict[str, Path] = {}
-    used_filenames: set[str] = set()
+    used_folder_names: set[str] = set()
+    existing_folder_paths = existing_playlist_folder_paths_by_safe_name(output_directory)
     for playlist_name in playlist_names:
         base_name = safe_playlist_filename(playlist_name)
-        filename = f"{base_name}.csv"
+        folder_path = existing_folder_paths.get(base_name.casefold())
+        folder_name = folder_path.name if folder_path else base_name
         suffix = 2
-        while filename.casefold() in used_filenames:
-            filename = f"{base_name} ({suffix}).csv"
+        while folder_name.casefold() in used_folder_names:
+            folder_name = f"{base_name} ({suffix})"
+            folder_path = None
             suffix += 1
-        used_filenames.add(filename.casefold())
-        paths[playlist_name] = output_directory / filename
+        used_folder_names.add(folder_name.casefold())
+        paths[playlist_name] = folder_path or output_directory / folder_name
     return paths
+
+
+def existing_playlist_folder_paths_by_safe_name(output_directory: Path) -> dict[str, Path]:
+    if not output_directory.exists():
+        return {}
+    folder_paths: dict[str, Path] = {}
+    for folder_path in sorted(path for path in output_directory.iterdir() if path.is_dir()):
+        folder_paths.setdefault(folder_path.name.casefold(), folder_path)
+    return folder_paths
+
+
+def playlist_master_path(folder_path: Path) -> Path:
+    return folder_path / f"{folder_path.name}.csv"
 
 
 def safe_playlist_filename(playlist_name: str) -> str:

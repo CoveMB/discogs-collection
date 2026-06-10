@@ -6,7 +6,8 @@ CSVs. The main workflow is:
 1. Enrich a Discogs export with explicit `Style` and `Genre` metadata from the
    Discogs release API.
 2. Map those Discogs terms to local playlist labels.
-3. Export one TuneMyMusic-style CSV per playlist from Discogs tracklists.
+3. Export full TuneMyMusic-style playlist master CSVs into per-playlist folders.
+4. Create split CSVs from each playlist master, defaulting to 500 rows per file.
 
 The durable file is the enriched master CSV. By default that file is:
 
@@ -35,9 +36,12 @@ the matching Discogs release, and writes the explicit Discogs styles and genres
 into `Style` and `Genre` columns.
 
 The tool is built for repeat use. Keep one enriched CSV as your master file,
-then merge each new Discogs collection export into that master. Existing rows
-and already-filled style or genre values are preserved by default. New rows are
-appended, and only missing metadata is looked up.
+then merge each new Discogs collection export into that master. Export rows with
+new `release_id` values are appended. Export rows whose `release_id` already
+exists in the master refresh that master row's export fields in place. Export
+rows with missing `release_id` values are skipped and listed in the report.
+Already-filled style or genre values are preserved by default, and only missing
+metadata is looked up.
 
 ## What the enricher changes
 
@@ -132,8 +136,10 @@ python3 scripts/discogs_style_enricher.py \
    against the enriched master.
 8. When you want TuneMyMusic import files, run
    `python3 scripts/discogs_playlist_exporter.py` against that mapped master.
-9. Upload each generated playlist CSV to TuneMyMusic when you want to create the
-   actual streaming-service playlist.
+9. Run `python3 scripts/discogs_playlist_splitter.py` to create split CSVs from
+   each playlist master.
+10. Upload the split CSVs to TuneMyMusic when you want to create the actual
+   streaming-service playlist.
 
 This workflow avoids redoing work. The enrichment script keeps a local JSON
 cache beside the output CSV, so later runs can reuse earlier release lookups.
@@ -144,23 +150,24 @@ before doing any lookups.
 
 ## One-command playlist workflow
 
-To run enrichment, playlist mapping, and TuneMyMusic export one after the other,
-use:
+To run enrichment, playlist mapping, TuneMyMusic export, and playlist splitting
+one after the other, use:
 
 ```bash
 python3 scripts/discogs_make_playlists.py
 ```
 
-With no options, the command uses the same defaults as the three individual
-scripts:
+With no options, the command uses the same defaults as the individual scripts:
 
 - enrich from `export` into `collection/enriched-collection.csv`
 - map playlists in `collection/enriched-collection.csv`
-- export playlist CSVs into `collection/playlists`
+- export playlist master CSVs into folders under `collection/playlists`
+- write split CSVs under each playlist folder, defaulting to 500 rows per file
 
 The command stops before the next step when a step exits with a nonzero status.
-For example, if enrichment reports lookup errors, mapping and playlist export do
-not run. Check the enrichment report, then rerun after the issue is resolved.
+For example, if enrichment reports lookup errors, mapping, playlist export, and
+playlist splitting do not run. Check the enrichment report, then rerun after the
+issue is resolved.
 
 The child enrichment and exporter scripts still read `DISCOGS_TOKEN` from the
 environment. The combined command does not have a separate token option.
@@ -173,7 +180,8 @@ python3 scripts/discogs_make_playlists.py \
   --export export/latest-discogs-export.csv \
   --master collection/enriched-collection.csv \
   --config config/playlist-map.json \
-  --playlist-output-dir collection/playlists
+  --playlist-output-dir collection/playlists \
+  --split-report reports/playlist_splits.txt
 ```
 
 ## Playlist mapper
@@ -279,8 +287,9 @@ empty aliases, non-string aliases, and aliases that appear in both
 ## TuneMyMusic playlist exporter
 
 `scripts/discogs_playlist_exporter.py` reads a playlist-mapped enriched master
-CSV and writes one TuneMyMusic-style CSV per playlist. It does not call Spotify,
-does not need Spotify credentials, and does not write to any external service.
+CSV and writes one TuneMyMusic-style master CSV per playlist. It does not call
+Spotify, does not need Spotify credentials, and does not write to any external
+service.
 
 Run it after the playlist mapper:
 
@@ -296,16 +305,17 @@ By default it uses:
 --cache collection/cache/playlist-tracks.cache.json
 ```
 
-Each playlist in the `Playlists` column gets its own file:
+Each playlist in the `Playlists` column gets its own folder and master CSV:
 
 ```text
-collection/playlists/<playlist-name>.csv
+collection/playlists/<playlist-name>/<playlist-name>.csv
+collection/playlists/Techno/Techno.csv
 ```
 
-Playlist file names come from the playlist labels. Characters that are not safe
-in file names are replaced with `_`, repeated whitespace is collapsed, an empty
-label becomes `playlist.csv`, and case-insensitive name collisions get a suffix
-such as ` (2)`.
+Playlist folder and master file names come from the playlist labels. Characters
+that are not safe in file names are replaced with `_`, repeated whitespace is
+collapsed, an empty label becomes `playlist`, and case-insensitive folder name
+collisions get a suffix such as ` (2)`.
 
 The exporter writes a small TuneMyMusic import CSV:
 
@@ -350,16 +360,17 @@ The report contains summary counts, output file paths, playlist CSV row counts,
 release changes by playlist, and review notes for uncertain rows. The terminal
 summary prints the same release changes.
 
-The exporter rewrites playlist CSVs from the current mapped master each time it
-runs. Before rewriting a playlist CSV, it compares the new rows with the
-previous TuneMyMusic CSV in the output directory. Release changes appear once per
-release, even when a release exports multiple track rows. For rows without
-`Release Id`, the comparison falls back to artist and album names.
+The exporter rewrites playlist master CSVs from the current mapped master each
+time it runs. Before rewriting a playlist master, it compares the new rows with
+the previous TuneMyMusic CSV in that playlist folder. Release changes appear
+once per release, even when a release exports multiple track rows. For rows
+without `Release Id`, the comparison falls back to artist and album names.
 
-If an old playlist CSV is no longer generated, the report lists its releases as
-removed from the current export, but leaves the file in place. If a previous CSV
-cannot be read, or if it is missing the current TuneMyMusic columns, the exporter
-skips the release-change comparison for that file and writes a review note.
+If an old playlist folder is no longer generated, the report lists its master
+CSV releases as removed from the current export, but leaves the folder and file
+in place. If a previous CSV cannot be read, or if it is missing the current
+TuneMyMusic columns, the exporter skips the release-change comparison for that
+file and writes a review note.
 
 The exporter uses the same Discogs token environment variable as the enrichment
 script:
@@ -382,11 +393,58 @@ notes. It does not store raw Discogs API payloads. If the cache file has an
 unsupported schema, the exporter stops and asks you to delete the old cache or
 choose a new `--cache` path.
 
+## Playlist splitter
+
+`scripts/discogs_playlist_splitter.py` reads the playlist master CSVs under
+`collection/playlists` and writes split CSVs in each playlist folder. Each split
+uses the same TuneMyMusic columns as the playlist master.
+
+Run it after the playlist exporter:
+
+```bash
+python3 scripts/discogs_playlist_splitter.py
+```
+
+For a playlist master like:
+
+```text
+collection/playlists/Techno/Techno.csv
+```
+
+the splitter writes files like:
+
+```text
+collection/playlists/Techno/splits/1-500.csv
+collection/playlists/Techno/splits/501-932.csv
+```
+
+The file names use actual row numbers from the playlist master. By default,
+existing split CSVs are treated as frozen. The splitter preserves them, writes
+new split files for new release rows after the highest existing range, and warns
+when an existing split's contents no longer match the current master rows for
+that range. It does not rewrite mismatched frozen splits unless you ask for
+regeneration.
+
+Release rows are kept together when they fit within the configured row limit. By
+default that limit is 500 rows. If one release has more rows than the configured
+limit, that release can be split across files and the report includes a warning.
+
+To regenerate split files, pass a target:
+
+```bash
+python3 scripts/discogs_playlist_splitter.py --regenerate all
+python3 scripts/discogs_playlist_splitter.py --regenerate Techno
+python3 scripts/discogs_playlist_splitter.py --regenerate "Discogs - Techno"
+```
+
+`all` regenerates every playlist folder with a master CSV. A named target can
+match the folder name or the display playlist name after safe file-name cleanup.
+
 ## Creating playlists with TuneMyMusic
 
-The exporter only writes local CSV files. To create the actual playlist in
-Spotify, Apple Music, YouTube Music, TIDAL, or another destination service, use
-TuneMyMusic's web transfer flow:
+The exporter and splitter only write local CSV files. To create the actual
+playlist in Spotify, Apple Music, YouTube Music, TIDAL, or another destination
+service, use TuneMyMusic's web transfer flow:
 
 ```text
 https://www.tunemymusic.com/transfer
@@ -399,26 +457,27 @@ artist, album, and unique identifiers when present. The generated playlist CSV
 includes `Track Name`, `Artist Name`, and `Album Name`, plus the local
 `Release Id` audit column.
 
-Use this flow for each generated playlist CSV:
+Use this flow for each split CSV:
 
 1. Open `https://www.tunemymusic.com/transfer`.
 2. Choose `Upload file` as the source.
-3. Upload one file from `collection/playlists`, for example
-   `collection/playlists/Discogs - House.csv`.
+3. Upload one file from a playlist `splits` folder, for example
+   `collection/playlists/Discogs - House/splits/1-500.csv`.
 4. If TuneMyMusic shows a track review step, check that the track names and
    artist names look right before continuing.
 5. Choose the destination music service and authorize TuneMyMusic for the
    account where the playlist should be created.
 6. Choose whether to create a new playlist or add tracks to an existing one. For
-   a new playlist, use the generated CSV file name or the playlist label from
-   the `Playlists` column.
+   a new playlist, use the playlist folder name or the playlist label from the
+   `Playlists` column.
 7. Start the transfer.
 8. At the end, review TuneMyMusic's missing-track list. Download its missing
    tracks CSV when available, then compare it with this tool's playlist export
    report to decide which tracks need manual cleanup.
 
-Upload one generated CSV at a time when you want one streaming-service playlist
-per local playlist label. TuneMyMusic controls destination-service authorization,
+Upload one split CSV at a time. For playlists with multiple split files, create
+the playlist from the first split, then add the later splits to the same
+destination playlist. TuneMyMusic controls destination-service authorization,
 file-size limits, free-plan limits, matching behavior, and missing-track
 reporting, so check its [FAQ](https://www.tunemymusic.com/help?faq=1) or plan
 page if a large playlist is rejected or the site asks you to upgrade.
@@ -431,10 +490,15 @@ The script reads both files:
 - `--master` is the existing enriched CSV. It defaults to
   `collection/enriched-collection.csv` and is created if missing.
 
-Rows already present in the master are preserved. Rows from the new export are
-appended only when their original export fields do not already match a master
-row. Enrichment columns are ignored for this matching step, so existing
-`Style`, `Genre`, notes, or timestamp values do not cause duplicates.
+Rows are matched by `release_id`. Rows from the new export with an existing
+`release_id` refresh that master row's export fields in place. Rows with a new
+`release_id` are appended. Rows from the new export with a missing `release_id`
+are skipped and listed in the report. Duplicate `release_id` values within the
+same export are also skipped and reported after the first one is used.
+
+Enrichment columns are not replaced during the merge, so existing `Style`,
+`Genre`, notes, and timestamp values are preserved unless later enrichment work
+changes them under the normal refresh rules.
 
 Custom columns that already exist in the master are preserved. New export fields
 are also kept in the output.
@@ -556,6 +620,8 @@ review sections. It summarizes the run:
 - blank or not sure count
 - lookup error count
 - output and cache paths
+- refreshed existing release rows
+- skipped export rows with missing or duplicate `release_id`
 - release IDs left blank or not sure, with artist, title, which metadata fields
   are missing, and style or genre notes when present
 
@@ -660,9 +726,10 @@ Each script prints a run summary at the end.
   one lookup ended with an error status.
 - `discogs_style_enricher.py` returns `1` for handled file, directory, processed
   export collision, and validation errors.
-- `discogs_playlist_mapper.py` and `discogs_playlist_exporter.py` return `0` on
-  success and `1` for handled file, config, cache, and input validation errors.
-- `discogs_make_playlists.py` returns `0` when all three steps return `0`.
+- `discogs_playlist_mapper.py`, `discogs_playlist_exporter.py`, and
+  `discogs_playlist_splitter.py` return `0` on success and `1` for handled file,
+  config, cache, and input validation errors.
+- `discogs_make_playlists.py` returns `0` when all four steps return `0`.
   Otherwise it returns the first nonzero step exit code and skips later steps.
 
 Rows with blank lookup status are not treated as command failures. They mean the
@@ -685,14 +752,15 @@ Combined workflow options:
     Folder where default-folder exports are moved after enrichment.
 
 --master PATH
-    Enriched master CSV used by all three steps. When set, the mapper reads
-    from and writes to this path, and the exporter reads from this path.
+    Enriched master CSV used by the enrichment, mapping, and export steps. When
+    set, the mapper reads from and writes to this path, and the exporter reads
+    from this path.
 
 --config PATH
     Playlist map JSON passed to the mapper.
 
 --playlist-output-dir PATH
-    Directory for per-playlist TuneMyMusic CSV files.
+    Directory for per-playlist folders, playlist master CSVs, and split CSVs.
 
 --enrichment-cache PATH
     Discogs style and genre lookup cache JSON passed to the enricher as
@@ -709,6 +777,12 @@ Combined workflow options:
 
 --playlist-report PATH
     Playlist export report path.
+
+--split-report PATH
+    Playlist split report path.
+
+--regenerate-splits TARGET
+    Playlist folder/display name to regenerate, or all, passed to the splitter.
 
 --refresh-existing
     Ask the enricher to replace existing Style and Genre values.
@@ -812,7 +886,8 @@ TuneMyMusic playlist exporter options:
     collection/enriched-collection.csv.
 
 --output-dir PATH
-    Directory for per-playlist CSVs. Defaults to collection/playlists.
+    Directory for per-playlist folders and master CSVs. Defaults to
+    collection/playlists.
 
 --report PATH
     Text report path. Defaults to
@@ -839,6 +914,26 @@ TuneMyMusic playlist exporter options:
     Disable the interactive terminal progress bar.
 ```
 
+Playlist splitter options:
+
+```text
+--output-dir PATH
+    Directory containing playlist folders. Defaults to collection/playlists.
+
+--report PATH
+    Text report path. Defaults to
+    reports/playlist_splits_<timestamp>_report.txt.
+
+--regenerate [TARGET]
+    Regenerate split CSVs for a playlist folder/display name or all. If the
+    option is present without a target, it regenerates all playlists. If omitted,
+    the splitter uses stable update mode for all playlists.
+
+--max-rows COUNT
+    Maximum rows per split CSV. Defaults to 500; use a larger value only when
+    your playlist import tool supports larger files.
+```
+
 Playlist config printer options:
 
 ```text
@@ -859,9 +954,11 @@ CollectionFolder, Date Added, Collection Media Condition,
 Collection Sleeve Condition, Collection Notes
 ```
 
-Extra columns are allowed. Duplicate headers are rejected. Rows without a
-`release_id` value are left blank with `Style Notes` and `Genre Notes` set to
-`missing release_id`.
+Extra columns are allowed. Duplicate headers are rejected. During an incoming
+export merge, rows without a `release_id` value are skipped and listed in the
+report. In an existing master row, missing `release_id` still prevents Discogs
+metadata lookup for that row; missing style or genre fields are left blank and
+marked with `missing release_id` notes.
 
 ## Tests
 

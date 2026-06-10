@@ -154,6 +154,15 @@ class SeenTermsUpdate:
 
 
 @dataclass(frozen=True)
+class MasterMergeSummary:
+    rows: tuple[dict[str, str], ...]
+    appended_count: int
+    refreshed_rows: tuple[str, ...]
+    skipped_missing_release_id_rows: tuple[str, ...]
+    skipped_duplicate_release_id_rows: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class RunSummary:
     input_rows: int
     master_rows_before: int
@@ -176,6 +185,9 @@ class RunSummary:
     seen_terms_initialized: bool = False
     seen_styles_count: int = 0
     seen_genres_count: int = 0
+    refreshed_existing_rows: tuple[str, ...] = ()
+    skipped_missing_release_id_rows: tuple[str, ...] = ()
+    skipped_duplicate_release_id_rows: tuple[str, ...] = ()
 
 
 class DiscogsRateLimiter:
@@ -412,30 +424,69 @@ def original_data_fields(fieldnames: Sequence[str]) -> tuple[str, ...]:
     return tuple(field for field in fieldnames if field not in ENRICHMENT_COLUMNS)
 
 
-def row_signature(row: Mapping[str, str], fieldnames: Sequence[str]) -> tuple[str, ...]:
-    return tuple(str(row.get(field, "") or "") for field in original_data_fields(fieldnames))
-
-
 def merge_master_and_export_rows(
     master_rows: Sequence[Mapping[str, str]],
     export_rows: Sequence[Mapping[str, str]],
     output_fieldnames: Sequence[str],
-) -> tuple[list[dict[str, str]], int]:
+) -> MasterMergeSummary:
     merged_rows = [normalize_row(row, output_fieldnames) for row in master_rows]
     identity_fieldnames = merge_identity_fieldnames(export_rows, output_fieldnames)
-    known_signatures = {row_signature(row, identity_fieldnames) for row in merged_rows}
+    master_release_id_indexes: dict[str, int] = {}
+    for index, row in enumerate(merged_rows):
+        release_id = str(row.get(RELEASE_ID_COLUMN, "") or "").strip()
+        if release_id and release_id not in master_release_id_indexes:
+            master_release_id_indexes[release_id] = index
+    seen_export_release_ids: set[str] = set()
+    refreshed_rows: list[str] = []
+    skipped_missing_release_id_rows: list[str] = []
+    skipped_duplicate_release_id_rows: list[str] = []
     appended_count = 0
 
-    for export_row in export_rows:
+    for row_number, export_row in enumerate(export_rows, start=1):
         normalized_export_row = normalize_row(export_row, output_fieldnames)
-        signature = row_signature(normalized_export_row, identity_fieldnames)
-        if signature in known_signatures:
+        release_id = normalized_export_row.get(RELEASE_ID_COLUMN, "").strip()
+        if not release_id:
+            skipped_missing_release_id_rows.append(format_missing_release_id_detail(row_number, normalized_export_row))
             continue
-        known_signatures.add(signature)
+        if release_id in seen_export_release_ids:
+            skipped_duplicate_release_id_rows.append(
+                format_duplicate_release_id_detail(row_number, release_id, normalized_export_row)
+            )
+            continue
+        seen_export_release_ids.add(release_id)
+        if release_id in master_release_id_indexes:
+            master_row = merged_rows[master_release_id_indexes[release_id]]
+            refreshed_rows.append(format_refreshed_release_detail(master_row, normalized_export_row))
+            for fieldname in identity_fieldnames:
+                master_row[fieldname] = normalized_export_row.get(fieldname, "")
+            continue
         merged_rows.append(normalized_export_row)
+        master_release_id_indexes[release_id] = len(merged_rows) - 1
         appended_count += 1
 
-    return merged_rows, appended_count
+    return MasterMergeSummary(
+        rows=tuple(merged_rows),
+        appended_count=appended_count,
+        refreshed_rows=tuple(refreshed_rows),
+        skipped_missing_release_id_rows=tuple(skipped_missing_release_id_rows),
+        skipped_duplicate_release_id_rows=tuple(skipped_duplicate_release_id_rows),
+    )
+
+
+def format_missing_release_id_detail(row_number: int, row: Mapping[str, str]) -> str:
+    return f"Export row {row_number}: missing release_id | {row.get('Artist', '')} | {row.get('Title', '')}"
+
+
+def format_duplicate_release_id_detail(row_number: int, release_id: str, row: Mapping[str, str]) -> str:
+    return f"Export row {row_number}: duplicate release_id {release_id} | {row.get('Artist', '')} | {row.get('Title', '')}"
+
+
+def format_refreshed_release_detail(master_row: Mapping[str, str], export_row: Mapping[str, str]) -> str:
+    release_id = str(master_row.get(RELEASE_ID_COLUMN, "") or "").strip()
+    return (
+        f"release_id {release_id} | {master_row.get('Artist', '')} | {master_row.get('Title', '')}"
+        f" -> {export_row.get('Artist', '')} | {export_row.get('Title', '')}"
+    )
 
 
 def merge_identity_fieldnames(
@@ -1094,11 +1145,12 @@ def run_enrichment(args: argparse.Namespace) -> RunSummary:
         master_rows, master_fieldnames = [], export_fieldnames
 
     output_fieldnames = build_output_fieldnames([*master_fieldnames, *export_fieldnames])
-    merged_rows, appended_rows = merge_master_and_export_rows(
+    merge_summary = merge_master_and_export_rows(
         master_rows=master_rows,
         export_rows=export_rows,
         output_fieldnames=output_fieldnames,
     )
+    merged_rows = list(merge_summary.rows)
     cache = load_lookup_cache(args.cache)
     lookup_metadata = make_cached_lookup(
         cache=cache,
@@ -1132,7 +1184,7 @@ def run_enrichment(args: argparse.Namespace) -> RunSummary:
         input_rows=len(export_rows),
         master_rows_before=len(master_rows),
         output_rows=len(merged_rows),
-        appended_rows=appended_rows,
+        appended_rows=merge_summary.appended_count,
         filled_style_count=enrichment_summary.filled_style_count,
         filled_genre_count=enrichment_summary.filled_genre_count,
         preserved_style_count=enrichment_summary.preserved_style_count,
@@ -1150,6 +1202,9 @@ def run_enrichment(args: argparse.Namespace) -> RunSummary:
         seen_terms_initialized=seen_terms_update.initialized if seen_terms_update else False,
         seen_styles_count=len(seen_terms_update.terms.styles) if seen_terms_update else 0,
         seen_genres_count=len(seen_terms_update.terms.genres) if seen_terms_update else 0,
+        refreshed_existing_rows=merge_summary.refreshed_rows,
+        skipped_missing_release_id_rows=merge_summary.skipped_missing_release_id_rows,
+        skipped_duplicate_release_id_rows=merge_summary.skipped_duplicate_release_id_rows,
     )
     write_report(args.report, run_summary, merged_rows)
     if move_processed_export_enabled and run_summary.error_count == 0:
@@ -1192,6 +1247,17 @@ def write_report(path: Path, summary: RunSummary, rows: Sequence[Mapping[str, st
     lines.extend(format_report_section("Summary", summary_lines))
     lines.extend(format_report_section("Files", file_lines))
     lines.extend(format_seen_terms_report_section(summary))
+    lines.extend(
+        format_report_section(
+            "Refreshed existing release rows",
+            format_detail_bullets(summary.refreshed_existing_rows),
+        )
+    )
+    skipped_export_rows = [
+        *summary.skipped_missing_release_id_rows,
+        *summary.skipped_duplicate_release_id_rows,
+    ]
+    lines.extend(format_report_section("Skipped export rows", format_detail_bullets(skipped_export_rows)))
     review_lines: list[str] = []
     if summary.not_sure_release_ids:
         for index, release_id in enumerate(summary.not_sure_release_ids):
@@ -1202,6 +1268,12 @@ def write_report(path: Path, summary: RunSummary, rows: Sequence[Mapping[str, st
         review_lines.append("- None")
     lines.extend(format_report_section("Items left blank / not sure", review_lines))
     write_text_report(path, lines)
+
+
+def format_detail_bullets(details: Sequence[str]) -> list[str]:
+    if not details:
+        return ["- None"]
+    return [f"- {detail}" for detail in details]
 
 
 def format_seen_terms_report_section(summary: RunSummary) -> list[str]:

@@ -9,13 +9,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from helpers import read_csv_text
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIRECTORY = PROJECT_ROOT / "scripts"
+TESTS_DIRECTORY = PROJECT_ROOT / "tests"
+sys.path.insert(0, str(TESTS_DIRECTORY))
 sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 
+from helpers import read_csv_text  # noqa: E402
 import discogs_style_enricher as enricher  # noqa: E402
 from discogs_style_enricher import (  # noqa: E402
     DEFAULT_MASTER_PATH,
@@ -100,40 +101,70 @@ class FieldnameTests(unittest.TestCase):
 
 
 class MergeTests(unittest.TestCase):
-    def test_merge_appends_only_new_export_rows_and_preserves_master_styles(self):
+    def test_merge_refreshes_existing_release_rows_and_appends_new_release_rows(self):
+        master_rows = read_csv_text(
+            "Catalog#,Artist,Title,Released,Format,Style,Genre,Style Notes,Genre Notes,Updated At,release_id,Date Added,My Notes\n"
+            "A1,Old Artist,Old Title,2023,Vinyl,House,Electronic,style note,genre note,2026-01-01T10:00:00Z,111,2026-01-01,keep this\n"
+        )
+        export_rows = read_csv_text(
+            "Catalog#,Artist,Title,Released,Format,release_id,Date Added\n"
+            "A1,New Artist,New Title,2024,CD,111,2026-06-01\n"
+            "B2,Second Artist,Second Title,2025,Vinyl,222,2026-06-04\n"
+        )
+        output_fields = build_output_fieldnames(
+            [
+                "Catalog#",
+                "Artist",
+                "Title",
+                "Released",
+                "Format",
+                "Style",
+                "Genre",
+                "Style Notes",
+                "Genre Notes",
+                "Updated At",
+                "release_id",
+                "Date Added",
+                "My Notes",
+            ]
+        )
+
+        summary = merge_master_and_export_rows(
+            master_rows=master_rows,
+            export_rows=export_rows,
+            output_fieldnames=output_fields,
+        )
+
+        self.assertEqual(summary.appended_count, 1)
+        self.assertEqual(len(summary.rows), 2)
+        self.assertEqual(summary.rows[0]["release_id"], "111")
+        self.assertEqual(summary.rows[0]["Artist"], "New Artist")
+        self.assertEqual(summary.rows[0]["Title"], "New Title")
+        self.assertEqual(summary.rows[0]["Released"], "2024")
+        self.assertEqual(summary.rows[0]["Format"], "CD")
+        self.assertEqual(summary.rows[0]["Style"], "House")
+        self.assertEqual(summary.rows[0]["Genre"], "Electronic")
+        self.assertEqual(summary.rows[0]["Style Notes"], "style note")
+        self.assertEqual(summary.rows[0]["Genre Notes"], "genre note")
+        self.assertEqual(summary.rows[0]["Updated At"], "2026-01-01T10:00:00Z")
+        self.assertEqual(summary.rows[0]["My Notes"], "keep this")
+        self.assertEqual(summary.rows[1]["release_id"], "222")
+        self.assertEqual(summary.rows[1]["Style"], "")
+        self.assertEqual(
+            summary.refreshed_rows,
+            ("release_id 111 | Old Artist | Old Title -> New Artist | New Title",),
+        )
+
+    def test_merge_skips_blank_and_duplicate_export_release_ids(self):
         master_rows = read_csv_text(
             "Catalog#,Artist,Title,Released,Style,release_id,Date Added\n"
             "A1,Existing Artist,Existing Title,2024,House,111,2026-01-01\n"
         )
         export_rows = read_csv_text(
             "Catalog#,Artist,Title,Released,release_id,Date Added\n"
-            "A1,Existing Artist,Existing Title,2024,111,2026-01-01\n"
-            "B2,Cauê (6),Revelations,2024,30887115,2026-06-04\n"
-        )
-        output_fields = build_output_fieldnames(
-            ["Catalog#", "Artist", "Title", "Released", "Style", "release_id", "Date Added"]
-        )
-
-        merged_rows, appended_count = merge_master_and_export_rows(
-            master_rows=master_rows,
-            export_rows=export_rows,
-            output_fieldnames=output_fields,
-        )
-
-        self.assertEqual(appended_count, 1)
-        self.assertEqual(len(merged_rows), 2)
-        self.assertEqual(merged_rows[0]["Style"], "House")
-        self.assertEqual(merged_rows[1]["release_id"], "30887115")
-        self.assertEqual(merged_rows[1]["Style"], "")
-
-    def test_merge_ignores_master_only_custom_columns_when_matching_export_rows(self):
-        master_rows = read_csv_text(
-            "Catalog#,Artist,Title,Released,Style,release_id,Date Added,My Notes\n"
-            "A1,Existing Artist,Existing Title,2024,House,111,2026-01-01,keep this\n"
-        )
-        export_rows = read_csv_text(
-            "Catalog#,Artist,Title,Released,release_id,Date Added\n"
-            "A1,Existing Artist,Existing Title,2024,111,2026-01-01\n"
+            "B2,Missing Artist,Missing Title,2024,,2026-06-01\n"
+            "C3,First Duplicate Artist,First Duplicate Title,2024,222,2026-06-02\n"
+            "D4,Second Duplicate Artist,Second Duplicate Title,2024,222,2026-06-03\n"
         )
         output_fields = build_output_fieldnames(
             [
@@ -144,19 +175,26 @@ class MergeTests(unittest.TestCase):
                 "Style",
                 "release_id",
                 "Date Added",
-                "My Notes",
             ]
         )
 
-        merged_rows, appended_count = merge_master_and_export_rows(
+        summary = merge_master_and_export_rows(
             master_rows=master_rows,
             export_rows=export_rows,
             output_fieldnames=output_fields,
         )
 
-        self.assertEqual(appended_count, 0)
-        self.assertEqual(len(merged_rows), 1)
-        self.assertEqual(merged_rows[0]["My Notes"], "keep this")
+        self.assertEqual(summary.appended_count, 1)
+        self.assertEqual([row["release_id"] for row in summary.rows], ["111", "222"])
+        self.assertEqual(summary.rows[1]["Artist"], "First Duplicate Artist")
+        self.assertEqual(
+            summary.skipped_missing_release_id_rows,
+            ("Export row 1: missing release_id | Missing Artist | Missing Title",),
+        )
+        self.assertEqual(
+            summary.skipped_duplicate_release_id_rows,
+            ("Export row 3: duplicate release_id 222 | Second Duplicate Artist | Second Duplicate Title",),
+        )
 
 
 class EnrichmentTests(unittest.TestCase):
@@ -509,7 +547,7 @@ class ReportTests(unittest.TestCase):
             report_lines = report_path.read_text(encoding="utf-8").splitlines()
 
         self.assertEqual(
-            report_lines[:24],
+            report_lines[:32],
             [
                 "Discogs style and genre enrichment report",
                 "=========================================",
@@ -532,6 +570,14 @@ class ReportTests(unittest.TestCase):
                 "- Output: collection/enriched-collection.csv",
                 "- Cache: collection/cache/processing.cache.json",
                 "",
+                "Refreshed existing release rows",
+                "-------------------------------",
+                "- None",
+                "",
+                "Skipped export rows",
+                "-------------------",
+                "- None",
+                "",
                 "Items left blank / not sure",
                 "---------------------------",
                 "- None",
@@ -541,6 +587,60 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn(
             "Consider mapping useful new styles and genres in the playlist mapper config.",
             report_lines,
+        )
+
+    def test_write_report_lists_refreshed_and_skipped_export_rows(self):
+        summary = enricher.RunSummary(
+            input_rows=4,
+            master_rows_before=1,
+            output_rows=2,
+            appended_rows=1,
+            filled_style_count=0,
+            filled_genre_count=0,
+            preserved_style_count=2,
+            preserved_genre_count=2,
+            blank_count=0,
+            error_count=0,
+            not_sure_release_ids=(),
+            output_path=Path("collection/enriched-collection.csv"),
+            report_path=Path("reports/report.txt"),
+            cache_path=Path("collection/cache/processing.cache.json"),
+            processed_export_path=None,
+            refreshed_existing_rows=(
+                "release_id 111 | Old Artist | Old Title -> New Artist | New Title",
+            ),
+            skipped_missing_release_id_rows=(
+                "Export row 2: missing release_id | Missing Artist | Missing Title",
+            ),
+            skipped_duplicate_release_id_rows=(
+                "Export row 4: duplicate release_id 222 | Duplicate Artist | Duplicate Title",
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            report_path = Path(temporary_directory) / "report.txt"
+
+            enricher.write_report(report_path, summary, [])
+
+            report_text = report_path.read_text(encoding="utf-8")
+
+        self.assertIn("Refreshed existing release rows", report_text)
+        self.assertIn(
+            "- release_id 111 | Old Artist | Old Title -> New Artist | New Title",
+            report_text,
+        )
+        self.assertIn("Skipped export rows", report_text)
+        self.assertIn(
+            "- Export row 2: missing release_id | Missing Artist | Missing Title",
+            report_text,
+        )
+        self.assertIn(
+            "- Export row 4: duplicate release_id 222 | Duplicate Artist | Duplicate Title",
+            report_text,
+        )
+        self.assertLess(
+            report_text.index("Refreshed existing release rows"),
+            report_text.index("Skipped export rows"),
         )
 
     def test_print_summary_omits_styles_and_genres_section_when_no_new_terms_were_found(self):

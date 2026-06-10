@@ -112,8 +112,8 @@ class PlaylistExporterTests(unittest.TestCase):
                 lookup_tracklist=lambda row: lookups[row["release_id"]],
             )
 
-            breakbeat_path = output_directory / "Discogs - Breakbeat.csv"
-            house_path = output_directory / "Discogs - House.csv"
+            breakbeat_path = output_directory / "Discogs - Breakbeat" / "Discogs - Breakbeat.csv"
+            house_path = output_directory / "Discogs - House" / "Discogs - House.csv"
             breakbeat_rows = read_csv_file(breakbeat_path)
             house_rows = read_csv_file(house_path)
 
@@ -142,6 +142,8 @@ class PlaylistExporterTests(unittest.TestCase):
             self.assertEqual(house_rows[0]["Track Name"], "Beta One")
             self.assertIn(str(breakbeat_path), report_path.read_text(encoding="utf-8"))
             self.assertIn(str(house_path), report_path.read_text(encoding="utf-8"))
+            self.assertFalse((output_directory / "Discogs - Breakbeat.csv").exists())
+            self.assertFalse((output_directory / "Discogs - House.csv").exists())
 
     def test_falls_back_to_release_rows_and_reports_uncertain_exports(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -172,7 +174,7 @@ class PlaylistExporterTests(unittest.TestCase):
                 lookup_tracklist=lambda row: empty_lookup,
             )
 
-            rows = read_csv_file(output_directory / "Discogs - Breakbeat.csv")
+            rows = read_csv_file(output_directory / "Discogs - Breakbeat" / "Discogs - Breakbeat.csv")
             report_text = report_path.read_text(encoding="utf-8")
 
             self.assertEqual(summary.track_row_count, 2)
@@ -190,8 +192,8 @@ class PlaylistExporterTests(unittest.TestCase):
             input_path = directory / "enriched-collection.csv"
             output_directory = directory / "playlists"
             report_path = directory / "playlist-export-report.txt"
-            output_directory.mkdir()
-            existing_playlist_path = output_directory / "Discogs - Breakbeat.csv"
+            existing_playlist_path = output_directory / "Discogs - Breakbeat" / "Discogs - Breakbeat.csv"
+            existing_playlist_path.parent.mkdir(parents=True)
             existing_playlist_path.write_text(
                 "Release Id,Album Name,Track Number,Track Name,Artist Name,Spotify Search Query\n"
                 "111,Alpha Album,1,Alpha One,Alpha Artist,Alpha Artist Alpha One Alpha Album\n"
@@ -252,8 +254,8 @@ class PlaylistExporterTests(unittest.TestCase):
             input_path = directory / "enriched-collection.csv"
             output_directory = directory / "playlists"
             report_path = directory / "playlist-export-report.txt"
-            output_directory.mkdir()
-            stale_path = output_directory / "Discogs - Old.csv"
+            stale_path = output_directory / "Discogs - Old" / "Discogs - Old.csv"
+            stale_path.parent.mkdir(parents=True)
             stale_path.write_text(
                 "Release Id,Album Name,Track Number,Track Name,Artist Name,Spotify Search Query\n"
                 "999,Old Album,1,Old Track,Old Artist,Old Artist Old Track Old Album\n",
@@ -286,14 +288,97 @@ class PlaylistExporterTests(unittest.TestCase):
             self.assertIn("previous playlist file was not regenerated in this run; file left unchanged", report_text)
             self.assertIn("999 | Old Artist | Old Album | 1 track row", report_text)
 
-    def test_release_change_report_handles_missing_release_ids_by_artist_and_album(self):
+    def test_stale_root_playlist_file_is_not_reported_as_current_generated_playlist_file(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
             input_path = directory / "enriched-collection.csv"
             output_directory = directory / "playlists"
             report_path = directory / "playlist-export-report.txt"
             output_directory.mkdir()
-            existing_playlist_path = output_directory / "Discogs - Breakbeat.csv"
+            stale_root_path = output_directory / "Discogs - Old.csv"
+            stale_root_path.write_text(
+                "Release Id,Album Name,Track Number,Track Name,Artist Name,Spotify Search Query\n"
+                "999,Old Album,1,Old Track,Old Artist,Old Artist Old Track Old Album\n",
+                encoding="utf-8",
+            )
+            input_path.write_text(
+                "release_id,Artist,Title,Released,Format,Playlists\n"
+                '111,Alpha Artist,Alpha Album,1997,"Vinyl, LP, Album",Discogs - Breakbeat\n',
+                encoding="utf-8",
+            )
+            lookup = exporter.ReleaseTracklistLookup(
+                release_id="111",
+                artist_name="Alpha Artist",
+                album_name="Alpha Album",
+                record_year="1997",
+                tracks=(exporter.DiscogsTrack(position="A1", title="Alpha One", artist_name="Alpha Artist"),),
+                notes=(),
+            )
+
+            summary = exporter.export_playlist_csvs(
+                input_path=input_path,
+                output_directory=output_directory,
+                report_path=report_path,
+                lookup_tracklist=lambda row: lookup,
+            )
+
+            report_text = report_path.read_text(encoding="utf-8")
+            self.assertTrue(stale_root_path.exists())
+            self.assertNotIn("- Discogs - Old:", report_text)
+            self.assertNotIn("999 | Old Artist | Old Album | 1 track row", report_text)
+            self.assertEqual(
+                [change.playlist_name for change in summary.playlist_release_changes],
+                ["Discogs - Breakbeat"],
+            )
+
+    def test_existing_playlist_folder_with_case_variant_is_reused_and_not_reported_stale(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            input_path = directory / "enriched-collection.csv"
+            output_directory = directory / "playlists"
+            report_path = directory / "playlist-export-report.txt"
+            existing_playlist_path = output_directory / "House" / "House.csv"
+            existing_playlist_path.parent.mkdir(parents=True)
+            existing_playlist_path.write_text(
+                "Release Id,Album Name,Track Number,Track Name,Artist Name,Spotify Search Query\n"
+                "111,Alpha Album,1,Old Alpha One,Alpha Artist,Alpha Artist Old Alpha One Alpha Album\n",
+                encoding="utf-8",
+            )
+            input_path.write_text(
+                "release_id,Artist,Title,Released,Format,Playlists\n"
+                '111,Alpha Artist,Alpha Album,1997,"Vinyl, LP, Album",house\n',
+                encoding="utf-8",
+            )
+            lookup = exporter.ReleaseTracklistLookup(
+                release_id="111",
+                artist_name="Alpha Artist",
+                album_name="Alpha Album",
+                record_year="1997",
+                tracks=(exporter.DiscogsTrack(position="A1", title="Alpha One", artist_name="Alpha Artist"),),
+                notes=(),
+            )
+
+            summary = exporter.export_playlist_csvs(
+                input_path=input_path,
+                output_directory=output_directory,
+                report_path=report_path,
+                lookup_tracklist=lambda row: lookup,
+            )
+
+            report_text = report_path.read_text(encoding="utf-8")
+            self.assertEqual(summary.playlist_files[0].path, existing_playlist_path)
+            self.assertEqual(read_csv_file(existing_playlist_path)[0]["Track Name"], "Alpha One")
+            self.assertNotIn("previous playlist file was not regenerated in this run", report_text)
+            self.assertNotIn("Removed releases:", report_text)
+
+    def test_release_change_report_handles_missing_release_ids_by_artist_and_album(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            input_path = directory / "enriched-collection.csv"
+            output_directory = directory / "playlists"
+            report_path = directory / "playlist-export-report.txt"
+            existing_playlist_path = output_directory / "Discogs - Breakbeat" / "Discogs - Breakbeat.csv"
+            existing_playlist_path.parent.mkdir(parents=True)
             existing_playlist_path.write_text(
                 "Release Id,Album Name,Track Number,Track Name,Artist Name,Spotify Search Query\n"
                 ",Old Missing Album,1,Old Missing Album,Old Missing Artist,Old Missing Artist Old Missing Album Old Missing Album\n",
@@ -368,6 +453,25 @@ class PlaylistExporterTests(unittest.TestCase):
         self.assertTrue(default_args.progress)
         self.assertFalse(quiet_args.progress)
 
+    def test_playlist_path_helpers_use_safe_folder_master_paths_and_case_insensitive_suffixes(self):
+        output_directory = Path("collection/playlists")
+
+        folder_paths = exporter.build_playlist_folder_paths(
+            ["House", "house", 'Discogs: "Breakbeat"'],
+            output_directory,
+        )
+        master_paths = exporter.build_playlist_paths(
+            ["House", "house", 'Discogs: "Breakbeat"'],
+            output_directory,
+        )
+
+        self.assertEqual(folder_paths["House"], output_directory / "House")
+        self.assertEqual(folder_paths["house"], output_directory / "house (2)")
+        self.assertEqual(folder_paths['Discogs: "Breakbeat"'], output_directory / "Discogs_ _Breakbeat_")
+        self.assertEqual(exporter.playlist_master_path(output_directory / "House"), output_directory / "House" / "House.csv")
+        self.assertEqual(master_paths["House"], output_directory / "House" / "House.csv")
+        self.assertEqual(master_paths["house"], output_directory / "house (2)" / "house (2).csv")
+
     def test_print_summary_includes_playlist_release_changes(self):
         summary = exporter.PlaylistExportSummary(
             input_rows=1,
@@ -381,14 +485,14 @@ class PlaylistExporterTests(unittest.TestCase):
             playlist_files=(
                 exporter.PlaylistExportFile(
                     playlist_name="Discogs - Breakbeat",
-                    path=Path("collection/playlists/Discogs - Breakbeat.csv"),
+                    path=Path("collection/playlists/Discogs - Breakbeat/Discogs - Breakbeat.csv"),
                     row_count=1,
                 ),
             ),
             playlist_release_changes=(
                 exporter.PlaylistReleaseChange(
                     playlist_name="Discogs - Breakbeat",
-                    path=Path("collection/playlists/Discogs - Breakbeat.csv"),
+                    path=Path("collection/playlists/Discogs - Breakbeat/Discogs - Breakbeat.csv"),
                     added_releases=(
                         exporter.ReleaseReportEntry(
                             key=("release_id", "222", ""),
@@ -429,7 +533,7 @@ class PlaylistExporterTests(unittest.TestCase):
             (
                 exporter.PlaylistReleaseChange(
                     playlist_name="Discogs - Techno",
-                    path=Path("collection/playlists/Discogs - Techno.csv"),
+                    path=Path("collection/playlists/Discogs - Techno/Discogs - Techno.csv"),
                     added_releases=(),
                     removed_releases=(),
                 ),
