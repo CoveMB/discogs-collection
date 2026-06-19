@@ -14,12 +14,12 @@ def readable_timestamp() -> str:
     return dt.datetime.now().replace(microsecond=0).strftime("%Y-%m-%d_%H-%M-%S")
 
 
-def timestamped_report_path(
-    output_path: Path,
-    report_suffix: str,
+def script_report_path(
+    script_path: Path | str,
     directory: Path = DEFAULT_REPORT_DIRECTORY,
 ) -> Path:
-    return directory / f"{output_path.stem}_{readable_timestamp()}_{report_suffix}.txt"
+    script_name = Path(script_path).stem
+    return directory / f"{readable_timestamp()}_{script_name}.txt"
 
 
 def format_report_title(title: str) -> list[str]:

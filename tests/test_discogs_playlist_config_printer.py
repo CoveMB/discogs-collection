@@ -34,14 +34,13 @@ class PlaylistConfigPrinterTests(unittest.TestCase):
             self.assertIn("4. Check Style aliases first.", output)
             self.assertIn("6. Use Genre aliases only when Style creates no playlist.", output)
             self.assertIn("8. Allow the same raw term under multiple playlist labels.", output)
-            self.assertIn("Playlist prefix\n---------------\nDiscogs -", output)
             self.assertIn("Excluded raw Discogs terms\n--------------------------", output)
             self.assertIn("- Electronic", output)
             self.assertIn("- Electro", output)
             self.assertIn("Playlist labels and raw Discogs terms\n-------------------------------------", output)
-            self.assertIn("- Bossanova -> Discogs - Bossanova", output)
+            self.assertIn("- Bossanova -> Bossanova", output)
             self.assertIn("Raw Discogs terms: Bossa Nova, Bossanova", output)
-            self.assertIn("- Breakbeat -> Discogs - Breakbeat", output)
+            self.assertIn("- Breakbeat -> Breakbeat", output)
             self.assertIn("Raw Discogs terms: Breakbeat, Breaks", output)
 
     def test_cli_creates_missing_config_and_prints_blank_config(self):
@@ -58,13 +57,11 @@ class PlaylistConfigPrinterTests(unittest.TestCase):
             self.assertEqual(
                 json.loads(config_path.read_text(encoding="utf-8")),
                 {
-                    "playlist_prefix": "Discogs - ",
                     "excluded_terms": [],
                     "playlists": {},
                 },
             )
             self.assertIn("Status: Created blank playlist config.", output)
-            self.assertIn("Playlist prefix\n---------------\nDiscogs -", output)
             self.assertIn("- None configured.", output)
             self.assertIn("No playlists configured yet.", output)
 

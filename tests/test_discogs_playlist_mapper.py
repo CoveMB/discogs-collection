@@ -24,7 +24,7 @@ class PlaylistMapperTests(unittest.TestCase):
                 {"Style": "Bossa Nova, Bossanova", "Genre": ""},
                 config,
             ),
-            "Discogs - Bossanova",
+            "Bossanova",
         )
 
     def test_breakbeat_aliases_map_to_configured_playlist_label(self):
@@ -35,7 +35,7 @@ class PlaylistMapperTests(unittest.TestCase):
                 {"Style": "Breakbeat, Breaks", "Genre": ""},
                 config,
             ),
-            "Discogs - Breakbeat",
+            "Breakbeat",
         )
 
     def test_excluded_terms_never_create_playlists(self):
@@ -57,7 +57,7 @@ class PlaylistMapperTests(unittest.TestCase):
                 {"Style": "House", "Genre": "Breakbeat"},
                 config,
             ),
-            "Discogs - House",
+            "House",
         )
 
     def test_genre_mapping_is_used_only_when_style_has_no_mapped_playlist(self):
@@ -68,7 +68,7 @@ class PlaylistMapperTests(unittest.TestCase):
                 {"Style": "Electronic", "Genre": "Breakbeat"},
                 config,
             ),
-            "Discogs - Breakbeat",
+            "Breakbeat",
         )
 
     def test_one_row_can_get_multiple_ordered_playlists(self):
@@ -79,7 +79,7 @@ class PlaylistMapperTests(unittest.TestCase):
                 {"Style": "House, Breaks", "Genre": ""},
                 config,
             ),
-            "Discogs - Breakbeat, Discogs - House",
+            "Breakbeat, House",
         )
 
     def test_duplicate_source_terms_do_not_duplicate_playlists(self):
@@ -90,7 +90,7 @@ class PlaylistMapperTests(unittest.TestCase):
                 {"Style": "Breakbeat, Breaks, breakbeat", "Genre": ""},
                 config,
             ),
-            "Discogs - Breakbeat",
+            "Breakbeat",
         )
 
     def test_unmapped_rows_get_blank_playlists(self):
@@ -124,8 +124,8 @@ class PlaylistMapperTests(unittest.TestCase):
         self.assertEqual(output_rows[1]["Custom"], "also keep")
         self.assertEqual(output_rows[0]["release_id"], "111")
         self.assertEqual(output_rows[1]["release_id"], "222")
-        self.assertEqual(output_rows[0]["Playlists"], "Discogs - House")
-        self.assertEqual(output_rows[1]["Playlists"], "Discogs - Breakbeat")
+        self.assertEqual(output_rows[0]["Playlists"], "House")
+        self.assertEqual(output_rows[1]["Playlists"], "Breakbeat")
 
     def test_one_raw_term_can_create_multiple_playlist_labels(self):
         payload = sample_config()
@@ -138,8 +138,15 @@ class PlaylistMapperTests(unittest.TestCase):
                 {"Style": "Breakbeat", "Genre": ""},
                 config,
             ),
-            "Discogs - Breakbeat, Discogs - House",
+            "Breakbeat, House",
         )
+
+    def test_playlist_prefix_config_is_rejected_for_playlist_map(self):
+        payload = sample_config()
+        payload["playlist_prefix"] = "Discogs - "
+
+        with self.assertRaisesRegex(ValueError, "unknown playlist config key: playlist_prefix"):
+            mapper.normalize_playlist_config(payload)
 
     def test_excluded_playlist_overlap_fails_clearly(self):
         payload = sample_config()
@@ -153,6 +160,7 @@ class PlaylistMapperTests(unittest.TestCase):
             directory = Path(temporary_directory)
             input_path = directory / "enriched.csv"
             output_path = directory / "mapped.csv"
+            report_path = directory / "playlist-report.txt"
             config_path = directory / "playlist-map.json"
             input_path.write_text(
                 "Catalog#,Artist,Style,Genre\n"
@@ -172,14 +180,16 @@ class PlaylistMapperTests(unittest.TestCase):
                         str(output_path),
                         "--config",
                         str(config_path),
+                        "--report",
+                        str(report_path),
                     ]
                 )
 
             self.assertEqual(exit_code, 0)
             output_rows = read_csv_text(output_path.read_text(encoding="utf-8"))
-            self.assertEqual(output_rows[0]["Playlists"], "Discogs - House")
-            self.assertEqual(output_rows[1]["Playlists"], "Discogs - Breakbeat")
-            self.assertEqual(output_rows[2]["Playlists"], "Discogs - House")
+            self.assertEqual(output_rows[0]["Playlists"], "House")
+            self.assertEqual(output_rows[1]["Playlists"], "Breakbeat")
+            self.assertEqual(output_rows[2]["Playlists"], "House")
 
     def test_cli_writes_report_listing_every_release_playlist_association(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -224,7 +234,7 @@ class PlaylistMapperTests(unittest.TestCase):
                 "- Release ID: 111\n"
                 "  Artist: First Artist\n"
                 "  Title: First Title\n"
-                "  Playlists: Discogs - House",
+                "  Playlists: House",
                 stdout_text,
             )
             self.assertIn(
@@ -255,21 +265,21 @@ class PlaylistMapperTests(unittest.TestCase):
                 "- Release ID: 111\n"
                 "  Artist: First Artist\n"
                 "  Title: First Title\n"
-                "  Playlists: Discogs - House",
+                "  Playlists: House",
                 report_text,
             )
             self.assertIn(
                 "- Release ID: 222\n"
                 "  Artist: Second Artist\n"
                 "  Title: Second Title\n"
-                "  Playlists: Discogs - Breakbeat",
+                "  Playlists: Breakbeat",
                 report_text,
             )
             self.assertIn(
                 "- Release ID: 333\n"
                 "  Artist: Third Artist\n"
                 "  Title: Third Title\n"
-                "  Playlists: Discogs - House",
+                "  Playlists: House",
                 report_text,
             )
             self.assertIn(
@@ -347,7 +357,7 @@ class PlaylistMapperTests(unittest.TestCase):
         self.assertEqual(args.output, Path("collection/enriched-collection.csv"))
         self.assertEqual(
             args.report,
-            Path("reports/enriched-collection_2026-06-05_15-30-00_playlist_report.txt"),
+            Path("reports/2026-06-05_15-30-00_discogs_playlist_mapper.txt"),
         )
 
 

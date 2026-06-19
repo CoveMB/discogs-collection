@@ -18,7 +18,6 @@ def write_json(path: Path, payload: object) -> None:
 
 def sample_playlist_config() -> dict[str, object]:
     return {
-        "playlist_prefix": "Discogs - ",
         "excluded_terms": ["Electronic", "Electro"],
         "playlists": {
             "Bossanova": ["Bossa Nova", "Bossanova"],

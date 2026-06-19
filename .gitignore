@@ -35,6 +35,9 @@ dist/
 **/*-style-report.txt
 reports/*_report.txt
 **/*cache.json
+reports/**.txt
 collection/cache/
 collection/**.json
 config/**
+!config/publisher.json
+!config/workflow.json

@@ -12,9 +12,31 @@ import discogs_playlist_exporter as exporter
 import discogs_playlist_mapper as mapper
 import discogs_playlist_splitter as splitter
 import discogs_style_enricher as enricher
+from publishers.spotify import publish_playlist as spotify_publisher
+from shared.debug_log import DebugLog, build_debug_logger
+from shared.publisher_config import DEFAULT_PUBLISHER_CONFIG_PATH, load_or_create_publisher_config
 
 
 StepMain = Callable[[Sequence[str] | None], int]
+PipelineStep = tuple[str, StepMain, list[str]]
+SUPPORTED_MAIN_PUBLISHERS = ("spotify", "none")
+NON_PUBLISHING_PUBLISHERS = frozenset({"none"})
+DEBUG_PATH_FIELDS = (
+    "export",
+    "input_dir",
+    "processed_dir",
+    "master",
+    "config",
+    "workflow_config",
+    "playlist_output_dir",
+    "enrichment_cache",
+    "tracklist_cache",
+    "enrichment_report",
+    "mapping_report",
+    "playlist_report",
+    "split_report",
+    "publisher_config",
+)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -32,10 +54,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mapping-report", type=Path, help="Playlist mapping report path.")
     parser.add_argument("--playlist-report", type=Path, help="Playlist export report path.")
     parser.add_argument("--split-report", type=Path, help="Playlist split report path.")
-    parser.add_argument("--regenerate-splits", help="Playlist folder/display name to regenerate, or all, passed to the splitter.")
+    parser.add_argument("--debug-log", type=Path, help="Write sanitized make-playlists pipeline debug logs to this path.")
+    parser.add_argument("--regenerate-splits", help="Playlist folder/display name/path to regenerate, or all, passed to the splitter.")
+    parser.add_argument("--publisher-config", type=Path, default=DEFAULT_PUBLISHER_CONFIG_PATH, help="Publisher JSON config. Defaults to config/publisher.json.")
+    parser.add_argument("--publisher", choices=SUPPORTED_MAIN_PUBLISHERS, help="Publisher override for the workflow. Omit to use default_publisher from the publisher config.")
+    parser.add_argument("--publishing-dry-run", action="store_true", help="Preview playlist publishing without creating or updating Spotify playlists.")
     parser.add_argument("--refresh-existing", action="store_true", help="Ask the enricher to replace existing Style and Genre values.")
     parser.add_argument("--no-seen-terms", action="store_true", help="Disable seen Discogs terms tracking in the enricher.")
-    parser.add_argument("--no-progress", action="store_true", help="Disable progress output in enrichment and playlist export.")
+    parser.add_argument("--no-progress", action="store_true", help="Disable progress output in enrichment, playlist export, and Spotify publishing.")
     parser.add_argument("--timeout-seconds", type=int, help="HTTP timeout per Discogs request for enrichment and playlist export.")
     parser.add_argument(
         "--request-interval-seconds",
@@ -64,6 +90,43 @@ def append_option(arguments: list[str], option: str, value: object | None) -> No
     if value is None:
         return
     arguments.extend([option, str(value)])
+
+
+def log_pipeline_context(args: argparse.Namespace, debug_log: DebugLog) -> None:
+    for field_name in DEBUG_PATH_FIELDS:
+        debug_log(f"path {field_name}={format_debug_value(getattr(args, field_name))}")
+    debug_log(
+        "options "
+        f"refresh_existing={args.refresh_existing} no_seen_terms={args.no_seen_terms} "
+        f"publishing_dry_run={args.publishing_dry_run} "
+        f"no_progress={args.no_progress} timeout_seconds={format_debug_value(args.timeout_seconds)} "
+        f"request_interval_seconds={format_debug_value(args.request_interval_seconds)} "
+        f"max_workers={format_debug_value(args.max_workers)} max_rows={format_debug_value(args.max_rows)} "
+        f"regenerate_splits={format_debug_value(args.regenerate_splits)}"
+    )
+
+
+def format_debug_value(value: object | None) -> str:
+    if value is None:
+        return "(default)"
+    return str(value)
+
+
+def step_option_names(step_args: Sequence[str]) -> str:
+    option_names = [argument for argument in step_args if argument.startswith("--")]
+    return ",".join(option_names) if option_names else "(none)"
+
+
+def available_playlist_publishers(supported_publishers: Sequence[str] | None = None) -> tuple[str, ...]:
+    publishers = SUPPORTED_MAIN_PUBLISHERS if supported_publishers is None else supported_publishers
+    return tuple(publisher for publisher in publishers if publisher not in NON_PUBLISHING_PUBLISHERS)
+
+
+def publisher_disabled_message() -> str:
+    return (
+        "\nPlaylist publishing skipped because the resolved publisher is none. "
+        f"Run with --publisher {', '.join(available_playlist_publishers())} to publish the playlist. "
+    )
 
 
 def build_enricher_args(args: argparse.Namespace) -> list[str]:
@@ -119,37 +182,123 @@ def build_splitter_args(args: argparse.Namespace) -> list[str]:
     return arguments
 
 
-def run_step(label: str, step_main: StepMain, step_args: Sequence[str]) -> int:
-    print(f"\n------------------------------------")
-    print(f"\nRunning {label}...")
-    exit_code = step_main(step_args)
-    return 0 if exit_code is None else int(exit_code)
+def build_spotify_publisher_args(args: argparse.Namespace) -> list[str]:
+    arguments: list[str] = []
+    append_option(arguments, "--playlist-output-dir", args.playlist_output_dir)
+    append_option(arguments, "--publisher-config", args.publisher_config)
+    if args.no_progress:
+        arguments.append("--no-progress")
+    if args.publishing_dry_run:
+        arguments.append("--publishing-dry-run")
+    return arguments
 
 
-def run_pipeline(args: argparse.Namespace) -> int:
-    steps: tuple[tuple[str, StepMain, list[str]], ...] = (
+def resolve_publisher(args: argparse.Namespace) -> str:
+    if args.publisher:
+        return args.publisher
+    publisher_config = load_or_create_publisher_config(args.publisher_config)
+    return publisher_config.default_publisher
+
+
+def skip_publisher(_argv: Sequence[str] | None = None) -> int:
+    print(publisher_disabled_message())
+    return 0
+
+
+def build_publisher_step(args: argparse.Namespace) -> PipelineStep:
+    if args.publisher == "none":
+        return ("Playlist publisher", skip_publisher, [])
+    if args.publisher == "spotify":
+        return ("Spotify playlist publisher", spotify_publisher.main, build_spotify_publisher_args(args))
+    raise ValueError(f"unsupported publisher: {args.publisher}")
+
+
+def build_pipeline_steps(args: argparse.Namespace) -> tuple[PipelineStep, ...]:
+    return (
         ("Discogs style enricher", enricher.main, build_enricher_args(args)),
         ("Discogs playlist mapper", mapper.main, build_mapper_args(args)),
         ("Discogs playlist exporter", exporter.main, build_exporter_args(args)),
         ("Discogs playlist splitter", splitter.main, build_splitter_args(args)),
+        build_publisher_step(args),
     )
+
+
+def run_step(
+    label: str,
+    step_main: StepMain,
+    step_args: Sequence[str],
+    step_index: int = 1,
+    total_steps: int = 1,
+    debug_log: DebugLog | None = None,
+) -> int:
+    if debug_log:
+        debug_log(
+            f"step_start index={step_index} total={total_steps} label={label} "
+            f"arg_count={len(step_args)} options={step_option_names(step_args)}"
+        )
+    print(f"\n------------------------------------")
+    print(f"\nRunning {label}...")
+    exit_code = step_main(step_args)
+    normalized_exit_code = 0 if exit_code is None else int(exit_code)
+    if debug_log:
+        debug_log(f"step_end index={step_index} total={total_steps} label={label} exit_code={normalized_exit_code}")
+    return normalized_exit_code
+
+
+def run_pipeline(
+    args: argparse.Namespace,
+    debug_log: DebugLog | None = None,
+) -> int:
+    steps = build_pipeline_steps(args)
+    if debug_log:
+        debug_log(f"pipeline_steps count={len(steps)}")
     for index, (label, step_main, step_args) in enumerate(steps):
-        exit_code = run_step(label, step_main, step_args)
+        exit_code = run_step(
+            label=label,
+            step_main=step_main,
+            step_args=step_args,
+            step_index=index + 1,
+            total_steps=len(steps),
+            debug_log=debug_log,
+        )
         if exit_code == 0:
             continue
         if index + 1 < len(steps):
             next_label = steps[index + 1][0]
+            if debug_log:
+                debug_log(f"stopping failed_step={label} next_step={next_label} exit_code={exit_code}")
             print(
                 f"Stopping before {next_label} because {label} exited with code {exit_code}.",
                 file=sys.stderr,
             )
+        elif debug_log:
+            debug_log(f"stopping failed_step={label} next_step=(none) exit_code={exit_code}")
         return exit_code
+    if debug_log:
+        debug_log("pipeline_completed exit_code=0")
     return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv)
-    return run_pipeline(args)
+    debug_log: DebugLog | None = None
+    try:
+        args = parse_args(argv)
+        debug_log = build_debug_logger(args.debug_log)
+        if debug_log:
+            debug_log("start discogs_make_playlists")
+            log_pipeline_context(args, debug_log)
+        args.publisher = resolve_publisher(args)
+        if debug_log:
+            debug_log(f"resolved_publisher value={args.publisher}")
+    except ValueError as error:
+        if debug_log:
+            debug_log(f"error type={type(error).__name__}")
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+    exit_code = run_pipeline(args, debug_log)
+    if debug_log:
+        debug_log(f"completed exit_code={exit_code}")
+    return exit_code
 
 
 if __name__ == "__main__":

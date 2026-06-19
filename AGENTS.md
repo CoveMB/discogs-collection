@@ -6,13 +6,17 @@ This project contains small Python CLIs for working with Discogs collection
 export CSV files. The main workflow enriches releases with explicit style and
 genre metadata from Discogs, maps those terms to local playlist labels, exports
 TuneMyMusic-style master CSV files per playlist, and creates split CSVs for
-playlist import batches.
+playlist import batches. The optional Spotify publisher starts from those
+playlist CSVs, can publish matched tracks to Spotify, and still supports
+explicit dry-run previews.
 
 The tool should stay focused on this workflow: read Discogs export rows, use
 `release_id` to find explicit Discogs metadata, write an enriched CSV with audit
 columns, map configured playlist labels, export reviewable playlist CSVs from
 Discogs tracklists, and write split CSVs in each playlist folder with a 500-row
-default batch size.
+default batch size. Spotify publisher code belongs under
+`scripts/publishers/spotify/` and should keep matching, API client, auth/cache,
+and CLI orchestration concerns separate.
 
 Do not add style or genre guessing, fuzzy matching, machine learning, broad
 scraping, or collection management features unless the user asks for them.

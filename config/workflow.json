@@ -1,0 +1,5 @@
+{
+  "max_rows_per_split": 500,
+  "keep_release_tracks_together": true,
+  "create_new_split_files_for_new_releases": true
+}

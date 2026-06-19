@@ -13,16 +13,14 @@ from pathlib import Path
 
 from discogs_playlist_exporter import (
     TUNEMYMUSIC_COLUMNS,
-    playlist_master_path,
-    safe_playlist_filename,
 )
 from shared.files import read_csv_file, write_csv_file
+from shared.playlist_selection import resolve_playlist_master_paths
 from shared.reports import (
-    DEFAULT_REPORT_DIRECTORY,
     format_report_section,
     format_report_title,
     print_report_section,
-    readable_timestamp,
+    script_report_path,
     write_text_report,
 )
 from shared.workflow_config import (
@@ -533,45 +531,7 @@ def validate_master_fieldnames(master_path: Path, fieldnames: Sequence[str]) -> 
 
 
 def resolve_master_paths(output_directory: Path, target: str) -> tuple[Path, ...]:
-    if not output_directory.exists():
-        raise FileNotFoundError(output_directory)
-    if not output_directory.is_dir():
-        raise NotADirectoryError(output_directory)
-    if target == "all":
-        master_paths: list[Path] = []
-        for folder_path in sorted(output_directory.iterdir()):
-            if folder_path.is_symlink():
-                raise ValueError(f"{folder_path}: playlist folder symlinks are not supported")
-            if not folder_path.is_dir():
-                continue
-            master_path = playlist_master_path(folder_path)
-            if master_path.exists():
-                master_paths.append(master_path)
-        return tuple(master_paths)
-
-    validate_regenerate_target(target)
-
-    exact_folder_path = output_directory / target
-    if exact_folder_path.is_symlink():
-        raise ValueError(f"{exact_folder_path}: playlist folder symlinks are not supported")
-    exact_master_path = playlist_master_path(exact_folder_path)
-    if exact_master_path.exists():
-        return (exact_master_path,)
-
-    safe_folder_path = output_directory / safe_playlist_filename(target)
-    if safe_folder_path.is_symlink():
-        raise ValueError(f"{safe_folder_path}: playlist folder symlinks are not supported")
-    safe_master_path = playlist_master_path(safe_folder_path)
-    if safe_master_path.exists():
-        return (safe_master_path,)
-
-    raise FileNotFoundError(f"playlist master not found for target: {target}")
-
-
-def validate_regenerate_target(target: str) -> None:
-    target_path = Path(target)
-    if target in {".", ".."} or target_path.is_absolute() or "/" in target or "\\" in target:
-        raise ValueError(f"invalid playlist target: {target}")
+    return resolve_playlist_master_paths(output_directory, [target], allow_all_selector=True)
 
 
 def regenerate_playlist_splits(
@@ -633,7 +593,7 @@ def update_playlist_splits_with_report(
 
 
 def default_report_path() -> Path:
-    return DEFAULT_REPORT_DIRECTORY / f"playlist_splits_{readable_timestamp()}_report.txt"
+    return script_report_path(__file__)
 
 
 def write_report(
@@ -716,8 +676,8 @@ def resolve_workflow_config(args: argparse.Namespace) -> WorkflowConfig:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIRECTORY, help="Directory containing playlist folders. Defaults to collection/playlists.")
-    parser.add_argument("--report", type=Path, help="Text report path. Defaults to reports/playlist_splits_<timestamp>_report.txt.")
-    parser.add_argument("--regenerate", nargs="?", const="all", help="Playlist folder/display name to regenerate, or all. Defaults to stable update for all playlists.")
+    parser.add_argument("--report", type=Path, help="Text report path. Defaults to reports/<timestamp>_discogs_playlist_splitter.txt.")
+    parser.add_argument("--regenerate", nargs="?", const="all", help="Playlist folder/display name/path to regenerate, or all. Defaults to stable update for all playlists.")
     parser.add_argument("--workflow-config", type=Path, default=DEFAULT_WORKFLOW_CONFIG_PATH, help="Workflow JSON config. Defaults to config/workflow.json.")
     parser.add_argument("--max-rows", type=int, help="Maximum rows per split CSV. Overrides workflow config.")
     args = parser.parse_args(argv)

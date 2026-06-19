@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +21,12 @@ def read_csv_file(path: Path) -> list[dict[str, str]]:
 
 
 class PlaylistExporterTests(unittest.TestCase):
+    def test_parse_args_defaults_to_script_report_path(self):
+        with patch("shared.reports.readable_timestamp", return_value="2026-06-10_14-30-00"):
+            args = exporter.parse_args([])
+
+        self.assertEqual(args.report, Path("reports/2026-06-10_14-30-00_discogs_playlist_exporter.txt"))
+
     def test_reports_row_progress_while_exporting_playlist_csvs(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)

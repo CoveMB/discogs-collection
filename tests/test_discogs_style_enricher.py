@@ -1106,14 +1106,16 @@ class RunEnrichmentTests(unittest.TestCase):
     def test_parse_args_defaults_to_export_folder_and_reports_folder(self):
         default_export_path = Path("export/discogs-export.csv")
 
-        with patch.object(enricher, "find_single_csv_export", return_value=default_export_path) as find_export:
+        with (
+            patch.object(enricher, "find_single_csv_export", return_value=default_export_path) as find_export,
+            patch("shared.reports.readable_timestamp", return_value="2026-06-10_14-30-00"),
+        ):
             args = parse_args([])
 
         find_export.assert_called_once_with(Path("export"))
         self.assertEqual(enricher.DEFAULT_INPUT_DIRECTORY, Path("export"))
         self.assertEqual(args.export, default_export_path)
-        self.assertEqual(args.report.parent, Path("reports"))
-        self.assertRegex(args.report.name, r"^enriched-collection_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_report\.txt$")
+        self.assertEqual(args.report, Path("reports/2026-06-10_14-30-00_discogs_style_enricher.txt"))
         self.assertEqual(args.seen_terms, Path("collection/cache/collected.cache.json"))
 
     def test_parse_args_uses_single_csv_from_input_folder_and_default_master(self):

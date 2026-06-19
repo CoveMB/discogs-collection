@@ -20,12 +20,13 @@ from discogs_style_enricher import (
 )
 from shared.discogs_columns import RELEASE_ID_COLUMN
 from shared.files import read_csv_file, write_csv_file, write_json_file
+from shared.playlist_selection import playlist_master_path, safe_playlist_filename
 from shared.progress import ProgressReporter
 from shared.reports import (
     format_report_section,
     format_report_title,
     print_report_section,
-    timestamped_report_path,
+    script_report_path,
     write_text_report,
 )
 from shared.text import split_unique_comma_separated
@@ -543,16 +544,6 @@ def existing_playlist_folder_paths_by_safe_name(output_directory: Path) -> dict[
     return folder_paths
 
 
-def playlist_master_path(folder_path: Path) -> Path:
-    return folder_path / f"{folder_path.name}.csv"
-
-
-def safe_playlist_filename(playlist_name: str) -> str:
-    clean_name = re.sub(r"[\\/:*?\"<>|\x00-\x1f]+", "_", playlist_name).strip()
-    clean_name = re.sub(r"\s+", " ", clean_name)
-    return clean_name or "playlist"
-
-
 def release_tracklist_from_payload(
     release_id: str,
     payload: Mapping[str, object],
@@ -755,7 +746,7 @@ def tracklist_lookup_to_cache_record(lookup: ReleaseTracklistLookup) -> dict[str
 
 
 def default_report_path(output_directory: Path) -> Path:
-    return timestamped_report_path(output_directory, "playlist_export_report")
+    return script_report_path(__file__)
 
 
 def run_playlist_export(args: argparse.Namespace) -> PlaylistExportSummary:
@@ -872,7 +863,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT_PATH, help="Playlist-mapped enriched master CSV. Defaults to collection/enriched-collection.csv.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIRECTORY, help="Directory for per-playlist CSVs. Defaults to collection/playlists.")
-    parser.add_argument("--report", type=Path, help="Text report path. Defaults to reports/playlists_<timestamp>_playlist_export_report.txt.")
+    parser.add_argument("--report", type=Path, help="Text report path. Defaults to reports/<timestamp>_discogs_playlist_exporter.txt.")
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE_PATH, help="Discogs tracklist cache JSON. Defaults to collection/cache/playlist-tracks.cache.json.")
     parser.add_argument("--discogs-token", default=os.environ.get("DISCOGS_TOKEN", ""), help="Optional Discogs personal access token. Defaults to DISCOGS_TOKEN.")
     parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT, help="User-Agent sent to Discogs.")

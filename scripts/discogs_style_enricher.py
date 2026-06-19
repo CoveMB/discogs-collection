@@ -31,7 +31,7 @@ from shared.reports import (
     format_report_section,
     format_report_title,
     print_report_section,
-    timestamped_report_path,
+    script_report_path,
     write_text_report,
 )
 from shared.text import (
@@ -1218,7 +1218,7 @@ def utc_timestamp() -> str:
 
 
 def default_report_path(output_path: Path) -> Path:
-    return timestamped_report_path(output_path, "report")
+    return script_report_path(__file__)
 
 
 def default_cache_path(output_path: Path) -> Path:
@@ -1361,7 +1361,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--processed-dir", type=Path, default=DEFAULT_PROCESSED_DIRECTORY, help="Folder where default-folder exports are moved after successful runs. Defaults to processed.")
     parser.add_argument("--master", type=Path, default=DEFAULT_MASTER_PATH, help="Existing enriched master CSV. Created if missing. Defaults to collection/enriched-collection.csv.")
     parser.add_argument("--output", type=Path, help="Output enriched master CSV. Defaults to --master.")
-    parser.add_argument("--report", type=Path, help="Text report path. Defaults to reports/<output-name>_<timestamp>_report.txt.")
+    parser.add_argument("--report", type=Path, help="Text report path. Defaults to reports/<timestamp>_discogs_style_enricher.txt.")
     parser.add_argument("--cache", type=Path, help="Lookup cache JSON path. Defaults to cache/processing.cache.json under the output CSV folder.")
     parser.add_argument("--seen-terms", type=Path, default=DEFAULT_SEEN_TERMS_PATH, help="Seen Discogs terms JSON path. Defaults to collection/cache/collected.cache.json.")
     parser.add_argument("--no-seen-terms", action="store_true", help="Disable seen Discogs terms tracking for this run.")

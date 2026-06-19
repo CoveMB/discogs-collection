@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +45,12 @@ def write_split(path: Path, rows: list[dict[str, str]]) -> None:
 
 
 class PlaylistSplitterTests(unittest.TestCase):
+    def test_parse_args_defaults_to_script_report_path(self):
+        with patch("shared.reports.readable_timestamp", return_value="2026-06-10_14-30-00"):
+            args = splitter.parse_args([])
+
+        self.assertEqual(args.report, Path("reports/2026-06-10_14-30-00_discogs_playlist_splitter.txt"))
+
     def test_500_rows_produce_one_chunk_ranged_1_to_500(self):
         rows = [playlist_row(str(row_number), 1) for row_number in range(1, 501)]
 
@@ -917,6 +924,59 @@ class PlaylistSplitterTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertTrue((output_directory / folder_name / "splits" / "1-1.csv").exists())
             self.assertTrue((output_directory / folder_name / "splits" / "2-2.csv").exists())
+
+    def test_cli_regenerate_folder_path_target_works(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            output_directory = directory / "playlists"
+            report_path = directory / "split-report.txt"
+            playlist_folder = output_directory / "House"
+            write_master(
+                playlist_folder / "House.csv",
+                [playlist_row("111", 1), playlist_row("222", 1)],
+            )
+
+            result = splitter.main(
+                [
+                    "--output-dir",
+                    str(output_directory),
+                    "--report",
+                    str(report_path),
+                    "--regenerate",
+                    str(playlist_folder),
+                    "--max-rows",
+                    "1",
+                ]
+            )
+
+            self.assertEqual(result, 0)
+            self.assertTrue((playlist_folder / "splits" / "1-1.csv").exists())
+            self.assertTrue((playlist_folder / "splits" / "2-2.csv").exists())
+
+    def test_cli_regenerate_master_csv_path_target_works(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            output_directory = directory / "playlists"
+            report_path = directory / "split-report.txt"
+            master_path = output_directory / "House" / "House.csv"
+            write_master(master_path, [playlist_row("111", 1), playlist_row("222", 1)])
+
+            result = splitter.main(
+                [
+                    "--output-dir",
+                    str(output_directory),
+                    "--report",
+                    str(report_path),
+                    "--regenerate",
+                    str(master_path),
+                    "--max-rows",
+                    "1",
+                ]
+            )
+
+            self.assertEqual(result, 0)
+            self.assertTrue((output_directory / "House" / "splits" / "1-1.csv").exists())
+            self.assertTrue((output_directory / "House" / "splits" / "2-2.csv").exists())
 
     def test_cli_regenerate_all_processes_every_playlist_folder_with_master(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

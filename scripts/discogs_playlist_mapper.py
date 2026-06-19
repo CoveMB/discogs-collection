@@ -24,7 +24,7 @@ from shared.reports import (
     format_report_section,
     format_report_title,
     print_report_section,
-    timestamped_report_path,
+    script_report_path,
     write_text_report,
 )
 from shared.text import split_unique_comma_separated as split_discogs_terms
@@ -66,7 +66,7 @@ def map_terms_to_playlists(terms: Sequence[str], config: PlaylistConfig) -> tupl
     for playlist_label in config.playlist_labels:
         alias_keys = config.alias_keys_by_label[playlist_label]
         if any(alias_key in term_keys for alias_key in alias_keys):
-            playlist_names.append(f"{config.playlist_prefix}{playlist_label}")
+            playlist_names.append(playlist_label)
     return tuple(playlist_names)
 
 
@@ -116,7 +116,7 @@ def build_playlist_output_fieldnames(fieldnames: Sequence[str]) -> list[str]:
 
 
 def default_report_path(output_path: Path) -> Path:
-    return timestamped_report_path(output_path, "playlist_report")
+    return script_report_path(__file__)
 
 
 def ensure_config_file(path: Path) -> None:
@@ -145,7 +145,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT_PATH, help="Enriched Discogs master CSV. Defaults to collection/enriched-collection.csv.")
     parser.add_argument("--output", type=Path, help="Output CSV. Defaults to --input.")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="Playlist map JSON. Defaults to config/playlist-map.json.")
-    parser.add_argument("--report", type=Path, help="Text report path. Defaults to reports/<output-name>_<timestamp>_playlist_report.txt.")
+    parser.add_argument("--report", type=Path, help="Text report path. Defaults to reports/<timestamp>_discogs_playlist_mapper.txt.")
     args = parser.parse_args(argv)
     args.output = args.output or args.input
     args.report = args.report or default_report_path(args.output)

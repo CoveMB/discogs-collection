@@ -12,11 +12,11 @@ from shared.reports import format_report_section
 
 
 DEFAULT_CONFIG_PATH = Path("config/playlist-map.json")
+PLAYLIST_CONFIG_KEYS = frozenset({"excluded_terms", "playlists"})
 
 
 @dataclass(frozen=True)
 class PlaylistConfig:
-    playlist_prefix: str
     excluded_terms: tuple[str, ...]
     excluded_term_keys: frozenset[str]
     playlist_labels: tuple[str, ...]
@@ -26,7 +26,6 @@ class PlaylistConfig:
 
 def blank_playlist_config_payload() -> dict[str, object]:
     return {
-        "playlist_prefix": "Discogs - ",
         "excluded_terms": [],
         "playlists": {},
     }
@@ -36,9 +35,9 @@ def normalize_playlist_config(payload: object) -> PlaylistConfig:
     if not isinstance(payload, Mapping):
         raise ValueError("playlist config must be a JSON object")
 
-    playlist_prefix = payload.get("playlist_prefix", "")
-    if not isinstance(playlist_prefix, str):
-        raise ValueError("playlist_prefix must be a string")
+    unknown_keys = sorted(str(key) for key in payload if key not in PLAYLIST_CONFIG_KEYS)
+    if unknown_keys:
+        raise ValueError(f"unknown playlist config key: {', '.join(unknown_keys)}")
 
     excluded_terms = payload.get("excluded_terms", [])
     if not isinstance(excluded_terms, list) or not all(isinstance(term, str) for term in excluded_terms):
@@ -80,7 +79,6 @@ def normalize_playlist_config(payload: object) -> PlaylistConfig:
         alias_keys_by_label[clean_label] = tuple(label_alias_keys)
 
     return PlaylistConfig(
-        playlist_prefix=playlist_prefix,
         excluded_terms=clean_excluded_terms,
         excluded_term_keys=excluded_term_keys,
         playlist_labels=tuple(playlist_labels),
@@ -128,18 +126,15 @@ def format_playlist_config_overview(path: Path, config: PlaylistConfig, created:
             "8. Allow the same raw term under multiple playlist labels.",
         ]
     )
-    lines.extend(format_report_section("Playlist prefix", [config.playlist_prefix or "(none)"]))
-
     excluded_term_lines = [f"- {term}" for term in config.excluded_terms] or ["- None configured."]
     lines.extend(format_report_section("Excluded raw Discogs terms", excluded_term_lines))
 
     playlist_lines: list[str] = []
     if config.playlist_labels:
         for playlist_label in config.playlist_labels:
-            output_playlist_name = f"{config.playlist_prefix}{playlist_label}"
             raw_aliases = config.raw_aliases_by_label[playlist_label]
             raw_aliases_text = ", ".join(raw_aliases) if raw_aliases else "None"
-            playlist_lines.append(f"- {playlist_label} -> {output_playlist_name}")
+            playlist_lines.append(f"- {playlist_label} -> {playlist_label}")
             playlist_lines.append(f"  Raw Discogs terms: {raw_aliases_text}")
     else:
         playlist_lines.append("No playlists configured yet.")

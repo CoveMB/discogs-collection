@@ -1,0 +1,1 @@
+"""Spotify publisher tests."""
