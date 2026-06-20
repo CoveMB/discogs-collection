@@ -141,6 +141,27 @@ def export_playlist_csvs(
     progress: ProgressReporter | None = None,
 ) -> PlaylistExportSummary:
     rows, fieldnames = read_csv_file(input_path)
+    return export_playlist_rows(
+        rows=rows,
+        fieldnames=fieldnames,
+        input_path=input_path,
+        output_directory=output_directory,
+        report_path=report_path,
+        lookup_tracklist=lookup_tracklist,
+        progress=progress,
+    )
+
+
+def export_playlist_rows(
+    rows: Sequence[Mapping[str, str]],
+    fieldnames: Sequence[str],
+    input_path: Path,
+    output_directory: Path,
+    report_path: Path,
+    lookup_tracklist: Callable[[Mapping[str, str]], ReleaseTracklistLookup],
+    progress: ProgressReporter | None = None,
+    include_stale_playlists: bool = True,
+) -> PlaylistExportSummary:
     validate_input_fieldnames(fieldnames)
     records_by_playlist: dict[str, list[ReleaseExportRecord]] = {}
     review_notes: list[str] = []
@@ -197,13 +218,14 @@ def export_playlist_csvs(
         track_row_count += len(output_rows)
         fallback_row_count += playlist_fallback_count
 
-    playlist_release_changes.extend(
-        build_stale_playlist_release_changes(
-            output_directory=output_directory,
-            written_playlist_paths=written_playlist_paths,
-            review_notes=review_notes,
+    if include_stale_playlists:
+        playlist_release_changes.extend(
+            build_stale_playlist_release_changes(
+                output_directory=output_directory,
+                written_playlist_paths=written_playlist_paths,
+                review_notes=review_notes,
+            )
         )
-    )
 
     summary = PlaylistExportSummary(
         input_rows=len(rows),
@@ -315,7 +337,7 @@ def build_tunemymusic_row(
     row: Mapping[str, str],
     lookup: ReleaseTracklistLookup,
 ) -> dict[str, str]:
-    artist_name = track.artist_name or lookup.artist_name
+    artist_name = track.artist_name or lookup.artist_name or clean_cell(row.get("Artist", ""))
     album_name = lookup.album_name or clean_cell(row.get("Title", ""))
     release_id = clean_cell(row.get(RELEASE_ID_COLUMN, ""))
     return {

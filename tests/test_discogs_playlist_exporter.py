@@ -193,6 +193,86 @@ class PlaylistExporterTests(unittest.TestCase):
             self.assertIn("Row 2: release_id is missing", report_text)
             self.assertIn("Skipped rows without playlists: 1", report_text)
 
+    def test_cached_lookup_with_blank_release_names_falls_back_to_input_row_values(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            input_path = directory / "enriched-collection.csv"
+            output_directory = directory / "playlists"
+            report_path = directory / "playlist-export-report.txt"
+            input_path.write_text(
+                "release_id,Artist,Title,Released,Format,Playlists\n"
+                '111,Collection Artist,Collection Album,1997,"Vinyl, LP, Album",House\n',
+                encoding="utf-8",
+            )
+            cached_lookup = exporter.ReleaseTracklistLookup(
+                release_id="111",
+                artist_name="",
+                album_name="",
+                record_year="",
+                tracks=(exporter.DiscogsTrack(position="A1", title="Cached Track", artist_name=""),),
+                notes=(),
+            )
+
+            exporter.export_playlist_csvs(
+                input_path=input_path,
+                output_directory=output_directory,
+                report_path=report_path,
+                lookup_tracklist=lambda row: cached_lookup,
+            )
+
+            rows = read_csv_file(output_directory / "House" / "House.csv")
+            self.assertEqual(rows[0]["Artist Name"], "Collection Artist")
+            self.assertEqual(rows[0]["Album Name"], "Collection Album")
+            self.assertEqual(rows[0]["Spotify Search Query"], "Collection Artist Cached Track Collection Album")
+
+    def test_export_playlist_rows_can_skip_stale_playlist_reporting_for_isolated_output_roots(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            output_directory = directory / "playlists"
+            report_path = directory / "playlist-export-report.txt"
+            stale_path = output_directory / "Old Ad Hoc" / "Old Ad Hoc.csv"
+            stale_path.parent.mkdir(parents=True)
+            stale_path.write_text(
+                "Release Id,Album Name,Track Number,Track Name,Artist Name,Spotify Search Query\n"
+                "999,Old Album,1,Old Track,Old Artist,Old Artist Old Track Old Album\n",
+                encoding="utf-8",
+            )
+            rows = [
+                {
+                    "release_id": "111",
+                    "Artist": "",
+                    "Title": "",
+                    "Released": "",
+                    "Playlists": "Fresh Ad Hoc",
+                }
+            ]
+            lookup = exporter.ReleaseTracklistLookup(
+                release_id="111",
+                artist_name="Fresh Artist",
+                album_name="Fresh Album",
+                record_year="1997",
+                tracks=(exporter.DiscogsTrack(position="A1", title="Fresh Track", artist_name="Fresh Artist"),),
+                notes=(),
+            )
+
+            summary = exporter.export_playlist_rows(
+                rows=rows,
+                fieldnames=["release_id", "Artist", "Title", "Released", "Playlists"],
+                input_path=Path("release-ids"),
+                output_directory=output_directory,
+                report_path=report_path,
+                lookup_tracklist=lambda row: lookup,
+                include_stale_playlists=False,
+            )
+
+            report_text = report_path.read_text(encoding="utf-8")
+            self.assertEqual(
+                [change.playlist_name for change in summary.playlist_release_changes],
+                ["Fresh Ad Hoc"],
+            )
+            self.assertNotIn("Old Ad Hoc", report_text)
+            self.assertTrue(stale_path.exists())
+
     def test_report_lists_added_and_removed_releases_per_playlist_without_changing_rewrite_behavior(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)

@@ -187,6 +187,7 @@ def dry_run_spotify_playlist_publish(
     progress: ProgressReporter | None = None,
     playlist_selectors: Sequence[str] | None = None,
     playlist_master_paths: Sequence[Path] | None = None,
+    playlist_names_by_master_path: Mapping[Path, str] | None = None,
     debug_log: DebugLog | None = None,
 ) -> SpotifyDryRunSummary:
     if playlist_selectors is not None and playlist_master_paths is not None:
@@ -201,7 +202,10 @@ def dry_run_spotify_playlist_publish(
         )
     if debug_log:
         debug_log(f"dry_run_playlist_masters count={len(selected_master_paths)}")
-    playlist_tracks = read_playlist_tracks_from_master_paths(selected_master_paths)
+    playlist_tracks = read_playlist_tracks_from_master_paths(
+        selected_master_paths,
+        playlist_names_by_master_path=playlist_names_by_master_path,
+    )
     if debug_log:
         debug_log(f"loaded_playlist_tracks count={len(playlist_tracks)}")
     decisions: list[TrackMatchDecision] = []
@@ -247,6 +251,7 @@ def publish_spotify_playlists(
     progress: ProgressReporter | None = None,
     playlist_selectors: Sequence[str] | None = None,
     playlist_master_paths: Sequence[Path] | None = None,
+    playlist_names_by_master_path: Mapping[Path, str] | None = None,
     debug_log: DebugLog | None = None,
     match_cache_path: Path = DEFAULT_MATCH_CACHE_PATH,
     publisher_config: PublisherConfig | None = None,
@@ -268,6 +273,7 @@ def publish_spotify_playlists(
         playlist_selectors,
         allow_all_selector=False,
     )
+    playlist_name_overrides = normalize_playlist_names_by_master_path(playlist_names_by_master_path)
     match_cache = load_spotify_track_match_cache(match_cache_path)
     timestamp = utc_timestamp()
     spotify_playlists = spotify_client.list_current_user_playlists(access_token=access_token)
@@ -277,7 +283,10 @@ def publish_spotify_playlists(
     playlist_contexts: list[PlaylistPublishContext] = []
     planned_write_uris_by_playlist: dict[str, tuple[str, ...]] = {}
     tracks_by_master_path = {
-        playlist_master_path: read_playlist_tracks_from_master_paths((playlist_master_path,))
+        playlist_master_path: read_playlist_tracks_from_master_paths(
+            (playlist_master_path,),
+            playlist_names_by_master_path=playlist_name_overrides,
+        )
         for playlist_master_path in selected_master_paths
     }
     total_tracks = sum(len(tracks) for tracks in tracks_by_master_path.values())
@@ -288,7 +297,7 @@ def publish_spotify_playlists(
     processed_track_count = 0
     try:
         for playlist_master_path, playlist_tracks in tracks_by_master_path.items():
-            playlist_name = playlist_master_path.parent.name
+            playlist_name = playlist_name_for_master_path(playlist_master_path, playlist_name_overrides)
             target_playlist_name = publisher_playlist_name(playlist_name, config)
             context, existing_items, spotify_playlists = resolve_playlist_context(
                 spotify_client=spotify_client,
@@ -309,6 +318,7 @@ def publish_spotify_playlists(
                 spotify_playlist_item_identity_key(target_playlist_name, item)
                 for item in existing_items
             }
+            existing_incomplete_spotify_uris = incomplete_spotify_playlist_item_uris(existing_items)
             for track in playlist_tracks:
                 processed_track_count += 1
                 try:
@@ -332,6 +342,7 @@ def publish_spotify_playlists(
                         publisher_sync_mode=publisher_sync_mode,
                         apply=False,
                         existing_identity_keys=existing_identity_keys,
+                        existing_incomplete_spotify_uris=existing_incomplete_spotify_uris,
                         seen_source_identity_keys=seen_source_identity_keys,
                     )
                     decisions.append(publish_decision)
@@ -424,6 +435,7 @@ def build_publish_decision(
     publisher_sync_mode: str,
     apply: bool,
     existing_identity_keys: set[str],
+    existing_incomplete_spotify_uris: set[str],
     seen_source_identity_keys: set[str],
 ) -> PlaylistPublishDecision:
     if decision.status != MATCHED:
@@ -444,6 +456,9 @@ def build_publish_decision(
     elif publisher_sync_mode == APPEND_SYNC_MODE and identity_key in existing_identity_keys:
         status = ALREADY_PRESENT
         reason = "Spotify artist, album, and track already exist in playlist"
+    elif publisher_sync_mode == APPEND_SYNC_MODE and decision.spotify_uri in existing_incomplete_spotify_uris:
+        status = ALREADY_PRESENT
+        reason = "Spotify URI already exists in playlist with incomplete metadata"
     elif publisher_sync_mode == APPEND_SYNC_MODE:
         status = ADDED if apply else WOULD_ADD
         reason = "Spotify artist, album, and track will be appended to playlist"
@@ -638,15 +653,20 @@ def read_playlist_tracks(playlist_output_directory: Path, playlist_selectors: Se
     return read_playlist_tracks_from_master_paths(playlist_master_paths)
 
 
-def read_playlist_tracks_from_master_paths(playlist_master_paths: Sequence[Path]) -> tuple[PlaylistTrack, ...]:
+def read_playlist_tracks_from_master_paths(
+    playlist_master_paths: Sequence[Path],
+    playlist_names_by_master_path: Mapping[Path, str] | None = None,
+) -> tuple[PlaylistTrack, ...]:
+    playlist_name_overrides = normalize_playlist_names_by_master_path(playlist_names_by_master_path)
     tracks: list[PlaylistTrack] = []
     for playlist_path in playlist_master_paths:
+        playlist_name = playlist_name_for_master_path(playlist_path, playlist_name_overrides)
         rows, fieldnames = read_csv_file(playlist_path)
         validate_playlist_fieldnames(playlist_path, fieldnames)
         for row in rows:
             tracks.append(
                 PlaylistTrack(
-                    playlist_name=playlist_path.parent.name,
+                    playlist_name=playlist_name,
                     release_id=clean_cell(row.get("Release Id")),
                     album_name=clean_cell(row.get("Album Name")),
                     track_number=clean_cell(row.get("Track Number")),
@@ -656,6 +676,26 @@ def read_playlist_tracks_from_master_paths(playlist_master_paths: Sequence[Path]
                 )
             )
     return tuple(tracks)
+
+
+def normalize_playlist_names_by_master_path(
+    playlist_names_by_master_path: Mapping[Path, str] | None,
+) -> dict[Path, str]:
+    if not playlist_names_by_master_path:
+        return {}
+    names_by_path: dict[Path, str] = {}
+    for path, playlist_name in playlist_names_by_master_path.items():
+        clean_playlist_name = clean_cell(playlist_name)
+        if clean_playlist_name:
+            names_by_path[Path(path).resolve()] = clean_playlist_name
+    return names_by_path
+
+
+def playlist_name_for_master_path(
+    playlist_master_path: Path,
+    playlist_names_by_master_path: Mapping[Path, str],
+) -> str:
+    return playlist_names_by_master_path.get(playlist_master_path.resolve(), playlist_master_path.parent.name)
 
 
 def validate_playlist_fieldnames(path: Path, fieldnames: Sequence[str]) -> None:
@@ -686,6 +726,22 @@ def spotify_playlist_item_identity_key(target_playlist_name: str, item: SpotifyP
         artist_names=item.artists,
         album_name=item.album_name,
         track_name=item.name,
+    )
+
+
+def incomplete_spotify_playlist_item_uris(existing_items: Sequence[SpotifyPlaylistItem]) -> set[str]:
+    return {
+        item.uri
+        for item in existing_items
+        if item.uri and not spotify_playlist_item_has_identity_metadata(item)
+    }
+
+
+def spotify_playlist_item_has_identity_metadata(item: SpotifyPlaylistItem) -> bool:
+    return bool(
+        clean_cell(item.name)
+        and clean_cell(item.album_name)
+        and normalized_identity_artists(item.artists)
     )
 
 
@@ -1301,6 +1357,51 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def run_spotify_publish_from_args(
+    args: argparse.Namespace,
+    playlist_master_paths: Sequence[Path] | None = None,
+    playlist_names_by_master_path: Mapping[Path, str] | None = None,
+    publisher_config: PublisherConfig | None = None,
+    debug_log: DebugLog | None = None,
+    spotify_client: SpotifyClient | None = None,
+) -> SpotifyPublishSummary:
+    selected_master_paths = tuple(playlist_master_paths) if playlist_master_paths is not None else resolve_playlist_master_paths(
+        args.playlist_output_dir,
+        args.playlists,
+        allow_all_selector=False,
+    )
+    if debug_log:
+        debug_log(f"resolved_playlist_masters count={len(selected_master_paths)}")
+        debug_log("loading_spotify_settings")
+    settings = load_spotify_settings(args.env_file, token_cache_path=args.token_cache)
+    resolved_publisher_config = publisher_config or load_or_create_publisher_config(args.publisher_config)
+    if debug_log:
+        debug_log("spotify_settings_loaded")
+        debug_log("publisher_config_loaded")
+        debug_log("getting_spotify_access_token")
+    access_token = args.access_token or get_access_token_for_run(settings, force_reauthorize=args.reauthorize)
+    if debug_log:
+        debug_log("spotify_access_token_ready")
+    progress_label = "Updating Spotify playlists" if args.apply else "Planning Spotify playlists"
+    progress = ProgressReporter(label=progress_label) if getattr(args, "progress", False) else None
+    return publish_spotify_playlists(
+        playlist_output_directory=args.playlist_output_dir,
+        report_path=args.report,
+        spotify_client=spotify_client or SpotifyClient(debug_log=debug_log),
+        access_token=access_token,
+        search_limit=args.search_limit,
+        progress=progress,
+        playlist_master_paths=selected_master_paths,
+        playlist_names_by_master_path=playlist_names_by_master_path,
+        debug_log=debug_log,
+        match_cache_path=args.match_cache,
+        publisher_config=resolved_publisher_config,
+        apply=args.apply,
+        publisher_sync_mode=args.publisher_sync_mode,
+        info_log=print,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = parse_args(argv)
@@ -1311,40 +1412,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"parsed_args playlist_selectors={len(args.playlists or ())} search_limit={args.search_limit} "
                 f"progress={args.progress} apply={args.apply} sync_mode={args.publisher_sync_mode}"
             )
-        playlist_master_paths = resolve_playlist_master_paths(
-            args.playlist_output_dir,
-            args.playlists,
-            allow_all_selector=False,
-        )
-        if debug_log:
-            debug_log(f"resolved_playlist_masters count={len(playlist_master_paths)}")
-            debug_log("loading_spotify_settings")
-        settings = load_spotify_settings(args.env_file, token_cache_path=args.token_cache)
-        publisher_config = load_or_create_publisher_config(args.publisher_config)
-        if debug_log:
-            debug_log("spotify_settings_loaded")
-            debug_log("publisher_config_loaded")
-            debug_log("getting_spotify_access_token")
-        access_token = args.access_token or get_access_token_for_run(settings, force_reauthorize=args.reauthorize)
-        if debug_log:
-            debug_log("spotify_access_token_ready")
-        progress_label = "Updating Spotify playlists" if args.apply else "Planning Spotify playlists"
-        progress = ProgressReporter(label=progress_label) if getattr(args, "progress", False) else None
-        summary = publish_spotify_playlists(
-            playlist_output_directory=args.playlist_output_dir,
-            report_path=args.report,
-            spotify_client=SpotifyClient(debug_log=debug_log),
-            access_token=access_token,
-            search_limit=args.search_limit,
-            progress=progress,
-            playlist_master_paths=playlist_master_paths,
-            debug_log=debug_log,
-            match_cache_path=args.match_cache,
-            publisher_config=publisher_config,
-            apply=args.apply,
-            publisher_sync_mode=args.publisher_sync_mode,
-            info_log=print,
-        )
+        summary = run_spotify_publish_from_args(args, debug_log=debug_log)
         if debug_log:
             debug_log(
                 "completed "

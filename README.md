@@ -11,6 +11,9 @@ CSVs. The main workflow is:
 5. Optionally publish Spotify playlists from those playlist CSVs, or run an
    explicit dry-run preview first.
 
+You can also create an on-the-fly publisher playlist from explicit Discogs
+`release_id` values without adding those releases to the collection master.
+
 The durable file is the enriched master CSV. By default that file is:
 
 ```text
@@ -18,10 +21,10 @@ collection/enriched-collection.csv
 ```
 
 The scripts are local-first. They read and write CSV, JSON cache, and plain text
-report files on disk. The enrichment and playlist exporter scripts can call
-Discogs. The standalone Spotify publisher can call Spotify to plan playlist
-changes, and it creates or updates Spotify playlists unless you pass
-`--publishing-dry-run`.
+report files on disk. The enrichment, playlist exporter, and release-ID
+playlist scripts can call Discogs. The Spotify publisher can call Spotify to
+plan playlist changes, and it creates or updates Spotify playlists unless you
+pass `--publishing-dry-run`.
 
 ## Get a Discogs collection export
 
@@ -381,6 +384,82 @@ If Spotify rate-limits a request, the client waits and retries. It honors
 header is missing or invalid. If Spotify keeps returning `429` after three
 retries, the affected row stays in the search-error section so the failed query
 is visible.
+
+## On-the-fly release playlists
+
+Use `scripts/discogs_release_playlist.py` when you already have Discogs
+`release_id` values and want a playlist without importing those releases into
+the collection master. The script fetches Discogs tracklists and writes a
+TuneMyMusic-style playlist master. It does not read or write
+`collection/enriched-collection.csv`, does not run style or genre mapping, and
+does not run the playlist splitter.
+
+Preview a Spotify playlist from release IDs:
+
+```bash
+python3 scripts/discogs_release_playlist.py \
+  --name "Friday Picks" \
+  --publisher spotify \
+  --publishing-dry-run \
+  123456 789012
+```
+
+The script writes a TuneMyMusic-style master CSV under the on-the-fly playlist
+folder:
+
+```text
+collection/playlists/on-the-fly/Friday Picks/Friday Picks.csv
+```
+
+Reusing the same playlist name rewrites that on-the-fly master CSV. Duplicate
+release IDs are deduped in first-seen order and listed in the release playlist
+report. You can pass release IDs as arguments, with `--release-ids-file`, or
+with both. Files may use whitespace or commas between IDs.
+
+If the playlist name contains characters that are unsafe in file names, the
+folder and CSV file names are sanitized. The publisher name is still the exact
+`--name` value. For example, `--name "Friday/Picks"` writes
+`collection/playlists/on-the-fly/Friday_Picks/Friday_Picks.csv`, while Spotify
+uses `Friday/Picks` as the target playlist name.
+
+Names that would resolve outside the on-the-fly output folder are rejected. If
+two different names sanitize to the same folder, the script stops instead of
+overwriting the earlier playlist master. Reusing the same exact name still
+updates that playlist's master CSV. The playlist folder stores a small
+`.release-playlist.json` file to track the exact name.
+
+The default publisher still comes from `config/publisher.json`, and `--publisher`
+overrides it. If the resolved publisher is `none`, the script only writes the
+CSV and report. If the resolved publisher is `spotify`, it publishes the
+generated master CSV by exact path. On-the-fly release playlists do not use
+`playlist_prefix` or `playlist_suffix`.
+
+The release-ID workflow reuses the same local caches as the collection workflow:
+
+```text
+collection/cache/playlist-tracks.cache.json
+collection/cache/spotify-track-matches.cache.json
+```
+
+These caches store lookup and match data only. The script does not use the
+style and genre enrichment cache, and it does not store playlist labels or
+collection row order. If a release from an on-the-fly playlist later appears in
+a Discogs collection export, the main workflow adds it according to the export
+and the existing master merge. The earlier on-the-fly lookup does not move it to
+the front.
+
+Normal runs of `scripts/discogs_make_playlists.py` use `collection/playlists`
+and skip the nested on-the-fly playlist masters. If you want to publish or split
+only those on-the-fly masters, point the command directly at
+`collection/playlists/on-the-fly`.
+
+You can also read release IDs from a file:
+
+```bash
+python3 scripts/discogs_release_playlist.py \
+  --name "Friday Picks" \
+  --release-ids-file release-ids.txt
+```
 
 ## Playlist mapper
 
@@ -1167,6 +1246,87 @@ TuneMyMusic playlist exporter options:
 --request-interval-seconds SECONDS
     Minimum delay between Discogs requests. Defaults to header-aware throttling
     with no extra fixed delay.
+
+--no-progress
+    Disable the interactive terminal progress bar.
+```
+
+Release playlist options:
+
+```text
+release_ids
+    Discogs release IDs to export. Values must be positive integers. You can
+    also pass --release-ids-file.
+
+--name TEXT
+    Required playlist name. The same name updates the same on-the-fly master CSV.
+    The file path may be sanitized, but the publisher target keeps this exact
+    name.
+
+--release-ids-file PATH
+    Text file containing release IDs separated by whitespace or commas. IDs from
+    the file are appended after IDs passed as arguments, then deduped in order.
+
+--output-dir PATH
+    Directory for on-the-fly playlist folders. Defaults to
+    collection/playlists/on-the-fly.
+
+--report PATH
+    Release playlist report path. Defaults to
+    reports/YYYY-MM-DD_HH-MM-SS_discogs_release_playlist.txt.
+
+--tracklist-cache PATH
+    Discogs tracklist cache JSON. Defaults to
+    collection/cache/playlist-tracks.cache.json.
+
+--publisher-config PATH
+    Publisher JSON config. Defaults to config/publisher.json.
+
+--publisher spotify|none
+    Publisher override. If omitted, the script reads default_publisher from the
+    publisher config. Use none to write the CSV and report without publishing.
+
+--publisher-report PATH
+    Spotify publisher report path. Defaults to
+    reports/YYYY-MM-DD_HH-MM-SS_publish_playlist.txt.
+
+--publishing-dry-run
+    Preview Spotify playlist changes without creating or updating playlists.
+
+--publisher-sync-mode append|replace
+    Spotify sync mode. Defaults to append. This only affects Spotify publishing.
+
+--match-cache PATH
+    Spotify track match cache path. Defaults to
+    collection/cache/spotify-track-matches.cache.json.
+
+--env-file PATH
+    Local env file containing Spotify app settings. Defaults to .env.
+
+--token-cache PATH
+    Spotify token cache path. Defaults to config/cache/spotify-token.cache.json.
+
+--reauthorize
+    Force a fresh Spotify login before running the publisher.
+
+--search-limit COUNT
+    Spotify search result limit per track. Defaults to 10.
+
+--discogs-token TOKEN
+    Optional Discogs personal access token. Defaults to DISCOGS_TOKEN.
+
+--user-agent TEXT
+    User-Agent sent to Discogs.
+
+--timeout-seconds SECONDS
+    HTTP timeout per Discogs request. Defaults to 30.
+
+--request-interval-seconds SECONDS
+    Minimum delay between Discogs requests. Defaults to header-aware throttling
+    with no extra fixed delay.
+
+--debug-log PATH
+    Write sanitized release playlist debug logs to this path.
 
 --no-progress
     Disable the interactive terminal progress bar.

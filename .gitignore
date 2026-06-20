@@ -38,6 +38,9 @@ reports/*_report.txt
 reports/**.txt
 collection/cache/
 collection/**.json
+**/.release-playlist.json
 config/**
 !config/publisher.json
 !config/workflow.json
+
+**/superpowers/**

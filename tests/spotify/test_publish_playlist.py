@@ -141,6 +141,51 @@ class FailingReplaceRemainderPublishClient(PublishingSpotifyClient):
         return super().add_playlist_items(access_token, playlist_id, uris)
 
 
+class FailingFirstAppendBatchClient(PublishingSpotifyClient):
+    def __init__(self, candidates_by_query, fail_playlist_id):
+        super().__init__(
+            candidates_by_query,
+            playlists=(
+                SpotifyPlaylist(
+                    playlist_id=fail_playlist_id,
+                    name="Discogs - House",
+                    url="",
+                    owner_id="current-user",
+                    public=False,
+                ),
+            ),
+        )
+        self.fail_playlist_id = fail_playlist_id
+        self.fail_next_append = True
+        self.candidates_by_uri = {
+            candidate.uri: candidate
+            for candidates in candidates_by_query.values()
+            for candidate in candidates
+        }
+
+    def add_playlist_items(self, access_token, playlist_id, uris):
+        for batch_start in range(0, len(uris), 100):
+            batch = tuple(uris[batch_start : batch_start + 100])
+            self.add_calls.append((playlist_id, batch))
+            self.playlist_items_by_id.setdefault(playlist_id, []).extend(
+                self.playlist_item_for_uri(uri)
+                for uri in batch
+            )
+            if playlist_id == self.fail_playlist_id and self.fail_next_append:
+                self.fail_next_append = False
+                raise SpotifyApiError("Spotify playlist add items failed with status 429: Too many requests")
+        return ("snapshot-add",) if uris else ()
+
+    def playlist_item_for_uri(self, uri):
+        candidate = self.candidates_by_uri[uri]
+        return SpotifyPlaylistItem(
+            uri=uri,
+            name=candidate.name,
+            artists=candidate.artists,
+            album_name=candidate.album_name,
+        )
+
+
 def write_playlist_master(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as output_file:
@@ -569,6 +614,127 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertEqual(client.add_calls, [])
         self.assertIn("Spotify artist, album, and track already exist in playlist", report_text)
 
+    def test_append_skips_existing_uri_when_spotify_item_metadata_is_incomplete(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            write_playlist_master(
+                playlist_directory / "House" / "House.csv",
+                [playlist_row("111", "Alpha Album", "Alpha One", "Alpha Artist")],
+            )
+            report_path = directory / "reports" / "spotify-report.txt"
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            client = PublishingSpotifyClient(
+                {
+                    'track:"Alpha One" artist:"Alpha Artist" album:"Alpha Album"': (
+                        SpotifyTrackCandidate(
+                            uri="spotify:track:alpha",
+                            name="Alpha One",
+                            artists=("Alpha Artist",),
+                            album_name="Alpha Album",
+                        ),
+                    )
+                },
+                playlists=(
+                    SpotifyPlaylist(
+                        playlist_id="playlist-house",
+                        name="Discogs - House",
+                        url="",
+                        owner_id="current-user",
+                        public=False,
+                    ),
+                ),
+                playlist_items_by_id={
+                    "playlist-house": (
+                        SpotifyPlaylistItem(uri="spotify:track:alpha", name="", artists=(), album_name=""),
+                    )
+                },
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+            report_text = report_path.read_text(encoding="utf-8")
+
+        self.assertEqual(summary.already_present_count, 1)
+        self.assertEqual(summary.would_add_count, 0)
+        self.assertEqual(client.add_calls, [])
+        self.assertIn("Spotify URI already exists in playlist with incomplete metadata", report_text)
+
+    def test_append_rerun_after_partial_rate_limit_adds_only_missing_tracks(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            rows = [
+                playlist_row(str(index), f"Album {index}", f"Track {index}", f"Artist {index}")
+                for index in range(1, 151)
+            ]
+            write_playlist_master(playlist_directory / "House" / "House.csv", rows)
+            report_path = directory / "reports" / "spotify-report.txt"
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            client = FailingFirstAppendBatchClient(
+                {
+                    f'track:"{row["Track Name"]}" artist:"{row["Artist Name"]}" album:"{row["Album Name"]}"': (
+                        matching_candidate(row),
+                    )
+                    for row in rows
+                },
+                fail_playlist_id="playlist-house",
+            )
+
+            with self.assertRaisesRegex(SpotifyApiError, "status 429"):
+                publish_spotify_playlists(
+                    playlist_output_directory=playlist_directory,
+                    report_path=report_path,
+                    spotify_client=client,
+                    access_token="access-token",
+                    match_cache_path=match_cache_path,
+                    publisher_config=PublisherConfig(
+                        default_publisher="spotify",
+                        playlist_prefix="Discogs - ",
+                        playlist_suffix="",
+                    ),
+                    publisher_sync_mode="append",
+                )
+            searches_after_failed_run = len(client.searches)
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                publisher_sync_mode="append",
+            )
+
+        final_items = client.playlist_items_by_id["playlist-house"]
+        final_identities = {
+            (item.artists, item.album_name, item.name)
+            for item in final_items
+        }
+        self.assertEqual([len(batch) for _, batch in client.add_calls], [100, 50])
+        self.assertEqual(summary.already_present_count, 100)
+        self.assertEqual(summary.added_count, 50)
+        self.assertEqual(len(final_items), 150)
+        self.assertEqual(len(final_identities), 150)
+        self.assertEqual(len(client.searches), searches_after_failed_run)
+
     def test_append_allows_same_artist_and_track_on_different_albums(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
@@ -725,6 +891,46 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertIn("Added tracks: 1", report_text)
         self.assertIn("Tracks added", report_text)
         self.assertIn("Discogs - House | 111 | 1 | Alpha Artist | Alpha One | added | spotify:track:alpha", report_text)
+
+    def test_publish_uses_playlist_name_override_for_exact_master_path_target(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists" / "on-the-fly"
+            playlist_path = playlist_directory / "Friday_Picks" / "Friday_Picks.csv"
+            row = playlist_row("111", "House Album", "House One", "House Artist")
+            write_playlist_master(playlist_path, [row])
+            report_path = directory / "reports" / "spotify-publish.txt"
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            client = PublishingSpotifyClient(
+                {
+                    'track:"House One" artist:"House Artist" album:"House Album"': (
+                        matching_candidate(row),
+                    )
+                }
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=client,
+                access_token="access-token",
+                playlist_master_paths=(playlist_path,),
+                playlist_names_by_master_path={playlist_path: "Friday/Picks"},
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+
+        self.assertEqual(summary.playlist_contexts[0].playlist_name, "Friday/Picks")
+        self.assertEqual(summary.playlist_contexts[0].target_playlist_name, "Friday/Picks")
+        self.assertEqual(summary.decisions[0].playlist_name, "Friday/Picks")
+        self.assertEqual(summary.decisions[0].target_playlist_name, "Friday/Picks")
+        self.assertEqual(client.created_playlists, [])
 
     def test_publish_uses_discogs_prefix_when_config_is_omitted(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
