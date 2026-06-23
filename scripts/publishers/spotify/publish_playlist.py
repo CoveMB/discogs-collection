@@ -1365,13 +1365,19 @@ def run_spotify_publish_from_args(
     debug_log: DebugLog | None = None,
     spotify_client: SpotifyClient | None = None,
 ) -> SpotifyPublishSummary:
-    selected_master_paths = tuple(playlist_master_paths) if playlist_master_paths is not None else resolve_playlist_master_paths(
-        args.playlist_output_dir,
-        args.playlists,
-        allow_all_selector=False,
-    )
+    if playlist_master_paths is not None:
+        selected_master_paths: tuple[Path, ...] | None = tuple(playlist_master_paths)
+    elif args.playlists:
+        selected_master_paths = resolve_playlist_master_paths(
+            args.playlist_output_dir,
+            args.playlists,
+            allow_all_selector=False,
+        )
+    else:
+        selected_master_paths = None
     if debug_log:
-        debug_log(f"resolved_playlist_masters count={len(selected_master_paths)}")
+        if selected_master_paths is not None:
+            debug_log(f"resolved_playlist_masters count={len(selected_master_paths)}")
         debug_log("loading_spotify_settings")
     settings = load_spotify_settings(args.env_file, token_cache_path=args.token_cache)
     resolved_publisher_config = publisher_config or load_or_create_publisher_config(args.publisher_config)
