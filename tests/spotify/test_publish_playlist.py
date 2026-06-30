@@ -120,6 +120,14 @@ class PublishingSpotifyClient(FakeSpotifyClient):
         return "snapshot-replace"
 
 
+class DeferredSecondSearchPublishingClient(PublishingSpotifyClient):
+    def search_tracks(self, access_token, query, limit=10):
+        self.searches.append((access_token, query, limit))
+        if "Beta One" in query:
+            raise SpotifyRateLimitDeferredError(retry_after_seconds=9999, max_wait_seconds=480)
+        return self.candidates_by_query.get(query, ())
+
+
 class FailingSecondPlaylistPublishClient(PublishingSpotifyClient):
     def add_playlist_items(self, access_token, playlist_id, uris):
         if playlist_id == "playlist-techno":
@@ -550,6 +558,271 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertIn("1 | existing | Alpha Artist | Alpha One | Alpha Album | spotify:track:alpha", report_text)
         self.assertIn("2 | would_add | Beta Artist | Beta One | Beta Album | spotify:track:beta", report_text)
         self.assertIn("222|1|beta artist|beta album|beta one", cache_payload["matches"])
+
+    def test_publish_dry_run_caches_unmatched_and_ambiguous_decisions_for_reruns(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            write_playlist_master(
+                playlist_directory / "House" / "House.csv",
+                [
+                    playlist_row("111", "Alpha Album", "Alpha One", "Alpha Artist"),
+                    playlist_row("222", "Beta Album", "Beta One", "Beta Artist"),
+                ],
+            )
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            report_path = directory / "reports" / "spotify-report.txt"
+            first_client = PublishingSpotifyClient(
+                {
+                    'track:"Alpha One" artist:"Alpha Artist" album:"Alpha Album"': (),
+                    'track:"Beta One" artist:"Beta Artist" album:"Beta Album"': (
+                        SpotifyTrackCandidate(
+                            uri="spotify:track:beta-first",
+                            name="Beta One",
+                            artists=("Beta Artist",),
+                            album_name="Beta Album",
+                        ),
+                        SpotifyTrackCandidate(
+                            uri="spotify:track:beta-second",
+                            name="Beta One",
+                            artists=("Beta Artist",),
+                            album_name="Beta Album",
+                        ),
+                    ),
+                }
+            )
+
+            first_summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=first_client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+            cache_payload = json.loads(match_cache_path.read_text(encoding="utf-8"))
+            second_client = PublishingSpotifyClient({})
+
+            second_summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=second_client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+            report_text = report_path.read_text(encoding="utf-8")
+
+        self.assertEqual(first_summary.cache_hit_count, 0)
+        self.assertEqual(first_summary.search_count, 2)
+        self.assertEqual(first_summary.unmatched_count, 1)
+        self.assertEqual(first_summary.ambiguous_count, 1)
+        self.assertEqual(cache_payload["matches"]["111|1|alpha artist|alpha album|alpha one"]["match_status"], "unmatched")
+        self.assertEqual(cache_payload["matches"]["222|1|beta artist|beta album|beta one"]["match_status"], "ambiguous")
+        self.assertEqual(second_client.searches, [])
+        self.assertEqual(second_summary.cache_hit_count, 2)
+        self.assertEqual(second_summary.search_count, 0)
+        self.assertEqual(second_summary.unmatched_count, 1)
+        self.assertEqual(second_summary.ambiguous_count, 1)
+        self.assertIn("Cache hits: 2", report_text)
+        self.assertIn("Spotify searches: 0", report_text)
+        self.assertIn("Discogs - House | 111 | 1 | Alpha Artist | Alpha One | unmatched | no Spotify URI", report_text)
+        self.assertIn("Discogs - House | 222 | 1 | Beta Artist | Beta One | ambiguous | no Spotify URI", report_text)
+
+    def test_publish_refresh_match_cache_rechecks_cached_unmatched_decisions(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            write_playlist_master(
+                playlist_directory / "House" / "House.csv",
+                [playlist_row("111", "Alpha Album", "Alpha One", "Alpha Artist")],
+            )
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            match_cache_path.parent.mkdir(parents=True)
+            match_cache_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "record_type": "spotify_track_match_cache",
+                        "matches": {
+                            "111|1|alpha artist|alpha album|alpha one": {
+                                "release_id": "111",
+                                "track_number": "1",
+                                "artist_name": "Alpha Artist",
+                                "album_name": "Alpha Album",
+                                "track_name": "Alpha One",
+                                "search_query": 'track:"Alpha One" artist:"Alpha Artist" album:"Alpha Album"',
+                                "spotify_uri": "",
+                                "spotify_url": "",
+                                "match_status": "unmatched",
+                                "match_reason": "no candidates matched track, artist, and album",
+                                "matcher_version": 1,
+                                "searched_at": "2026-06-18T00:00:00Z",
+                                "last_seen_at": "2026-06-18T00:00:00Z",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report_path = directory / "reports" / "spotify-report.txt"
+            client = PublishingSpotifyClient(
+                {
+                    'track:"Alpha One" artist:"Alpha Artist" album:"Alpha Album"': (
+                        SpotifyTrackCandidate(
+                            uri="spotify:track:alpha",
+                            name="Alpha One",
+                            artists=("Alpha Artist",),
+                            album_name="Alpha Album",
+                        ),
+                    )
+                }
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+                refresh_match_cache=True,
+            )
+            cache_payload = json.loads(match_cache_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(client.searches, [('access-token', 'track:"Alpha One" artist:"Alpha Artist" album:"Alpha Album"', 10)])
+        self.assertEqual(summary.cache_hit_count, 0)
+        self.assertEqual(summary.search_count, 1)
+        self.assertEqual(summary.would_add_count, 1)
+        self.assertEqual(cache_payload["matches"]["111|1|alpha artist|alpha album|alpha one"]["match_status"], "matched")
+        self.assertEqual(cache_payload["matches"]["111|1|alpha artist|alpha album|alpha one"]["spotify_uri"], "spotify:track:alpha")
+
+    def test_publish_writes_partial_rate_limit_report_then_complete_report_on_rerun(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            write_playlist_master(
+                playlist_directory / "House" / "House.csv",
+                [
+                    playlist_row("111", "Alpha Album", "Alpha One", "Alpha Artist"),
+                    playlist_row("222", "Beta Album", "Beta One", "Beta Artist"),
+                ],
+            )
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            report_path = directory / "reports" / "spotify-report.txt"
+            candidates_by_query = {
+                'track:"Alpha One" artist:"Alpha Artist" album:"Alpha Album"': (
+                    SpotifyTrackCandidate(
+                        uri="spotify:track:alpha",
+                        name="Alpha One",
+                        artists=("Alpha Artist",),
+                        album_name="Alpha Album",
+                    ),
+                )
+            }
+            first_client = DeferredSecondSearchPublishingClient(candidates_by_query)
+
+            with self.assertRaisesRegex(SpotifyRateLimitDeferredError, "Retry-After is 2 hours 46 minutes 39 seconds"):
+                publish_spotify_playlists(
+                    playlist_output_directory=playlist_directory,
+                    report_path=report_path,
+                    spotify_client=first_client,
+                    access_token="access-token",
+                    match_cache_path=match_cache_path,
+                    publisher_config=PublisherConfig(
+                        default_publisher="spotify",
+                        playlist_prefix="Discogs - ",
+                        playlist_suffix="",
+                    ),
+                    apply=False,
+                    publisher_sync_mode="append",
+                )
+            cache_payload = json.loads(match_cache_path.read_text(encoding="utf-8"))
+            partial_report_text = report_path.read_text(encoding="utf-8")
+            second_client = DeferredSecondSearchPublishingClient(candidates_by_query)
+
+            with self.assertRaisesRegex(SpotifyRateLimitDeferredError, "Retry-After is 2 hours 46 minutes 39 seconds"):
+                publish_spotify_playlists(
+                    playlist_output_directory=playlist_directory,
+                    report_path=report_path,
+                    spotify_client=second_client,
+                    access_token="access-token",
+                    match_cache_path=match_cache_path,
+                    publisher_config=PublisherConfig(
+                        default_publisher="spotify",
+                        playlist_prefix="Discogs - ",
+                        playlist_suffix="",
+                    ),
+                    apply=False,
+                    publisher_sync_mode="append",
+                )
+            successful_client = PublishingSpotifyClient(
+                {
+                    'track:"Beta One" artist:"Beta Artist" album:"Beta Album"': (
+                        SpotifyTrackCandidate(
+                            uri="spotify:track:beta",
+                            name="Beta One",
+                            artists=("Beta Artist",),
+                            album_name="Beta Album",
+                        ),
+                    )
+                }
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=successful_client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+            complete_report_text = report_path.read_text(encoding="utf-8")
+
+        self.assertIn("111|1|alpha artist|alpha album|alpha one", cache_payload["matches"])
+        self.assertIn("Run status: aborted - Spotify rate limit deferred after 1 of 2 tracks", partial_report_text)
+        self.assertIn("no playlist writes were attempted", partial_report_text)
+        self.assertIn("Tracks: 1", partial_report_text)
+        self.assertIn("Spotify searches: 1", partial_report_text)
+        self.assertIn("Discogs - House | 111 | 1 | Alpha Artist | Alpha One | would_add | spotify:track:alpha", partial_report_text)
+        self.assertNotIn("Beta Artist | Beta One | would_add", partial_report_text)
+        self.assertEqual(
+            second_client.searches,
+            [('access-token', 'track:"Beta One" artist:"Beta Artist" album:"Beta Album"', 10)],
+        )
+        self.assertEqual(summary.track_count, 2)
+        self.assertEqual(summary.cache_hit_count, 1)
+        self.assertEqual(summary.search_count, 1)
+        self.assertIn("Run status: complete", complete_report_text)
+        self.assertIn("Tracks: 2", complete_report_text)
+        self.assertIn("Cache hits: 1", complete_report_text)
+        self.assertIn("Spotify searches: 1", complete_report_text)
+        self.assertIn("Discogs - House | 111 | 1 | Alpha Artist | Alpha One | would_add | spotify:track:alpha", complete_report_text)
+        self.assertIn("Discogs - House | 222 | 1 | Beta Artist | Beta One | would_add | spotify:track:beta", complete_report_text)
 
     def test_append_skips_existing_track_identity_even_if_spotify_uri_changed(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1022,6 +1295,8 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             report_text = report_path.read_text(encoding="utf-8")
 
         self.assertEqual(client.add_calls, [("playlist-house", ("spotify:track:alpha",))])
+        self.assertIn("Run status: failed - publishing stopped while writing Discogs - Techno", report_text)
+        self.assertNotIn("Run status: complete", report_text)
         self.assertIn("Discogs - House | 111 | 1 | Alpha Artist | Alpha One | added | spotify:track:alpha", report_text)
         self.assertIn("Discogs - Techno | 222 | 1 | Beta Artist | Beta One | would_add | spotify:track:beta", report_text)
         self.assertIn("publishing failed: Spotify playlist add items failed with status 500: temporary failure", report_text)
@@ -1685,6 +1960,58 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertNotIn("rate limited search", stderr.getvalue())
 
+    def test_main_prints_partial_report_path_for_deferred_rate_limit(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            write_playlist_master(
+                playlist_directory / "Deep Techno" / "Deep Techno.csv",
+                [playlist_row("111", "Alpha Album", "Alpha One", "Alpha Artist")],
+            )
+            report_path = directory / "reports" / "spotify-report.txt"
+            settings = SpotifySettings(
+                client_id="client-id",
+                redirect_uri="http://127.0.0.1:8765/callback",
+            )
+            token = SpotifyToken(
+                access_token="session-access-token",
+                refresh_token="refresh-token",
+                expires_at=5000,
+                scope="playlist-modify-private",
+                token_type="Bearer",
+            )
+            stderr = io.StringIO()
+
+            def publish_side_effect(**kwargs):
+                kwargs["report_path"].parent.mkdir(parents=True, exist_ok=True)
+                kwargs["report_path"].write_text("partial report\n", encoding="utf-8")
+                raise SpotifyRateLimitDeferredError(retry_after_seconds=9999, max_wait_seconds=480)
+
+            with (
+                patch("publishers.spotify.publish_playlist.load_spotify_settings", return_value=settings),
+                patch("publishers.spotify.publish_playlist.get_spotify_access_token", return_value=token.access_token),
+                patch("publishers.spotify.publish_playlist.publish_spotify_playlists", side_effect=publish_side_effect),
+                patch("sys.stderr", stderr),
+                patch("sys.stdout", new_callable=io.StringIO),
+            ):
+                from publishers.spotify import publish_playlist
+
+                exit_code = publish_playlist.main(
+                    [
+                        "--playlist-output-dir",
+                        str(playlist_directory),
+                        "--playlists",
+                        "Deep Techno",
+                        "--report",
+                        str(report_path),
+                        "--no-progress",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("Spotify rate limit Retry-After is 2 hours 46 minutes 39 seconds", stderr.getvalue())
+        self.assertIn(f"Spotify publish report: {report_path}", stderr.getvalue())
+
     def test_main_writes_safe_debug_log_when_requested(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
@@ -1753,6 +2080,8 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertEqual(publish_playlist.parse_args(["--playlists", "House", "Techno"]).playlists, ["House", "Techno"])
         self.assertEqual(default_args.publisher_sync_mode, "append")
         self.assertEqual(publish_playlist.parse_args(["--publisher-sync-mode", "replace"]).publisher_sync_mode, "replace")
+        self.assertFalse(default_args.refresh_match_cache)
+        self.assertTrue(publish_playlist.parse_args(["--refresh-match-cache"]).refresh_match_cache)
         self.assertTrue(default_args.apply)
         self.assertFalse(default_args.dry_run)
         self.assertTrue(publishing_dry_run_args.dry_run)

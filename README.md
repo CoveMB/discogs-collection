@@ -270,8 +270,9 @@ collection/cache/spotify-track-matches.cache.json
 ```
 
 The cache is JSON, ignored by git, and keyed by release ID, track number, artist,
-album, and track name. The publisher reads it before searching Spotify. New exact
-matches are written back to the cache so later runs can avoid repeat searches.
+album, and track name. The publisher reads it before searching Spotify. It stores
+`matched`, `ambiguous`, and `unmatched` decisions so later runs can avoid repeat
+searches. Search errors are not cached.
 
 Preview the publisher without writing to Spotify:
 
@@ -368,22 +369,42 @@ For each uncached row, the script builds a structured Spotify search query from
 `Spotify Search Query` column only when the structured fields are blank. A track
 is marked `matched` only when one Spotify result matches track, artist, and
 album after normalization. Multiple matching candidates are marked `ambiguous`,
-and rows with no matching candidate are marked `unmatched`. If one Spotify search
-fails, the row is marked `error` and the run continues so the report still shows
-the other rows.
+and rows with no matching candidate are marked `unmatched`.
 
-The report includes summary counts, playlist checks, per-row publish decisions,
-review sections, and the final planned playlist state. The final-state section
-lists position, status, artist, track, album, and Spotify URI for each playlist.
-In append mode it starts with the current Spotify playlist order and then adds
-the planned new tracks. In replace mode it shows the replacement playlist.
-Ambiguous, unmatched, and error rows are not added to the final planned state.
+The Spotify match cache stores `matched`, `ambiguous`, and `unmatched` decisions.
+Later runs reuse those decisions instead of searching Spotify again. Search
+errors are not cached, since they usually mean Spotify or the network failed
+temporarily. To recheck every row and replace cached decisions with fresh Spotify
+results without writing playlist changes to Spotify, run:
+
+```bash
+python3 scripts/publishers/spotify/publish_playlist.py \
+  --publishing-dry-run \
+  --refresh-match-cache
+```
+
+If you omit `--publishing-dry-run`, the publisher also creates or updates
+Spotify playlists according to the selected sync mode.
+
+The report includes run status, summary counts, playlist checks, per-row publish
+decisions, review sections, and the final planned playlist state. The final-state
+section lists position, status, artist, track, album, and Spotify URI for each
+playlist. In append mode it starts with the current Spotify playlist order and
+then adds the planned new tracks. In replace mode it shows the replacement
+playlist. Ambiguous, unmatched, and error rows are not added to the final planned
+state.
 
 If Spotify rate-limits a request, the client waits and retries. It honors
 `Retry-After` exactly when Spotify sends it, and uses a 60-second wait when the
 header is missing or invalid. If Spotify keeps returning `429` after three
 retries, the affected row stays in the search-error section so the failed query
-is visible.
+is visible. If Spotify sends a `Retry-After` longer than the allowed wait, the
+publisher saves stable decisions from the rows it already searched, writes an
+aborted partial report, prints that report path, and exits before any playlist
+writes. After the cooldown, run the publisher again without
+`--refresh-match-cache` so it can reuse the saved decisions. The completed report
+is rebuilt from the playlist CSVs and the match cache, so it includes cached
+decisions from earlier attempts and new results from the final run.
 
 ## On-the-fly release playlists
 
@@ -1295,6 +1316,11 @@ release_ids
 
 --publisher-sync-mode append|replace
     Spotify sync mode. Defaults to append. This only affects Spotify publishing.
+
+--refresh-match-cache
+    Recheck every generated playlist row with Spotify and update the local track
+    match cache. Use with --publishing-dry-run to refresh local decisions without
+    writing playlist changes to Spotify.
 
 --match-cache PATH
     Spotify track match cache path. Defaults to

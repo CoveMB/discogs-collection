@@ -9,7 +9,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from publishers.spotify.matching import (
+    AMBIGUOUS,
     MATCHED,
+    UNMATCHED,
     PlaylistTrack,
     SpotifyTrackCandidate,
     TrackMatchDecision,
@@ -22,6 +24,7 @@ from shared.files import write_json_file
 MATCH_CACHE_SCHEMA_VERSION = 1
 MATCH_CACHE_RECORD_TYPE = "spotify_track_match_cache"
 MATCHER_VERSION = 1
+CACHEABLE_MATCH_STATUSES = {MATCHED, AMBIGUOUS, UNMATCHED}
 
 
 @dataclass(frozen=True)
@@ -71,23 +74,23 @@ def cached_track_match(
     record = matches.get(cache_key)
     if not record:
         return None
-    if clean_cell(record.get("match_status")) not in {"matched", "manual"}:
-        return None
-    spotify_uri = clean_cell(record.get("spotify_uri"))
-    if not spotify_uri.startswith("spotify:track:"):
-        return None
+    match_status = clean_cell(record.get("match_status"))
+    if match_status in {"matched", "manual"}:
+        return cached_matched_track(track, cache_key, record, seen_at=seen_at)
+    if match_status in {AMBIGUOUS, UNMATCHED}:
+        return cached_review_decision(track, cache_key, record, match_status, seen_at=seen_at)
+    return None
 
-    artist_names = tuple(
-        clean_cell(artist_name)
-        for artist_name in record.get("spotify_artist_names", ())
-        if clean_cell(artist_name)
-    )
-    candidate = SpotifyTrackCandidate(
-        uri=spotify_uri,
-        name=clean_cell(record.get("spotify_track_name")) or track.track_name,
-        artists=artist_names or (track.artist_name,),
-        album_name=clean_cell(record.get("spotify_album_name")) or track.album_name,
-    )
+
+def cached_matched_track(
+    track: PlaylistTrack,
+    cache_key: str,
+    record: Mapping[str, object],
+    seen_at: str | None = None,
+) -> CachedSpotifyTrackMatch | None:
+    candidate = spotify_candidate_from_cache_record(record, default_track=track)
+    if not candidate:
+        return None
     if seen_at is not None and isinstance(record, dict):
         record["last_seen_at"] = seen_at
     return CachedSpotifyTrackMatch(
@@ -95,7 +98,7 @@ def cached_track_match(
         decision=TrackMatchDecision(
             track=track,
             status=MATCHED,
-            spotify_uri=spotify_uri,
+            spotify_uri=candidate.uri,
             reason=clean_cell(record.get("match_reason")) or "cached Spotify match",
             candidate=candidate,
             review_candidates=(candidate,),
@@ -103,34 +106,119 @@ def cached_track_match(
     )
 
 
+def cached_review_decision(
+    track: PlaylistTrack,
+    cache_key: str,
+    record: Mapping[str, object],
+    match_status: str,
+    seen_at: str | None = None,
+) -> CachedSpotifyTrackMatch:
+    if seen_at is not None and isinstance(record, dict):
+        record["last_seen_at"] = seen_at
+    return CachedSpotifyTrackMatch(
+        cache_key=cache_key,
+        decision=TrackMatchDecision(
+            track=track,
+            status=match_status,
+            spotify_uri="",
+            reason=clean_cell(record.get("match_reason")) or f"cached Spotify {match_status} decision",
+            candidate=None,
+            review_candidates=review_candidates_from_cache_record(record),
+        ),
+    )
+
+
+def spotify_candidate_from_cache_record(
+    record: Mapping[str, object],
+    default_track: PlaylistTrack | None = None,
+) -> SpotifyTrackCandidate | None:
+    spotify_uri = clean_cell(record.get("spotify_uri"))
+    if not spotify_uri.startswith("spotify:track:"):
+        return None
+    artist_names = clean_string_sequence(record.get("spotify_artist_names"))
+    return SpotifyTrackCandidate(
+        uri=spotify_uri,
+        name=clean_cell(record.get("spotify_track_name")) or (default_track.track_name if default_track else ""),
+        artists=artist_names or ((default_track.artist_name,) if default_track else ()),
+        album_name=clean_cell(record.get("spotify_album_name")) or (default_track.album_name if default_track else ""),
+    )
+
+
+def review_candidates_from_cache_record(record: Mapping[str, object]) -> tuple[SpotifyTrackCandidate, ...]:
+    candidate_records = record.get("review_candidates", ())
+    if not isinstance(candidate_records, list):
+        return ()
+    candidates: list[SpotifyTrackCandidate] = []
+    for candidate_record in candidate_records:
+        if not isinstance(candidate_record, Mapping):
+            continue
+        candidate = spotify_candidate_from_cache_record(candidate_record)
+        if candidate:
+            candidates.append(candidate)
+    return tuple(candidates)
+
+
 def cache_track_match(
     matches: dict[str, dict[str, object]],
     decision: TrackMatchDecision,
     matched_at: str | None = None,
 ) -> None:
-    if decision.status != MATCHED or not decision.spotify_uri:
+    if decision.status not in CACHEABLE_MATCH_STATUSES:
         return
     timestamp = matched_at or utc_timestamp()
     track = decision.track
     candidate = decision.candidate
-    matches[spotify_track_match_key(track)] = {
+    record = {
         "release_id": track.release_id,
         "track_number": track.track_number,
         "artist_name": track.artist_name,
         "album_name": track.album_name,
         "track_name": track.track_name,
         "search_query": build_spotify_track_search_query(track),
-        "spotify_uri": decision.spotify_uri,
-        "spotify_url": spotify_url_from_uri(decision.spotify_uri),
-        "spotify_track_name": candidate.name if candidate else track.track_name,
-        "spotify_artist_names": list(candidate.artists if candidate else (track.artist_name,)),
-        "spotify_album_name": candidate.album_name if candidate else track.album_name,
-        "match_status": "matched",
+        "match_status": decision.status,
         "match_reason": decision.reason,
         "matcher_version": MATCHER_VERSION,
-        "matched_at": timestamp,
         "last_seen_at": timestamp,
     }
+    if decision.status == MATCHED:
+        if not decision.spotify_uri.startswith("spotify:track:"):
+            return
+        record.update(
+            {
+                "spotify_uri": decision.spotify_uri,
+                "spotify_url": spotify_url_from_uri(decision.spotify_uri),
+                "spotify_track_name": candidate.name if candidate else track.track_name,
+                "spotify_artist_names": list(candidate.artists if candidate else (track.artist_name,)),
+                "spotify_album_name": candidate.album_name if candidate else track.album_name,
+                "matched_at": timestamp,
+            }
+        )
+    else:
+        record.update(
+            {
+                "spotify_uri": "",
+                "spotify_url": "",
+                "review_candidates": [spotify_candidate_cache_record(candidate) for candidate in decision.review_candidates],
+                "searched_at": timestamp,
+            }
+        )
+    matches[spotify_track_match_key(track)] = record
+
+
+def spotify_candidate_cache_record(candidate: SpotifyTrackCandidate) -> dict[str, object]:
+    return {
+        "spotify_uri": candidate.uri,
+        "spotify_url": spotify_url_from_uri(candidate.uri),
+        "spotify_track_name": candidate.name,
+        "spotify_artist_names": list(candidate.artists),
+        "spotify_album_name": candidate.album_name,
+    }
+
+
+def clean_string_sequence(value: object) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(clean_value for item in value if (clean_value := clean_cell(item)))
 
 
 def spotify_track_match_key(track: PlaylistTrack) -> str:

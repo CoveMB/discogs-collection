@@ -254,6 +254,7 @@ def build_spotify_publisher_args(args: argparse.Namespace) -> argparse.Namespace
         playlists=None,
         search_limit=args.search_limit,
         publisher_sync_mode=args.publisher_sync_mode,
+        refresh_match_cache=args.refresh_match_cache,
         dry_run=args.publishing_dry_run,
         progress=args.progress,
         apply=not args.publishing_dry_run,
@@ -408,6 +409,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--access-token", help=argparse.SUPPRESS)
     parser.add_argument("--search-limit", type=int, default=10, help="Spotify search result limit per track. Defaults to 10.")
     parser.add_argument("--publisher-sync-mode", choices=spotify_publisher.PUBLISHER_SYNC_MODES, default=spotify_publisher.APPEND_SYNC_MODE, help="Publisher sync mode. append adds missing tracks; replace replaces playlist contents. Defaults to append.")
+    parser.add_argument("--refresh-match-cache", action="store_true", help="Recheck every generated playlist row with Spotify and update the local track match cache.")
     parser.add_argument("--publishing-dry-run", action="store_true", help="Preview Spotify playlist changes without creating or updating playlists.")
     parser.add_argument("--debug-log", type=Path, help="Write sanitized release playlist debug logs to this path.")
     parser.add_argument("--no-progress", action="store_false", dest="progress", help="Disable terminal progress output.")

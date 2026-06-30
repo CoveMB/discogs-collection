@@ -135,6 +135,7 @@ class PlaylistPublishContext:
 class SpotifyPublishSummary:
     playlist_count: int
     track_count: int
+    run_status: str
     cache_hit_count: int
     search_count: int
     matched_count: int
@@ -258,6 +259,7 @@ def publish_spotify_playlists(
     apply: bool = True,
     publisher_sync_mode: str = APPEND_SYNC_MODE,
     info_log: InfoLog | None = None,
+    refresh_match_cache: bool = False,
 ) -> SpotifyPublishSummary:
     if publisher_sync_mode not in PUBLISHER_SYNC_MODES:
         raise ValueError(f"publisher_sync_mode must be one of: {', '.join(PUBLISHER_SYNC_MODES)}")
@@ -329,6 +331,7 @@ def publish_spotify_playlists(
                         search_limit=search_limit,
                         match_cache=match_cache,
                         timestamp=timestamp,
+                        refresh_match_cache=refresh_match_cache,
                     )
                     if match_source == MATCH_SOURCE_CACHE:
                         cache_hit_count += 1
@@ -353,7 +356,7 @@ def publish_spotify_playlists(
                         final_items.append(final_playlist_item_from_decision(len(final_items) + 1, publish_decision))
                     elif identity_key and publish_decision.status in {ALREADY_PRESENT, DUPLICATE_IN_SOURCE}:
                         seen_source_identity_keys.add(identity_key)
-                    if decision.status == MATCHED and match_source == MATCH_SOURCE_SEARCH:
+                    if match_source == MATCH_SOURCE_SEARCH:
                         cache_track_match(match_cache, decision, matched_at=timestamp)
                     if debug_log:
                         debug_log(f"publish_track_done index={processed_track_count} status={publish_decision.status} source={match_source}")
@@ -362,6 +365,23 @@ def publish_spotify_playlists(
                         progress.update(processed_track_count)
 
             planned_write_uris_by_playlist[target_playlist_name] = tuple(planned_write_uris)
+    except SpotifyRateLimitDeferredError:
+        save_spotify_track_match_cache(match_cache_path, match_cache)
+        write_publish_summary(
+            decisions=tuple(decisions),
+            final_items=tuple(reindex_final_items(final_items)),
+            playlist_contexts=tuple(playlist_contexts),
+            report_path=report_path,
+            apply=apply,
+            publisher_sync_mode=publisher_sync_mode,
+            cache_hit_count=cache_hit_count,
+            search_count=search_count,
+            run_status=(
+                f"aborted - Spotify rate limit deferred after {len(decisions)} of {total_tracks} tracks; "
+                "no playlist writes were attempted"
+            ),
+        )
+        raise
     finally:
         if progress:
             progress.finish()
@@ -415,10 +435,12 @@ def resolve_track_match(
     search_limit: int,
     match_cache: dict[str, dict[str, object]],
     timestamp: str,
+    refresh_match_cache: bool = False,
 ) -> tuple[TrackMatchDecision, str]:
-    cached_match = cached_track_match(track, match_cache, seen_at=timestamp)
-    if cached_match:
-        return cached_match.decision, MATCH_SOURCE_CACHE
+    if not refresh_match_cache:
+        cached_match = cached_track_match(track, match_cache, seen_at=timestamp)
+        if cached_match:
+            return cached_match.decision, MATCH_SOURCE_CACHE
     return search_spotify_track(
         track=track,
         spotify_client=spotify_client,
@@ -849,11 +871,13 @@ def build_publish_summary(
     publisher_sync_mode: str,
     cache_hit_count: int,
     search_count: int,
+    run_status: str = "complete",
 ) -> SpotifyPublishSummary:
     playlist_names = {context.target_playlist_name for context in playlist_contexts}
     return SpotifyPublishSummary(
         playlist_count=len(playlist_names),
         track_count=len(decisions),
+        run_status=run_status,
         cache_hit_count=cache_hit_count,
         search_count=search_count,
         matched_count=sum(1 for decision in decisions if decision.spotify_uri),
@@ -884,6 +908,7 @@ def write_publish_summary(
     publisher_sync_mode: str,
     cache_hit_count: int,
     search_count: int,
+    run_status: str = "complete",
 ) -> SpotifyPublishSummary:
     summary = build_publish_summary(
         decisions=decisions,
@@ -894,6 +919,7 @@ def write_publish_summary(
         publisher_sync_mode=publisher_sync_mode,
         cache_hit_count=cache_hit_count,
         search_count=search_count,
+        run_status=run_status,
     )
     write_publish_report(report_path, summary)
     return summary
@@ -948,6 +974,7 @@ def apply_planned_playlist_writes(
                 publisher_sync_mode=publisher_sync_mode,
                 cache_hit_count=cache_hit_count,
                 search_count=search_count,
+                run_status=f"failed - publishing stopped while writing {context.target_playlist_name}",
             )
             raise
         current_contexts[index] = applied_context
@@ -1030,11 +1057,19 @@ def write_publish_report(path: Path, summary: SpotifyPublishSummary) -> None:
         format_report_section(
             "Summary",
             [
+                f"- Run status: {summary.run_status}",
                 f"- Publisher sync mode: {summary.publisher_sync_mode}",
                 f"- Playlists: {summary.playlist_count}",
                 f"- Tracks: {summary.track_count}",
                 f"- Cache hits: {summary.cache_hit_count}",
                 f"- Spotify searches: {summary.search_count}",
+                f"- Cached matched tracks: {cached_matched_publish_decision_count(summary.decisions)}",
+                f"- Cached ambiguous tracks: {count_publish_decisions(summary.decisions, MATCH_SOURCE_CACHE, {AMBIGUOUS})}",
+                f"- Cached unmatched tracks: {count_publish_decisions(summary.decisions, MATCH_SOURCE_CACHE, {UNMATCHED})}",
+                f"- Searched matched tracks: {searched_matched_publish_decision_count(summary.decisions)}",
+                f"- Searched ambiguous tracks: {count_publish_decisions(summary.decisions, MATCH_SOURCE_SEARCH, {AMBIGUOUS})}",
+                f"- Searched unmatched tracks: {count_publish_decisions(summary.decisions, MATCH_SOURCE_SEARCH, {UNMATCHED})}",
+                f"- Searched error tracks: {count_publish_decisions(summary.decisions, MATCH_SOURCE_SEARCH, {ERROR})}",
                 f"- Matched tracks: {summary.matched_count}",
                 f"- Already-present tracks: {summary.already_present_count}",
                 f"- Would add tracks: {summary.would_add_count}",
@@ -1121,6 +1156,22 @@ def write_publish_report(path: Path, summary: SpotifyPublishSummary) -> None:
         )
     )
     write_text_report(path, lines)
+
+
+def count_publish_decisions(
+    decisions: Sequence[PlaylistPublishDecision],
+    match_source: str,
+    statuses: set[str],
+) -> int:
+    return sum(1 for decision in decisions if decision.match_source == match_source and decision.status in statuses)
+
+
+def cached_matched_publish_decision_count(decisions: Sequence[PlaylistPublishDecision]) -> int:
+    return sum(1 for decision in decisions if decision.match_source == MATCH_SOURCE_CACHE and bool(decision.spotify_uri))
+
+
+def searched_matched_publish_decision_count(decisions: Sequence[PlaylistPublishDecision]) -> int:
+    return sum(1 for decision in decisions if decision.match_source == MATCH_SOURCE_SEARCH and bool(decision.spotify_uri))
 
 
 def format_publish_decisions(decisions: Sequence[PlaylistPublishDecision], statuses: set[str]) -> list[str]:
@@ -1347,6 +1398,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--playlists", nargs="+", help="Playlist names, folder names, folder paths, or master CSV paths to publish. Omit to process every playlist.")
     parser.add_argument("--search-limit", type=int, default=10, help="Spotify search result limit per track. Defaults to 10.")
     parser.add_argument("--publisher-sync-mode", choices=PUBLISHER_SYNC_MODES, default=APPEND_SYNC_MODE, help="Publisher sync mode. append adds missing tracks; replace replaces playlist contents. Defaults to append.")
+    parser.add_argument("--refresh-match-cache", action="store_true", help="Recheck every playlist row with Spotify and update the local track match cache.")
     parser.add_argument("--publishing-dry-run", action="store_true", dest="dry_run", help="Preview Spotify playlist changes without creating or updating playlists.")
     parser.add_argument("--no-progress", action="store_false", dest="progress", help="Disable terminal progress output.")
     args = parser.parse_args(argv)
@@ -1405,6 +1457,7 @@ def run_spotify_publish_from_args(
         apply=args.apply,
         publisher_sync_mode=args.publisher_sync_mode,
         info_log=print,
+        refresh_match_cache=args.refresh_match_cache,
     )
 
 
@@ -1416,7 +1469,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             debug_log("start spotify_publish")
             debug_log(
                 f"parsed_args playlist_selectors={len(args.playlists or ())} search_limit={args.search_limit} "
-                f"progress={args.progress} apply={args.apply} sync_mode={args.publisher_sync_mode}"
+                f"progress={args.progress} apply={args.apply} sync_mode={args.publisher_sync_mode} "
+                f"refresh_match_cache={args.refresh_match_cache}"
             )
         summary = run_spotify_publish_from_args(args, debug_log=debug_log)
         if debug_log:
@@ -1429,6 +1483,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
     except (FileNotFoundError, NotADirectoryError, ValueError, csv.Error, SpotifyApiError) as error:
         print(f"Error: {error}", file=sys.stderr)
+        if isinstance(error, SpotifyRateLimitDeferredError) and "args" in locals() and args.report.exists():
+            print(f"Spotify publish report: {args.report}", file=sys.stderr)
         return 1
     print(f"Spotify publish report: {summary.report_path}")
     print(f"Tracks: {summary.track_count}")
