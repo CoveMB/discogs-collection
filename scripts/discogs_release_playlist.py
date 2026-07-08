@@ -253,6 +253,7 @@ def build_spotify_publisher_args(args: argparse.Namespace) -> argparse.Namespace
         access_token=args.access_token,
         playlists=None,
         search_limit=args.search_limit,
+        max_new_searches_per_run=args.max_new_searches_per_run,
         publisher_sync_mode=args.publisher_sync_mode,
         refresh_match_cache=args.refresh_match_cache,
         dry_run=args.publishing_dry_run,
@@ -408,6 +409,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reauthorize", action="store_true", help="Force a fresh Spotify login before running the publisher.")
     parser.add_argument("--access-token", help=argparse.SUPPRESS)
     parser.add_argument("--search-limit", type=int, default=10, help="Spotify search result limit per track. Defaults to 10.")
+    parser.add_argument(
+        "--max-new-searches-per-run",
+        type=int,
+        default=spotify_publisher.DEFAULT_MAX_NEW_SEARCHES_PER_RUN,
+        help=(
+            "Maximum uncached Spotify searches per publisher run. "
+            "Defaults to 500. Use 0 for unlimited."
+        ),
+    )
     parser.add_argument("--publisher-sync-mode", choices=spotify_publisher.PUBLISHER_SYNC_MODES, default=spotify_publisher.APPEND_SYNC_MODE, help="Publisher sync mode. append adds missing tracks; replace replaces playlist contents. Defaults to append.")
     parser.add_argument("--refresh-match-cache", action="store_true", help="Recheck every generated playlist row with Spotify and update the local track match cache.")
     parser.add_argument("--publishing-dry-run", action="store_true", help="Preview Spotify playlist changes without creating or updating playlists.")
@@ -427,6 +437,8 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--request-interval-seconds must be non-negative")
     if args.search_limit < 1 or args.search_limit > 10:
         parser.error("--search-limit must be between 1 and 10")
+    if args.max_new_searches_per_run < 0:
+        parser.error("--max-new-searches-per-run must be non-negative")
     if not args.release_ids and args.release_ids_file is None:
         parser.error("at least one release_id or --release-ids-file is required")
 

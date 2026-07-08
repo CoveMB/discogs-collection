@@ -43,6 +43,7 @@ class SpotifyPlaylist:
     owner_id: str = ""
     public: bool | None = None
     collaborative: bool = False
+    snapshot_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,8 @@ class SpotifyPlaylistItem:
     name: str
     artists: tuple[str, ...]
     album_name: str
+    added_at: str = ""
+    position: int = 0
 
 
 @dataclass(frozen=True)
@@ -85,6 +88,15 @@ class SpotifyRateLimitDeferredError(SpotifyApiError):
             f"{format_wait_duration(retry_after_seconds)}, exceeding max wait "
             f"{format_wait_duration(max_wait_seconds)}. Retry later. "
             "After the cooldown expires, run only scripts/publishers/spotify/publish_playlist.py."
+        )
+
+
+class SpotifyRateLimitRetriesExhaustedError(SpotifyApiError):
+    def __init__(self, retry_after_seconds: float):
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__(
+            "Spotify rate limit retries were exhausted. "
+            f"Retry later; last Retry-After was {format_wait_duration(retry_after_seconds)}."
         )
 
 
@@ -167,7 +179,10 @@ class SpotifyClient:
         playlist_items: list[SpotifyPlaylistItem] = []
         limit = 50
         offset = 0
-        fields = "items(track(uri,name,artists(name),album(name))),next,total,limit,offset"
+        fields = (
+            "items(added_at,item(uri,name,type,artists(name),album(name)),"
+            "track(uri,name,type,artists(name),album(name))),next,total,limit,offset"
+        )
         while True:
             params = urllib.parse.urlencode(
                 {
@@ -185,7 +200,10 @@ class SpotifyClient:
             if response.status != 200:
                 raise SpotifyApiError(f"Spotify playlist items failed with status {response.status}: {response.body}")
             payload = json.loads(response.body or "{}")
-            playlist_items.extend(parse_playlist_item_page(payload))
+            page_items = parse_playlist_item_page(payload, starting_position=offset)
+            if playlist_item_page_has_unparsed_tracks(payload, page_items):
+                raise SpotifyApiError("Spotify playlist items response could not parse any playlist tracks from a non-empty page")
+            playlist_items.extend(page_items)
             if not payload.get("next"):
                 return tuple(playlist_items)
             offset += limit
@@ -256,6 +274,32 @@ class SpotifyClient:
             raise SpotifyApiError(f"Spotify playlist replace items failed with status {response.status}: {response.body}")
         return parse_snapshot_id(response.body)
 
+    def remove_playlist_items(
+        self,
+        access_token: str,
+        playlist_id: str,
+        items: Sequence[SpotifyPlaylistItem],
+        snapshot_id: str = "",
+    ) -> str:
+        items_payload = playlist_item_remove_payload(tuple(items))
+        if not items_payload:
+            return snapshot_id
+        if len(items_payload) > 100:
+            raise ValueError("Spotify playlist remove accepts at most 100 URI groups per request")
+        body: dict[str, object] = {"items": items_payload}
+        if snapshot_id:
+            body["snapshot_id"] = snapshot_id
+        request = HttpRequest(
+            method="DELETE",
+            url=f"{SPOTIFY_API_ROOT}/playlists/{urllib.parse.quote(playlist_id)}/items",
+            headers=spotify_json_headers(access_token),
+            body=json.dumps(body).encode("utf-8"),
+        )
+        response = self.request_with_rate_limit_retries(request, operation_name="spotify_playlist_remove_items")
+        if response.status != 200:
+            raise SpotifyApiError(f"Spotify playlist remove items failed with status {response.status}: {response.body}")
+        return parse_snapshot_id(response.body)
+
     def request_with_rate_limit_retries(self, request: HttpRequest, operation_name: str = "spotify_search") -> HttpResponse:
         max_retries = max(0, self.retry_policy.max_rate_limit_retries)
         for attempt_number in range(1, max_retries + 2):
@@ -265,7 +309,8 @@ class SpotifyClient:
             if response.status != 429:
                 return response
             if attempt_number > max_retries:
-                return response
+                wait_seconds = self.retry_policy.rate_limit_wait_seconds(response.headers)
+                raise SpotifyRateLimitRetriesExhaustedError(wait_seconds)
             wait_seconds = self.retry_policy.rate_limit_wait_seconds(response.headers)
             if self.retry_policy.exceeds_max_wait(wait_seconds):
                 self.log_debug(
@@ -352,23 +397,59 @@ def parse_playlist_object(payload: object) -> SpotifyPlaylist | None:
         owner_id=clean_cell(owner.get("id")) if isinstance(owner, dict) else "",
         public=public_value if isinstance(public_value, bool) else None,
         collaborative=bool(payload.get("collaborative")) if isinstance(payload.get("collaborative"), bool) else False,
+        snapshot_id=clean_cell(payload.get("snapshot_id")),
     )
 
 
-def parse_playlist_item_page(payload: object) -> tuple[SpotifyPlaylistItem, ...]:
+def parse_playlist_item_page(payload: object, starting_position: int = 0) -> tuple[SpotifyPlaylistItem, ...]:
     items = payload.get("items", []) if isinstance(payload, dict) else []
     playlist_items: list[SpotifyPlaylistItem] = []
-    for item in items:
+    for item_offset, item in enumerate(items):
         if not isinstance(item, dict):
             continue
-        playlist_item = parse_playlist_item_track(item.get("track"))
+        playlist_item = parse_playlist_item_track(
+            playlist_item_media_payload(item),
+            added_at=clean_cell(item.get("added_at")),
+            position=starting_position + item_offset,
+        )
         if playlist_item:
             playlist_items.append(playlist_item)
     return tuple(playlist_items)
 
 
-def parse_playlist_item_track(track: object) -> SpotifyPlaylistItem | None:
+def playlist_item_page_has_unparsed_tracks(payload: object, parsed_items: Sequence[SpotifyPlaylistItem]) -> bool:
+    if parsed_items or not isinstance(payload, dict):
+        return False
+    items = payload.get("items", [])
+    if not isinstance(items, list) or not items:
+        return False
+    return any(playlist_item_payload_looks_like_track(item) for item in items)
+
+
+def playlist_item_payload_looks_like_track(item: object) -> bool:
+    if not isinstance(item, dict):
+        return False
+    media = playlist_item_media_payload(item)
+    if not isinstance(media, dict):
+        return False
+    media_type = clean_cell(media.get("type")).casefold()
+    if media_type and media_type != "track":
+        return False
+    return any(field in media for field in ("uri", "name", "artists", "album"))
+
+
+def playlist_item_media_payload(item: Mapping[str, object]) -> object:
+    media = item.get("item")
+    if isinstance(media, dict):
+        return media
+    return item.get("track")
+
+
+def parse_playlist_item_track(track: object, added_at: str = "", position: int = 0) -> SpotifyPlaylistItem | None:
     if not isinstance(track, dict):
+        return None
+    media_type = clean_cell(track.get("type")).casefold()
+    if media_type and media_type != "track":
         return None
     uri = clean_cell(track.get("uri"))
     name = clean_cell(track.get("name"))
@@ -387,6 +468,8 @@ def parse_playlist_item_track(track: object) -> SpotifyPlaylistItem | None:
         name=name,
         artists=artist_names,
         album_name=album_name,
+        added_at=added_at,
+        position=position,
     )
 
 
@@ -402,6 +485,19 @@ def parse_current_user_id(body: str) -> str:
 
 def chunk_values(values: Sequence[str], batch_size: int) -> tuple[tuple[str, ...], ...]:
     return tuple(tuple(values[index : index + batch_size]) for index in range(0, len(values), batch_size))
+
+
+def playlist_item_remove_payload(items: Sequence[SpotifyPlaylistItem]) -> list[dict[str, object]]:
+    positions_by_uri: dict[str, list[int]] = {}
+    for item in items:
+        uri = clean_cell(item.uri)
+        if not uri:
+            continue
+        positions_by_uri.setdefault(uri, []).append(item.position)
+    return [
+        {"uri": uri, "positions": sorted(positions)}
+        for uri, positions in positions_by_uri.items()
+    ]
 
 
 def urllib_transport(request: HttpRequest) -> HttpResponse:

@@ -70,6 +70,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--max-workers", type=int, help="Maximum concurrent uncached enrichment lookups.")
     parser.add_argument("--max-rows", type=int, help="Maximum rows per split CSV, overriding workflow config.")
+    parser.add_argument(
+        "--max-new-searches-per-run",
+        type=int,
+        help=(
+            "Maximum uncached Spotify searches per publisher run. "
+            "Passed to the Spotify publisher; use 0 for unlimited."
+        ),
+    )
     args = parser.parse_args(argv)
     validate_args(parser, args)
     return args
@@ -84,6 +92,8 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--max-workers must be at least 1")
     if args.max_rows is not None and args.max_rows < 1:
         parser.error("--max-rows must be at least 1")
+    if args.max_new_searches_per_run is not None and args.max_new_searches_per_run < 0:
+        parser.error("--max-new-searches-per-run must be non-negative")
 
 
 def append_option(arguments: list[str], option: str, value: object | None) -> None:
@@ -102,6 +112,7 @@ def log_pipeline_context(args: argparse.Namespace, debug_log: DebugLog) -> None:
         f"no_progress={args.no_progress} timeout_seconds={format_debug_value(args.timeout_seconds)} "
         f"request_interval_seconds={format_debug_value(args.request_interval_seconds)} "
         f"max_workers={format_debug_value(args.max_workers)} max_rows={format_debug_value(args.max_rows)} "
+        f"max_new_searches_per_run={format_debug_value(args.max_new_searches_per_run)} "
         f"regenerate_splits={format_debug_value(args.regenerate_splits)}"
     )
 
@@ -190,6 +201,7 @@ def build_spotify_publisher_args(args: argparse.Namespace) -> list[str]:
         arguments.append("--no-progress")
     if args.publishing_dry_run:
         arguments.append("--publishing-dry-run")
+    append_option(arguments, "--max-new-searches-per-run", args.max_new_searches_per_run)
     return arguments
 
 

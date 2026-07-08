@@ -250,6 +250,47 @@ class DiscogsReleasePlaylistTests(unittest.TestCase):
             self.assertEqual(summary.publisher, "spotify")
             self.assertTrue(publish.call_args.args[0].refresh_match_cache)
 
+    def test_run_release_playlist_forwards_max_new_searches_per_run_to_spotify_publisher(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            output_directory = directory / "collection" / "playlists" / "on-the-fly"
+            report_path = directory / "reports" / "release-playlist.txt"
+            publisher_report_path = directory / "reports" / "spotify-publish.txt"
+            args = release_playlist.parse_args(
+                [
+                    "--name",
+                    "Friday Picks",
+                    "--output-dir",
+                    str(output_directory),
+                    "--report",
+                    str(report_path),
+                    "--publisher",
+                    "spotify",
+                    "--publisher-report",
+                    str(publisher_report_path),
+                    "--publishing-dry-run",
+                    "--max-new-searches-per-run",
+                    "25",
+                    "--no-progress",
+                    "111",
+                ]
+            )
+
+            with (
+                patch(
+                    "discogs_release_playlist.exporter.make_cached_tracklist_lookup",
+                    return_value=lambda row: lookup_for(row["release_id"]),
+                ),
+                patch(
+                    "discogs_release_playlist.spotify_publisher.run_spotify_publish_from_args",
+                    return_value=publish_summary_stub(),
+                ) as publish,
+            ):
+                summary = release_playlist.run_release_playlist(args)
+
+            self.assertEqual(summary.publisher, "spotify")
+            self.assertEqual(publish.call_args.args[0].max_new_searches_per_run, 25)
+
     def test_publisher_flag_overrides_default_config(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)

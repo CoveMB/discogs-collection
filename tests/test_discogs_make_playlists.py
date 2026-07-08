@@ -372,6 +372,41 @@ class DiscogsMakePlaylistsTests(unittest.TestCase):
             ]
         )
 
+    def test_passes_max_new_searches_per_run_to_configured_spotify_publisher(self):
+        def successful_step(_argv):
+            return 0
+
+        with (
+            patch.object(maker.enricher, "main", side_effect=successful_step),
+            patch.object(maker.mapper, "main", side_effect=successful_step),
+            patch.object(maker.exporter, "main", side_effect=successful_step),
+            patch.object(maker.splitter, "main", side_effect=successful_step),
+            patch.object(spotify_publisher, "main", return_value=0) as publisher_main,
+            patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            exit_code = maker.main(["--publisher", "spotify", "--max-new-searches-per-run", "250"])
+
+        self.assertEqual(exit_code, 0)
+        publisher_main.assert_called_once_with(
+            [
+                "--publisher-config",
+                "config/publisher.json",
+                "--max-new-searches-per-run",
+                "250",
+            ]
+        )
+
+    def test_parse_args_rejects_negative_max_new_searches_per_run(self):
+        stderr = io.StringIO()
+        with (
+            patch("sys.stderr", stderr),
+            self.assertRaises(SystemExit) as exit_context,
+        ):
+            maker.parse_args(["--max-new-searches-per-run", "-1"])
+
+        self.assertEqual(exit_context.exception.code, 2)
+        self.assertIn("--max-new-searches-per-run must be non-negative", stderr.getvalue())
+
     def test_logs_when_resolved_publisher_is_none(self):
         def successful_step(_argv):
             return 0

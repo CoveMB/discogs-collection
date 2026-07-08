@@ -23,7 +23,7 @@ from shared.files import write_json_file
 
 MATCH_CACHE_SCHEMA_VERSION = 1
 MATCH_CACHE_RECORD_TYPE = "spotify_track_match_cache"
-MATCHER_VERSION = 1
+MATCHER_VERSION = 2
 CACHEABLE_MATCH_STATUSES = {MATCHED, AMBIGUOUS, UNMATCHED}
 
 
@@ -78,8 +78,17 @@ def cached_track_match(
     if match_status in {"matched", "manual"}:
         return cached_matched_track(track, cache_key, record, seen_at=seen_at)
     if match_status in {AMBIGUOUS, UNMATCHED}:
+        if cache_record_matcher_version(record) != MATCHER_VERSION:
+            return None
         return cached_review_decision(track, cache_key, record, match_status, seen_at=seen_at)
     return None
+
+
+def cache_record_matcher_version(record: Mapping[str, object]) -> int:
+    try:
+        return int(str(record.get("matcher_version", "")).strip())
+    except ValueError:
+        return 0
 
 
 def cached_matched_track(
@@ -102,6 +111,7 @@ def cached_matched_track(
             reason=clean_cell(record.get("match_reason")) or "cached Spotify match",
             candidate=candidate,
             review_candidates=(candidate,),
+            search_queries=search_queries_from_cache_record(record),
         ),
     )
 
@@ -124,8 +134,17 @@ def cached_review_decision(
             reason=clean_cell(record.get("match_reason")) or f"cached Spotify {match_status} decision",
             candidate=None,
             review_candidates=review_candidates_from_cache_record(record),
+            search_queries=search_queries_from_cache_record(record),
         ),
     )
+
+
+def search_queries_from_cache_record(record: Mapping[str, object]) -> tuple[str, ...]:
+    search_queries = clean_string_sequence(record.get("search_queries"))
+    if search_queries:
+        return search_queries
+    search_query = clean_cell(record.get("search_query"))
+    return (search_query,) if search_query else ()
 
 
 def spotify_candidate_from_cache_record(
@@ -175,6 +194,7 @@ def cache_track_match(
         "album_name": track.album_name,
         "track_name": track.track_name,
         "search_query": build_spotify_track_search_query(track),
+        "search_queries": list(decision.search_queries),
         "match_status": decision.status,
         "match_reason": decision.reason,
         "matcher_version": MATCHER_VERSION,

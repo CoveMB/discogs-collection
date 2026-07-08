@@ -8,9 +8,11 @@ genre metadata from Discogs, maps those terms to local playlist labels, exports
 TuneMyMusic-style master CSV files per playlist, and creates split CSVs for
 playlist import batches. The optional Spotify publisher starts from those
 playlist CSVs, can publish matched tracks to Spotify, and still supports
-explicit dry-run previews. A separate release-ID playlist script can create an
-isolated on-the-fly playlist from explicit Discogs `release_id` values without
-adding those releases to the collection master.
+explicit dry-run previews. Optional Spotify tooling can also dedupe
+repo-managed publisher playlists by exact Spotify track URI. A separate
+release-ID playlist script can create an isolated on-the-fly playlist from
+explicit Discogs `release_id` values without adding those releases to the
+collection master.
 
 The tool should stay focused on this workflow: read Discogs export rows, use
 `release_id` to find explicit Discogs metadata, write an enriched CSV with audit
@@ -20,7 +22,7 @@ default batch size. On-the-fly release playlists should stay under
 `collection/playlists/on-the-fly`, reuse lookup caches only as lookup caches, and
 never change collection row order or playlist mapping. Spotify publisher code belongs under
 `scripts/publishers/spotify/` and should keep matching, API client, auth/cache,
-and CLI orchestration concerns separate.
+dedupe, and CLI orchestration concerns separate.
 
 Do not add style or genre guessing, fuzzy matching, machine learning, broad
 scraping, or collection management features unless the user asks for them.
@@ -101,6 +103,10 @@ The tool should:
 - create split CSVs from playlist master CSVs, defaulting to 500 rows per file
 - write export reports for missing playlist labels, missing `release_id`, empty
   tracklists, and release-level fallback rows
+- dedupe only repo-managed Spotify publisher playlists owned by the current user
+  whose names match the configured publisher prefix or suffix
+- use exact Spotify track URI duplicates only, keep the first added item, and
+  require explicit apply mode before removing duplicates from Spotify
 
 Use `--refresh-existing` only when the user wants existing `Style` and `Genre`
 values replaced.

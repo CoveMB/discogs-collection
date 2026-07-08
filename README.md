@@ -24,7 +24,9 @@ The scripts are local-first. They read and write CSV, JSON cache, and plain text
 report files on disk. The enrichment, playlist exporter, and release-ID
 playlist scripts can call Discogs. The Spotify publisher can call Spotify to
 plan playlist changes, and it creates or updates Spotify playlists unless you
-pass `--publishing-dry-run`.
+pass `--publishing-dry-run`. The Spotify dedupe command can remove exact track
+URI duplicates from repo-managed Spotify publisher playlists, but only when you
+pass `--apply`.
 
 ## Get a Discogs collection export
 
@@ -206,6 +208,10 @@ from the combined workflow, pass `--publisher spotify` or set
 resolved Spotify publisher to preview changes without creating or updating
 playlists.
 
+When Spotify publishing is enabled, the combined workflow accepts
+`--max-new-searches-per-run N` and passes it to the Spotify publisher. Use `0`
+for an uncapped publisher run.
+
 `config/publisher.json` defaults to:
 
 ```json
@@ -331,6 +337,27 @@ has a different Spotify URI. Duplicate artist, album, and track matches inside
 the same source run are skipped and reported. The same artist and track can
 still be added when it appears on a different album.
 
+Append publishing is incremental. The publisher reads the playlist CSVs in
+source order and checks the local Spotify match cache before searching Spotify.
+For uncached rows, it searches up to 500 new tracks per run by default. Cache
+hits do not count against that limit. As matched tracks are found, the publisher
+writes append batches of up to 100 URIs, saves the match cache, and rewrites the
+report. When the search budget is reached, the run exits successfully with a
+partial run status. Later runs start from the CSVs again, reuse cached matches,
+fetch the current Spotify playlist contents, and skip tracks that are already
+present.
+
+To change the per-run search budget:
+
+```bash
+python3 scripts/publishers/spotify/publish_playlist.py \
+  --max-new-searches-per-run 50
+```
+
+Use `--max-new-searches-per-run 0` for an uncapped run. If Spotify throttles
+before the default 500 new searches, rerun the publisher after the cooldown and
+use a lower value such as `50` or `25`.
+
 Replace mode plans the final playlist from the matched local CSV rows in source
 order:
 
@@ -397,14 +424,77 @@ state.
 If Spotify rate-limits a request, the client waits and retries. It honors
 `Retry-After` exactly when Spotify sends it, and uses a 60-second wait when the
 header is missing or invalid. If Spotify keeps returning `429` after three
-retries, the affected row stays in the search-error section so the failed query
-is visible. If Spotify sends a `Retry-After` longer than the allowed wait, the
-publisher saves stable decisions from the rows it already searched, writes an
-aborted partial report, prints that report path, and exits before any playlist
-writes. After the cooldown, run the publisher again without
-`--refresh-match-cache` so it can reuse the saved decisions. The completed report
-is rebuilt from the playlist CSVs and the match cache, so it includes cached
-decisions from earlier attempts and new results from the final run.
+retries, or sends a `Retry-After` longer than the allowed wait, the publisher
+treats that as a rate-limit stop instead of a row-level search error. It saves
+the match cache, writes an aborted partial report for rows already planned,
+prints that report path, and exits with a nonzero status. In append mode,
+completed append checkpoints stay written; uncheckpointed pending rows are not
+written after the rate-limit stop. After the cooldown, run the publisher again
+without `--refresh-match-cache` so it can reuse the saved decisions. The
+completed report is rebuilt from the playlist CSVs and the match cache, so it
+includes cached decisions from earlier attempts and new results from the final
+run.
+
+## Dedupe Spotify publisher playlists
+
+`scripts/dedupe_playlists.py` checks provider playlists for duplicate tracks and
+plans removals. The first supported provider is Spotify.
+
+The script only considers Spotify playlists that are owned by the current user,
+private, non-collaborative, and named with the publisher prefix or suffix from
+`config/publisher.json`. With the default config, that means playlists named
+like `Discogs - House`. Followed playlists, public playlists, collaborative
+playlists, playlists with unknown privacy status, and playlists that do not
+match the configured publisher naming are skipped. If both `playlist_prefix` and
+`playlist_suffix` are empty, the script stops before calling Spotify because it
+cannot identify repo-managed playlists safely.
+
+Preview duplicate removals:
+
+```bash
+python3 scripts/dedupe_playlists.py --provider spotify
+```
+
+Preview duplicate removals for selected playlists:
+
+```bash
+python3 scripts/dedupe_playlists.py --provider spotify --playlists House Techno
+```
+
+Apply duplicate removals:
+
+```bash
+python3 scripts/dedupe_playlists.py --provider spotify --apply
+```
+
+Apply duplicate removals for selected playlists:
+
+```bash
+python3 scripts/dedupe_playlists.py --provider spotify --playlists House Techno --apply
+```
+
+`--playlists` accepts one or more selectors. Each selector can be the local
+playlist label, such as `House`, the Spotify target name, such as
+`Discogs - House`, or the Spotify playlist ID. Each selected playlist must still
+pass the owned, private, non-collaborative, publisher-managed checks. If any
+selector is blank, `all`, ambiguous, missing, or matches only skipped playlists,
+the script stops before fetching playlist tracks.
+
+Duplicates are exact Spotify track URI matches inside the same playlist. The
+same track URI in two different playlists is not a duplicate. For each duplicate
+URI, the script keeps the item with the earliest Spotify `added_at` timestamp.
+If timestamps are missing, invalid, or tied, it keeps the earlier playlist
+position.
+
+The report defaults to:
+
+```text
+reports/YYYY-MM-DD_HH-MM-SS_dedupe.txt
+```
+
+The report lists fetched playlists, eligible playlists, skipped playlists,
+planned duplicate removals, and applied removals. It does not update collection
+CSVs, playlist master CSVs, split CSVs, or Spotify match caches.
 
 ## On-the-fly release playlists
 
@@ -454,6 +544,10 @@ overrides it. If the resolved publisher is `none`, the script only writes the
 CSV and report. If the resolved publisher is `spotify`, it publishes the
 generated master CSV by exact path. On-the-fly release playlists do not use
 `playlist_prefix` or `playlist_suffix`.
+
+When this script publishes to Spotify, `--max-new-searches-per-run` uses the
+same uncached search budget as the main Spotify publisher. The default is 500
+uncached searches per run. Use `0` for an uncapped publisher run.
 
 The release-ID workflow reuses the same local caches as the collection workflow:
 
@@ -1064,6 +1158,8 @@ Each script prints a run summary at the end.
 - `discogs_make_playlists.py` returns `0` when all configured workflow steps
   return `0`. Otherwise it returns the first nonzero step exit code and skips
   later steps.
+- `dedupe_playlists.py` returns `0` when planning or apply finishes, and `1` for
+  handled file, config, Spotify API, and safety validation errors.
 
 Rows with blank lookup status are not treated as command failures. They mean the
 script could not find explicit style or genre data and chose not to guess.
@@ -1136,6 +1232,10 @@ Combined workflow options:
     Preview playlist publishing without creating or updating Spotify playlists.
     This only affects runs where the resolved publisher is spotify. When omitted,
     the resolved Spotify publisher can write changes.
+
+--max-new-searches-per-run COUNT
+    Maximum uncached Spotify searches per publisher run. Defaults to the
+    Spotify publisher's 500-search cap. Use 0 for an uncapped publisher run.
 
 --max-rows COUNT
     Maximum rows per split CSV, overriding workflow config.
@@ -1338,6 +1438,11 @@ release_ids
 --search-limit COUNT
     Spotify search result limit per track. Defaults to 10.
 
+--max-new-searches-per-run COUNT
+    Maximum uncached Spotify searches per publisher run. Defaults to 500. Use 0
+    for an uncapped run. Lower this value if Spotify throttles before the
+    default cap.
+
 --discogs-token TOKEN
     Optional Discogs personal access token. Defaults to DISCOGS_TOKEN.
 
@@ -1353,6 +1458,44 @@ release_ids
 
 --debug-log PATH
     Write sanitized release playlist debug logs to this path.
+
+--no-progress
+    Disable the interactive terminal progress bar.
+```
+
+Playlist dedupe options:
+
+```text
+--provider spotify
+    Provider to dedupe. Defaults to spotify.
+
+--apply
+    Remove planned duplicate tracks from eligible provider playlists. Omit this
+    flag for a dry run.
+
+--playlists VALUE [VALUE ...]
+    Dedupe one or more eligible playlists. Each value can be the local playlist
+    label, Spotify target name, or Spotify playlist ID. Omit this flag to process
+    every eligible playlist.
+
+--report PATH
+    Dedupe report path. Defaults to
+    reports/YYYY-MM-DD_HH-MM-SS_dedupe.txt.
+
+--publisher-config PATH
+    Publisher JSON config. Defaults to config/publisher.json.
+
+--env-file PATH
+    Local env file containing Spotify app settings. Defaults to .env.
+
+--token-cache PATH
+    Spotify token cache path. Defaults to config/cache/spotify-token.cache.json.
+
+--reauthorize
+    Force a fresh Spotify login before running dedupe.
+
+--debug-log PATH
+    Write sanitized playlist dedupe debug logs to this path.
 
 --no-progress
     Disable the interactive terminal progress bar.

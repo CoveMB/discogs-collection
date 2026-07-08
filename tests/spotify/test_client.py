@@ -15,6 +15,7 @@ from publishers.spotify.client import (
     SpotifyApiError,
     SpotifyClient,
     SpotifyRateLimitDeferredError,
+    SpotifyRateLimitRetriesExhaustedError,
     SpotifyRetryPolicy,
     SpotifyTrackCandidate,
 )
@@ -167,6 +168,26 @@ class SpotifyClientTests(unittest.TestCase):
             ),
         )
 
+    def test_lists_current_user_playlists_reads_snapshot_id(self):
+        def transport(request):
+            return HttpResponse(
+                status=200,
+                headers={},
+                body=(
+                    '{"items":[{"id":"playlist-1","name":"Discogs - House",'
+                    '"snapshot_id":"snapshot-alpha",'
+                    '"owner":{"id":"current-user"},"public":false,"collaborative":false,'
+                    '"external_urls":{"spotify":"https://open.spotify.com/playlist/playlist-1"}}],'
+                    '"next":null}'
+                ),
+            )
+
+        client = SpotifyClient(transport=transport)
+
+        playlists = client.list_current_user_playlists(access_token="access-token")
+
+        self.assertEqual(playlists[0].snapshot_id, "snapshot-alpha")
+
     def test_get_playlist_items_reads_tracks_across_pages(self):
         captured_requests = []
         responses = [
@@ -212,6 +233,7 @@ class SpotifyClientTests(unittest.TestCase):
                     name="Beta One",
                     artists=("Beta Artist",),
                     album_name="Beta Album",
+                    position=50,
                 ),
             ),
         )
@@ -219,6 +241,114 @@ class SpotifyClientTests(unittest.TestCase):
         self.assertIn("/playlists/playlist-1/items?", captured_requests[0].url)
         self.assertIn("offset=0", captured_requests[0].url)
         self.assertIn("offset=50", captured_requests[1].url)
+
+    def test_get_playlist_items_reads_added_at_and_zero_based_positions(self):
+        captured_requests = []
+        responses = [
+            HttpResponse(
+                status=200,
+                headers={},
+                body=(
+                    '{"items":[{"added_at":"2026-01-01T00:00:00Z",'
+                    '"track":{"uri":"spotify:track:alpha","name":"Alpha One",'
+                    '"artists":[{"name":"Alpha Artist"}],"album":{"name":"Alpha Album"}}}],'
+                    '"next":"next-page"}'
+                ),
+            ),
+            HttpResponse(
+                status=200,
+                headers={},
+                body=(
+                    '{"items":[{"added_at":"2026-01-02T00:00:00Z",'
+                    '"track":{"uri":"spotify:track:beta","name":"Beta One",'
+                    '"artists":[{"name":"Beta Artist"}],"album":{"name":"Beta Album"}}}],'
+                    '"next":null}'
+                ),
+            ),
+        ]
+
+        def transport(request):
+            captured_requests.append(request)
+            return responses.pop(0)
+
+        client = SpotifyClient(transport=transport)
+
+        items = client.get_playlist_items(access_token="access-token", playlist_id="playlist-1")
+
+        self.assertEqual(
+            items,
+            (
+                SpotifyPlaylistItem(
+                    uri="spotify:track:alpha",
+                    name="Alpha One",
+                    artists=("Alpha Artist",),
+                    album_name="Alpha Album",
+                    added_at="2026-01-01T00:00:00Z",
+                    position=0,
+                ),
+                SpotifyPlaylistItem(
+                    uri="spotify:track:beta",
+                    name="Beta One",
+                    artists=("Beta Artist",),
+                    album_name="Beta Album",
+                    added_at="2026-01-02T00:00:00Z",
+                    position=50,
+                ),
+            ),
+        )
+        self.assertIn("added_at", captured_requests[0].url)
+
+    def test_get_playlist_items_reads_current_item_field(self):
+        captured_requests = []
+        responses = [
+            HttpResponse(
+                status=200,
+                headers={},
+                body=(
+                    '{"items":[{"item":{"type":"track","uri":"spotify:track:alpha","name":"Alpha One",'
+                    '"artists":[{"name":"Alpha Artist"}],"album":{"name":"Alpha Album"}}}],'
+                    '"next":null,"total":1}'
+                ),
+            ),
+        ]
+
+        def transport(request):
+            captured_requests.append(request)
+            return responses.pop(0)
+
+        client = SpotifyClient(transport=transport)
+
+        items = client.get_playlist_items(access_token="access-token", playlist_id="playlist-1")
+
+        self.assertEqual(
+            items,
+            (
+                SpotifyPlaylistItem(
+                    uri="spotify:track:alpha",
+                    name="Alpha One",
+                    artists=("Alpha Artist",),
+                    album_name="Alpha Album",
+                ),
+            ),
+        )
+        self.assertIn("item%28uri", captured_requests[0].url)
+
+    def test_get_playlist_items_rejects_unparsed_nonempty_pages(self):
+        responses = [
+            HttpResponse(
+                status=200,
+                headers={},
+                body='{"items":[{"item":{"type":"track","name":"Alpha One"}}],"next":null,"total":1}',
+            ),
+        ]
+
+        def transport(request):
+            return responses.pop(0)
+
+        client = SpotifyClient(transport=transport)
+
+        with self.assertRaisesRegex(SpotifyApiError, "could not parse any playlist tracks"):
+            client.get_playlist_items(access_token="access-token", playlist_id="playlist-1")
 
     def test_create_playlist_posts_private_playlist_and_parses_result(self):
         captured_requests = []
@@ -305,6 +435,40 @@ class SpotifyClientTests(unittest.TestCase):
         self.assertEqual(
             json.loads(captured_requests[0].body.decode("utf-8"))["uris"],
             ["spotify:track:alpha", "spotify:track:beta"],
+        )
+
+    def test_remove_playlist_items_sends_uri_positions_and_snapshot(self):
+        captured_requests = []
+
+        def transport(request):
+            captured_requests.append(request)
+            return HttpResponse(status=200, headers={}, body='{"snapshot_id":"snapshot-after-remove"}')
+
+        client = SpotifyClient(transport=transport)
+
+        snapshot_id = client.remove_playlist_items(
+            access_token="access-token",
+            playlist_id="playlist-1",
+            items=(
+                SpotifyPlaylistItem(uri="spotify:track:alpha", name="Alpha", artists=(), album_name="", position=3),
+                SpotifyPlaylistItem(uri="spotify:track:alpha", name="Alpha", artists=(), album_name="", position=5),
+                SpotifyPlaylistItem(uri="spotify:track:beta", name="Beta", artists=(), album_name="", position=8),
+            ),
+            snapshot_id="snapshot-before-remove",
+        )
+
+        self.assertEqual(snapshot_id, "snapshot-after-remove")
+        self.assertEqual(captured_requests[0].method, "DELETE")
+        self.assertEqual(captured_requests[0].url, "https://api.spotify.com/v1/playlists/playlist-1/items")
+        self.assertEqual(
+            json.loads(captured_requests[0].body.decode("utf-8")),
+            {
+                "items": [
+                    {"uri": "spotify:track:alpha", "positions": [3, 5]},
+                    {"uri": "spotify:track:beta", "positions": [8]},
+                ],
+                "snapshot_id": "snapshot-before-remove",
+            },
         )
 
     def test_search_tracks_honors_retry_after_before_retrying_rate_limit(self):
@@ -519,7 +683,7 @@ class SpotifyClientTests(unittest.TestCase):
             retry_policy=SpotifyRetryPolicy(max_rate_limit_retries=2),
         )
 
-        with self.assertRaisesRegex(SpotifyApiError, "Spotify search failed with status 429"):
+        with self.assertRaisesRegex(SpotifyRateLimitRetriesExhaustedError, "Spotify rate limit retries were exhausted"):
             client.search_tracks(
                 access_token="access-token",
                 query='track:"Alpha One" artist:"Alpha Artist" album:"Alpha Album"',

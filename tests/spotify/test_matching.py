@@ -10,6 +10,7 @@ sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 from publishers.spotify.matching import (
     PlaylistTrack,
     SpotifyTrackCandidate,
+    build_spotify_track_search_queries,
     build_spotify_track_search_query,
     choose_best_track_match,
 )
@@ -30,6 +31,30 @@ class SpotifyMatchingTests(unittest.TestCase):
         query = build_spotify_track_search_query(track)
 
         self.assertEqual(query, 'track:"Alpha One" artist:"Alpha Artist" album:"Alpha Album"')
+
+    def test_builds_search_query_ladder_from_track_artist_album_and_raw_query(self):
+        track = PlaylistTrack(
+            playlist_name="Discogs - Breakbeat",
+            release_id="111",
+            album_name="Alpha EP",
+            track_number="1",
+            track_name="Alpha One",
+            artist_name="Alpha Artist, Beta Artist",
+            spotify_search_query="Alpha Artist Alpha One Alpha EP",
+        )
+
+        queries = build_spotify_track_search_queries(track)
+
+        self.assertEqual(
+            queries,
+            (
+                'track:"Alpha One" artist:"Alpha Artist, Beta Artist" album:"Alpha EP"',
+                'track:"Alpha One" artist:"Alpha Artist, Beta Artist"',
+                'track:"Alpha One" artist:"Alpha Artist"',
+                'track:"Alpha One" artist:"Beta Artist"',
+                "Alpha Artist Alpha One Alpha EP",
+            ),
+        )
 
     def test_falls_back_to_existing_search_query_when_structured_fields_are_missing(self):
         track = PlaylistTrack(
@@ -68,6 +93,82 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.status, "matched")
         self.assertEqual(decision.spotify_uri, "spotify:track:alpha")
         self.assertEqual(decision.reason, "track, artist, and album matched")
+
+    def test_accepts_unique_candidate_matching_track_and_artist_when_album_differs(self):
+        track = PlaylistTrack(
+            playlist_name="Discogs - Breakbeat",
+            release_id="111",
+            album_name="Discogs EP",
+            track_number="1",
+            track_name="Alpha One",
+            artist_name="Alpha Artist",
+            spotify_search_query="Alpha Artist Alpha One Discogs EP",
+        )
+        candidate = SpotifyTrackCandidate(
+            uri="spotify:track:alpha",
+            name="Alpha One",
+            artists=("Alpha Artist",),
+            album_name="Spotify Single",
+        )
+
+        decision = choose_best_track_match(track, (candidate,))
+
+        self.assertEqual(decision.status, "matched")
+        self.assertEqual(decision.spotify_uri, "spotify:track:alpha")
+        self.assertEqual(decision.reason, "track and artist matched; album differed")
+
+    def test_marks_multiple_track_and_artist_matches_as_ambiguous_when_album_differs(self):
+        track = PlaylistTrack(
+            playlist_name="Discogs - Breakbeat",
+            release_id="111",
+            album_name="Discogs EP",
+            track_number="1",
+            track_name="Alpha One",
+            artist_name="Alpha Artist",
+            spotify_search_query="Alpha Artist Alpha One Discogs EP",
+        )
+        candidates = (
+            SpotifyTrackCandidate(
+                uri="spotify:track:alpha-single",
+                name="Alpha One",
+                artists=("Alpha Artist",),
+                album_name="Spotify Single",
+            ),
+            SpotifyTrackCandidate(
+                uri="spotify:track:alpha-compilation",
+                name="Alpha One",
+                artists=("Alpha Artist",),
+                album_name="Compilation",
+            ),
+        )
+
+        decision = choose_best_track_match(track, candidates)
+
+        self.assertEqual(decision.status, "ambiguous")
+        self.assertEqual(decision.spotify_uri, "")
+        self.assertEqual(decision.reason, "2 candidates matched track and artist")
+
+    def test_deduplicates_candidates_by_spotify_uri_before_matching(self):
+        track = PlaylistTrack(
+            playlist_name="Discogs - Breakbeat",
+            release_id="111",
+            album_name="Alpha Album",
+            track_number="1",
+            track_name="Alpha One",
+            artist_name="Alpha Artist",
+            spotify_search_query="Alpha Artist Alpha One Alpha Album",
+        )
+        duplicate_candidate = SpotifyTrackCandidate(
+            uri="spotify:track:alpha",
+            name="Alpha One",
+            artists=("Alpha Artist",),
+            album_name="Alpha Album",
+        )
+
+        decision = choose_best_track_match(track, (duplicate_candidate, duplicate_candidate))
+
+        self.assertEqual(decision.status, "matched")
+        self.assertEqual(decision.spotify_uri, "spotify:track:alpha")
 
     def test_rejects_candidate_when_parenthetical_version_text_differs(self):
         track = PlaylistTrack(
