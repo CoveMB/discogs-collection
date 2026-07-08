@@ -4,16 +4,12 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import re
-import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from discogs_playlist_exporter import (
-    TUNEMYMUSIC_COLUMNS,
-)
+from shared.cli import run_cli
 from shared.files import read_csv_file, write_csv_file
 from shared.playlist_selection import resolve_playlist_master_paths
 from shared.reports import (
@@ -23,16 +19,18 @@ from shared.reports import (
     script_report_path,
     write_text_report,
 )
+from shared.tunemymusic import TUNEMYMUSIC_COLUMNS, missing_tunemymusic_columns, normalize_tunemymusic_rows
 from shared.workflow_config import (
     DEFAULT_MAX_ROWS_PER_SPLIT,
     DEFAULT_WORKFLOW_CONFIG_PATH,
     WorkflowConfig,
     load_or_create_workflow_config,
 )
+from shared.workflow_paths import DEFAULT_PLAYLIST_OUTPUT_DIRECTORY
 
 
 PLAYLIST_SPLITS_DIRECTORY_NAME = "splits"
-DEFAULT_OUTPUT_DIRECTORY = Path("collection/playlists")
+DEFAULT_OUTPUT_DIRECTORY = DEFAULT_PLAYLIST_OUTPUT_DIRECTORY
 RANGE_FILENAME_PATTERN = re.compile(r"^(\d+)-(\d+)\.csv$")
 
 
@@ -520,12 +518,8 @@ def write_initial_stable_splits(
     )
 
 
-def normalize_tunemymusic_rows(rows: Sequence[Mapping[str, str]]) -> tuple[dict[str, str], ...]:
-    return tuple({column: str(row.get(column, "") or "") for column in TUNEMYMUSIC_COLUMNS} for row in rows)
-
-
 def validate_master_fieldnames(master_path: Path, fieldnames: Sequence[str]) -> None:
-    missing_columns = [column for column in TUNEMYMUSIC_COLUMNS if column not in fieldnames]
+    missing_columns = missing_tunemymusic_columns(fieldnames)
     if missing_columns:
         raise ValueError(f"{master_path}: missing TuneMyMusic columns: {', '.join(missing_columns)}")
 
@@ -685,33 +679,36 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def run_playlist_splitter(args: argparse.Namespace) -> tuple[Path, Sequence[PlaylistSplitSummary]]:
+    workflow_config = resolve_workflow_config(args)
+    target = args.regenerate or "all"
+    if args.regenerate is None:
+        summaries = update_playlist_splits_with_report(
+            output_directory=args.output_dir,
+            report_path=args.report,
+            target=target,
+            max_rows=workflow_config.max_rows_per_split,
+            keep_release_tracks_together=workflow_config.keep_release_tracks_together,
+            create_new_split_files_for_new_releases=workflow_config.create_new_split_files_for_new_releases,
+        )
+    else:
+        summaries = regenerate_playlist_splits(
+            output_directory=args.output_dir,
+            report_path=args.report,
+            target=target,
+            max_rows=workflow_config.max_rows_per_split,
+            keep_release_tracks_together=workflow_config.keep_release_tracks_together,
+        )
+    return args.report, summaries
+
+
+def print_splitter_summary(result: tuple[Path, Sequence[PlaylistSplitSummary]]) -> None:
+    report_path, summaries = result
+    print_summary(report_path, summaries)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    try:
-        args = parse_args(argv)
-        workflow_config = resolve_workflow_config(args)
-        target = args.regenerate or "all"
-        if args.regenerate is None:
-            summaries = update_playlist_splits_with_report(
-                output_directory=args.output_dir,
-                report_path=args.report,
-                target=target,
-                max_rows=workflow_config.max_rows_per_split,
-                keep_release_tracks_together=workflow_config.keep_release_tracks_together,
-                create_new_split_files_for_new_releases=workflow_config.create_new_split_files_for_new_releases,
-            )
-        else:
-            summaries = regenerate_playlist_splits(
-                output_directory=args.output_dir,
-                report_path=args.report,
-                target=target,
-                max_rows=workflow_config.max_rows_per_split,
-                keep_release_tracks_together=workflow_config.keep_release_tracks_together,
-            )
-    except (FileNotFoundError, NotADirectoryError, ValueError, csv.Error) as error:
-        print(f"Error: {error}", file=sys.stderr)
-        return 1
-    print_summary(args.report, summaries)
-    return 0
+    return run_cli(parse_args, run_playlist_splitter, print_splitter_summary, argv)
 
 
 if __name__ == "__main__":

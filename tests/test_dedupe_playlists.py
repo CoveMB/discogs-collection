@@ -13,6 +13,15 @@ import dedupe_playlists  # noqa: E402
 
 
 class DedupePlaylistsCliTests(unittest.TestCase):
+    def assert_parse_args_exits(self, argv: list[str], expected_error: str) -> None:
+        with (
+            patch("sys.stderr", new_callable=io.StringIO) as stderr,
+            self.assertRaises(SystemExit),
+        ):
+            dedupe_playlists.parse_args(argv)
+
+        self.assertIn(expected_error, stderr.getvalue())
+
     def test_parse_args_defaults_to_spotify_dry_run(self):
         args = dedupe_playlists.parse_args([])
 
@@ -32,22 +41,20 @@ class DedupePlaylistsCliTests(unittest.TestCase):
 
         self.assertEqual(args.playlists, ["House", "Techno"])
 
-    def test_parse_args_accepts_legacy_single_playlist_selector(self):
-        args = dedupe_playlists.parse_args(["--playlist", "House"])
-
-        self.assertEqual(args.playlists, ["House"])
+    def test_parse_args_rejects_removed_single_playlist_selector(self):
+        self.assert_parse_args_exits(["--playlist", "House"], "unrecognized arguments: --playlist House")
 
     def test_parse_args_rejects_blank_playlist_selector(self):
-        with self.assertRaises(SystemExit):
-            dedupe_playlists.parse_args(["--playlists", "House", "   "])
+        self.assert_parse_args_exits(
+            ["--playlists", "House", "   "],
+            "--playlists cannot contain blank selectors",
+        )
 
     def test_parse_args_rejects_all_playlist_selector(self):
-        with self.assertRaises(SystemExit):
-            dedupe_playlists.parse_args(["--playlists", "all"])
-
-    def test_parse_args_rejects_combined_legacy_and_plural_playlist_selectors(self):
-        with self.assertRaises(SystemExit):
-            dedupe_playlists.parse_args(["--playlist", "House", "--playlists", "Techno"])
+        self.assert_parse_args_exits(
+            ["--playlists", "all"],
+            "--playlists all is not allowed; omit --playlists to process every eligible playlist",
+        )
 
     def test_main_prints_summary_from_spotify_provider(self):
         summary = type(
@@ -77,6 +84,16 @@ class DedupePlaylistsCliTests(unittest.TestCase):
         self.assertIn("Eligible playlists: 1", output)
         self.assertIn("Duplicates planned: 1", output)
         self.assertIn("Duplicates removed: 0", output)
+
+    def test_main_reports_os_errors_with_shared_cli_boundary(self):
+        with (
+            patch.object(dedupe_playlists, "run_spotify_dedupe_from_args", side_effect=OSError("disk full")),
+            patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            exit_code = dedupe_playlists.main(["--provider", "spotify"])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "Error: disk full\n")
 
     def test_run_spotify_dedupe_passes_playlist_selectors(self):
         summary = type(

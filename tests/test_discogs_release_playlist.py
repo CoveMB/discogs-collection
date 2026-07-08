@@ -188,7 +188,7 @@ class DiscogsReleasePlaylistTests(unittest.TestCase):
 
             with (
                 patch(
-                    "discogs_release_playlist.exporter.make_cached_tracklist_lookup",
+                    "discogs_release_playlist.tracklists.make_cached_tracklist_lookup",
                     return_value=lambda row: lookup_for(row["release_id"]),
                 ),
                 patch(
@@ -237,7 +237,7 @@ class DiscogsReleasePlaylistTests(unittest.TestCase):
 
             with (
                 patch(
-                    "discogs_release_playlist.exporter.make_cached_tracklist_lookup",
+                    "discogs_release_playlist.tracklists.make_cached_tracklist_lookup",
                     return_value=lambda row: lookup_for(row["release_id"]),
                 ),
                 patch(
@@ -278,7 +278,7 @@ class DiscogsReleasePlaylistTests(unittest.TestCase):
 
             with (
                 patch(
-                    "discogs_release_playlist.exporter.make_cached_tracklist_lookup",
+                    "discogs_release_playlist.tracklists.make_cached_tracklist_lookup",
                     return_value=lambda row: lookup_for(row["release_id"]),
                 ),
                 patch(
@@ -327,7 +327,7 @@ class DiscogsReleasePlaylistTests(unittest.TestCase):
 
             with (
                 patch(
-                    "discogs_release_playlist.exporter.make_cached_tracklist_lookup",
+                    "discogs_release_playlist.tracklists.make_cached_tracklist_lookup",
                     return_value=lambda row: lookup_for(row["release_id"]),
                 ),
                 patch("discogs_release_playlist.spotify_publisher.run_spotify_publish_from_args") as publish,
@@ -360,7 +360,7 @@ class DiscogsReleasePlaylistTests(unittest.TestCase):
                 ]
             )
 
-            with patch("discogs_release_playlist.exporter.make_cached_tracklist_lookup") as make_lookup:
+            with patch("discogs_release_playlist.tracklists.make_cached_tracklist_lookup") as make_lookup:
                 with self.assertRaisesRegex(ValueError, "default_publisher"):
                     release_playlist.run_release_playlist(args)
 

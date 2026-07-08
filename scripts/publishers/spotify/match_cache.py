@@ -19,6 +19,7 @@ from publishers.spotify.matching import (
     normalize_music_text,
 )
 from shared.files import write_json_file
+from shared.text import clean_cell
 
 
 MATCH_CACHE_SCHEMA_VERSION = 1
@@ -262,7 +263,3 @@ def spotify_url_from_uri(uri: str) -> str:
 
 def utc_timestamp() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def clean_cell(value: object) -> str:
-    return str(value or "").strip()

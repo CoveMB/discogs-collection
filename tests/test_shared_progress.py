@@ -2,6 +2,7 @@ import io
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +23,16 @@ class NonTerminalStream(io.StringIO):
 
 
 class ProgressReporterTests(unittest.TestCase):
+    def test_constructor_does_not_write_before_start(self):
+        stream = TerminalStream()
+
+        with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            progress = ProgressReporter(stream=stream, width=10, label="Processing rows", enabled=True)
+
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stream.getvalue(), "")
+        self.assertFalse(progress.started)
+
     def test_updates_same_terminal_line_with_configurable_label_width_and_percentage(self):
         stream = TerminalStream()
         progress = ProgressReporter(stream=stream, width=10, label="Processing rows")

@@ -11,8 +11,13 @@ sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 
 from shared.publisher_config import (  # noqa: E402
     DEFAULT_PUBLISHER_CONFIG_PATH,
+    NON_PUBLISHING_PUBLISHERS,
     PublisherConfig,
     load_or_create_publisher_config,
+    publisher_local_name_from_target,
+    publisher_playlist_name,
+    publishing_publishers,
+    validate_publisher_naming_is_safe,
 )
 
 
@@ -76,6 +81,24 @@ class PublisherConfigTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "unknown publisher config key"):
                 load_or_create_publisher_config(path)
+
+    def test_filters_non_publishing_publishers(self):
+        self.assertEqual(NON_PUBLISHING_PUBLISHERS, frozenset({"none"}))
+        self.assertEqual(publishing_publishers(("spotify", "none")), ("spotify",))
+
+    def test_builds_and_parses_publisher_playlist_names(self):
+        config = PublisherConfig(default_publisher="spotify", playlist_prefix="Discogs - ", playlist_suffix=" Archive")
+
+        self.assertEqual(publisher_playlist_name("House", config), "Discogs - House Archive")
+        self.assertEqual(publisher_local_name_from_target("Discogs - House Archive", config), "House")
+        self.assertIsNone(publisher_local_name_from_target("House", config))
+        self.assertIsNone(publisher_local_name_from_target("Discogs -  Archive", config))
+
+    def test_rejects_unsafe_managed_playlist_naming(self):
+        config = PublisherConfig(default_publisher="spotify", playlist_prefix="", playlist_suffix="")
+
+        with self.assertRaisesRegex(ValueError, "playlist_prefix or playlist_suffix"):
+            validate_publisher_naming_is_safe(config)
 
 
 if __name__ == "__main__":

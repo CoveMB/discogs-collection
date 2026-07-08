@@ -13,14 +13,21 @@ import discogs_playlist_mapper as mapper
 import discogs_playlist_splitter as splitter
 import discogs_style_enricher as enricher
 from publishers.spotify import publish_playlist as spotify_publisher
+from shared.cli_args import append_cli_option as append_option
 from shared.debug_log import DebugLog, build_debug_logger
-from shared.publisher_config import DEFAULT_PUBLISHER_CONFIG_PATH, load_or_create_publisher_config
+from shared.publisher_config import (
+    DEFAULT_PUBLISHER_CONFIG_PATH,
+    NO_PUBLISHER,
+    PUBLISHER_CHOICES,
+    SPOTIFY_PUBLISHER,
+    load_or_create_publisher_config,
+    publishing_publishers,
+)
 
 
 StepMain = Callable[[Sequence[str] | None], int]
 PipelineStep = tuple[str, StepMain, list[str]]
-SUPPORTED_MAIN_PUBLISHERS = ("spotify", "none")
-NON_PUBLISHING_PUBLISHERS = frozenset({"none"})
+SUPPORTED_MAIN_PUBLISHERS = PUBLISHER_CHOICES
 DEBUG_PATH_FIELDS = (
     "export",
     "input_dir",
@@ -96,12 +103,6 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--max-new-searches-per-run must be non-negative")
 
 
-def append_option(arguments: list[str], option: str, value: object | None) -> None:
-    if value is None:
-        return
-    arguments.extend([option, str(value)])
-
-
 def log_pipeline_context(args: argparse.Namespace, debug_log: DebugLog) -> None:
     for field_name in DEBUG_PATH_FIELDS:
         debug_log(f"path {field_name}={format_debug_value(getattr(args, field_name))}")
@@ -129,8 +130,7 @@ def step_option_names(step_args: Sequence[str]) -> str:
 
 
 def available_playlist_publishers(supported_publishers: Sequence[str] | None = None) -> tuple[str, ...]:
-    publishers = SUPPORTED_MAIN_PUBLISHERS if supported_publishers is None else supported_publishers
-    return tuple(publisher for publisher in publishers if publisher not in NON_PUBLISHING_PUBLISHERS)
+    return publishing_publishers(SUPPORTED_MAIN_PUBLISHERS if supported_publishers is None else supported_publishers)
 
 
 def publisher_disabled_message() -> str:
@@ -194,15 +194,13 @@ def build_splitter_args(args: argparse.Namespace) -> list[str]:
 
 
 def build_spotify_publisher_args(args: argparse.Namespace) -> list[str]:
-    arguments: list[str] = []
-    append_option(arguments, "--playlist-output-dir", args.playlist_output_dir)
-    append_option(arguments, "--publisher-config", args.publisher_config)
-    if args.no_progress:
-        arguments.append("--no-progress")
-    if args.publishing_dry_run:
-        arguments.append("--publishing-dry-run")
-    append_option(arguments, "--max-new-searches-per-run", args.max_new_searches_per_run)
-    return arguments
+    return spotify_publisher.build_spotify_publisher_argv(
+        playlist_output_dir=args.playlist_output_dir,
+        publisher_config=args.publisher_config,
+        no_progress=args.no_progress,
+        dry_run=args.publishing_dry_run,
+        max_new_searches_per_run=args.max_new_searches_per_run,
+    )
 
 
 def resolve_publisher(args: argparse.Namespace) -> str:
@@ -218,9 +216,9 @@ def skip_publisher(_argv: Sequence[str] | None = None) -> int:
 
 
 def build_publisher_step(args: argparse.Namespace) -> PipelineStep:
-    if args.publisher == "none":
+    if args.publisher == NO_PUBLISHER:
         return ("Playlist publisher", skip_publisher, [])
-    if args.publisher == "spotify":
+    if args.publisher == SPOTIFY_PUBLISHER:
         return ("Spotify playlist publisher", spotify_publisher.main, build_spotify_publisher_args(args))
     raise ValueError(f"unsupported publisher: {args.publisher}")
 

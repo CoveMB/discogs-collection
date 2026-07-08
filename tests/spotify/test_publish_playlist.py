@@ -26,6 +26,7 @@ from publishers.spotify.publish_playlist import dry_run_spotify_playlist_publish
 from discogs_playlist_exporter import safe_playlist_filename
 from shared.progress import ProgressReporter
 from shared.publisher_config import PublisherConfig
+from shared.tunemymusic import TUNEMYMUSIC_COLUMNS
 from publishers.spotify.token_cache import SpotifyToken
 
 
@@ -268,17 +269,7 @@ class FailingFirstAppendBatchClient(PublishingSpotifyClient):
 def write_playlist_master(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as output_file:
-        writer = csv.DictWriter(
-            output_file,
-            fieldnames=[
-                "Release Id",
-                "Album Name",
-                "Track Number",
-                "Track Name",
-                "Artist Name",
-                "Spotify Search Query",
-            ],
-        )
+        writer = csv.DictWriter(output_file, fieldnames=TUNEMYMUSIC_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -330,42 +321,13 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
             playlist_directory = directory / "collection" / "playlists"
-            playlist_folder = playlist_directory / "Discogs - Breakbeat"
-            playlist_folder.mkdir(parents=True)
-            playlist_csv = playlist_folder / "Discogs - Breakbeat.csv"
-            with playlist_csv.open("w", newline="", encoding="utf-8") as output_file:
-                writer = csv.DictWriter(
-                    output_file,
-                    fieldnames=[
-                        "Release Id",
-                        "Album Name",
-                        "Track Number",
-                        "Track Name",
-                        "Artist Name",
-                        "Spotify Search Query",
-                    ],
-                )
-                writer.writeheader()
-                writer.writerow(
-                    {
-                        "Release Id": "111",
-                        "Album Name": "Alpha Album",
-                        "Track Number": "1",
-                        "Track Name": "Alpha One",
-                        "Artist Name": "Alpha Artist",
-                        "Spotify Search Query": "Alpha Artist Alpha One Alpha Album",
-                    }
-                )
-                writer.writerow(
-                    {
-                        "Release Id": "222",
-                        "Album Name": "Beta Album",
-                        "Track Number": "1",
-                        "Track Name": "Beta One",
-                        "Artist Name": "Beta Artist",
-                        "Spotify Search Query": "Beta Artist Beta One Beta Album",
-                    }
-                )
+            write_playlist_master(
+                playlist_directory / "Discogs - Breakbeat" / "Discogs - Breakbeat.csv",
+                [
+                    playlist_row("111", "Alpha Album", "Alpha One", "Alpha Artist"),
+                    playlist_row("222", "Beta Album", "Beta One", "Beta Artist"),
+                ],
+            )
             report_path = directory / "reports" / "spotify-dry-run.txt"
             client = FakeSpotifyClient({})
             progress_stream = TerminalStream()
@@ -391,32 +353,10 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
             playlist_directory = directory / "collection" / "playlists"
-            playlist_folder = playlist_directory / "Discogs - Breakbeat"
-            playlist_folder.mkdir(parents=True)
-            playlist_csv = playlist_folder / "Discogs - Breakbeat.csv"
-            with playlist_csv.open("w", newline="", encoding="utf-8") as output_file:
-                writer = csv.DictWriter(
-                    output_file,
-                    fieldnames=[
-                        "Release Id",
-                        "Album Name",
-                        "Track Number",
-                        "Track Name",
-                        "Artist Name",
-                        "Spotify Search Query",
-                    ],
-                )
-                writer.writeheader()
-                writer.writerow(
-                    {
-                        "Release Id": "111",
-                        "Album Name": "Alpha Album",
-                        "Track Number": "1",
-                        "Track Name": "Alpha One",
-                        "Artist Name": "Alpha Artist",
-                        "Spotify Search Query": "Alpha Artist Alpha One Alpha Album",
-                    }
-                )
+            write_playlist_master(
+                playlist_directory / "Discogs - Breakbeat" / "Discogs - Breakbeat.csv",
+                [playlist_row("111", "Alpha Album", "Alpha One", "Alpha Artist")],
+            )
             report_path = directory / "reports" / "spotify-dry-run.txt"
             client = FakeSpotifyClient(
                 {
@@ -456,42 +396,13 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
             playlist_directory = directory / "collection" / "playlists"
-            playlist_folder = playlist_directory / "Discogs - Breakbeat"
-            playlist_folder.mkdir(parents=True)
-            playlist_csv = playlist_folder / "Discogs - Breakbeat.csv"
-            with playlist_csv.open("w", newline="", encoding="utf-8") as output_file:
-                writer = csv.DictWriter(
-                    output_file,
-                    fieldnames=[
-                        "Release Id",
-                        "Album Name",
-                        "Track Number",
-                        "Track Name",
-                        "Artist Name",
-                        "Spotify Search Query",
-                    ],
-                )
-                writer.writeheader()
-                writer.writerow(
-                    {
-                        "Release Id": "111",
-                        "Album Name": "Alpha Album",
-                        "Track Number": "1",
-                        "Track Name": "Alpha One",
-                        "Artist Name": "Alpha Artist",
-                        "Spotify Search Query": "Alpha Artist Alpha One Alpha Album",
-                    }
-                )
-                writer.writerow(
-                    {
-                        "Release Id": "222",
-                        "Album Name": "Beta Album",
-                        "Track Number": "1",
-                        "Track Name": "Beta One",
-                        "Artist Name": "Beta Artist",
-                        "Spotify Search Query": "Beta Artist Beta One Beta Album",
-                    }
-                )
+            write_playlist_master(
+                playlist_directory / "Discogs - Breakbeat" / "Discogs - Breakbeat.csv",
+                [
+                    playlist_row("111", "Alpha Album", "Alpha One", "Alpha Artist"),
+                    playlist_row("222", "Beta Album", "Beta One", "Beta Artist"),
+                ],
+            )
             report_path = directory / "reports" / "spotify-dry-run.txt"
 
             summary = dry_run_spotify_playlist_publish(
@@ -2504,6 +2415,20 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         load_settings.assert_not_called()
         get_access_token.assert_not_called()
 
+    def test_main_reports_os_errors_with_shared_cli_boundary(self):
+        from publishers.spotify import publish_playlist
+
+        stderr = io.StringIO()
+        with (
+            patch.object(publish_playlist, "run_spotify_publish_from_args", side_effect=OSError("disk full")),
+            patch("sys.stderr", stderr),
+            patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            exit_code = publish_playlist.main(["--no-progress"])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "Error: disk full\n")
+
     def test_main_uses_auto_session_for_default_publish(self):
         settings = SpotifySettings(
             client_id="client-id",
@@ -2843,6 +2768,50 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertFalse(default_args.dry_run)
         self.assertTrue(publishing_dry_run_args.dry_run)
         self.assertFalse(publishing_dry_run_args.apply)
+
+    def test_build_spotify_publisher_argv_forwards_shared_options(self):
+        from publishers.spotify import publish_playlist
+
+        argv = publish_playlist.build_spotify_publisher_argv(
+            playlist_output_dir=Path("collection/custom-playlists"),
+            publisher_config=Path("config/custom-publisher.json"),
+            no_progress=True,
+            dry_run=True,
+            max_new_searches_per_run=25,
+        )
+
+        self.assertEqual(
+            argv,
+            [
+                "--playlist-output-dir",
+                "collection/custom-playlists",
+                "--publisher-config",
+                "config/custom-publisher.json",
+                "--no-progress",
+                "--publishing-dry-run",
+                "--max-new-searches-per-run",
+                "25",
+            ],
+        )
+
+    def test_build_spotify_publisher_namespace_sets_apply_from_dry_run(self):
+        from publishers.spotify import publish_playlist
+
+        args = publish_playlist.build_spotify_publisher_namespace(
+            playlist_output_dir=Path("collection/custom-playlists"),
+            report=Path("reports/publish.txt"),
+            publisher_config=Path("config/custom-publisher.json"),
+            max_new_searches_per_run=25,
+            dry_run=True,
+            progress=False,
+        )
+
+        self.assertEqual(args.playlist_output_dir, Path("collection/custom-playlists"))
+        self.assertEqual(args.report, Path("reports/publish.txt"))
+        self.assertEqual(args.publisher_config, Path("config/custom-publisher.json"))
+        self.assertEqual(args.max_new_searches_per_run, 25)
+        self.assertFalse(args.apply)
+        self.assertFalse(args.progress)
 
     def test_parse_args_rejects_removed_apply_flag(self):
         from publishers.spotify import publish_playlist

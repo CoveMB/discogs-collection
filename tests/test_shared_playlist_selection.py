@@ -9,8 +9,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIRECTORY = PROJECT_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 
-from discogs_playlist_exporter import TUNEMYMUSIC_COLUMNS  # noqa: E402
-from shared.playlist_selection import resolve_playlist_master_paths, safe_playlist_filename  # noqa: E402
+from shared.playlist_selection import normalize_playlist_selectors, resolve_playlist_master_paths, safe_playlist_filename  # noqa: E402
+from shared.tunemymusic import TUNEMYMUSIC_COLUMNS  # noqa: E402
 
 
 def playlist_row(release_id: str) -> dict[str, str]:
@@ -33,6 +33,19 @@ def write_master(path: Path, release_id: str) -> None:
 
 
 class PlaylistSelectionTests(unittest.TestCase):
+    def test_normalize_playlist_selectors_trims_and_rejects_blank_values(self):
+        self.assertEqual(normalize_playlist_selectors([" House ", "Techno"]), ("House", "Techno"))
+        self.assertEqual(normalize_playlist_selectors(None), ())
+
+        with self.assertRaisesRegex(ValueError, "cannot be blank"):
+            normalize_playlist_selectors(["House", "   "])
+
+    def test_normalize_playlist_selectors_controls_all_selector(self):
+        self.assertEqual(normalize_playlist_selectors(["all"], allow_all_selector=True), ("all",))
+
+        with self.assertRaisesRegex(ValueError, "all.*not allowed"):
+            normalize_playlist_selectors(["all"])
+
     def test_omitted_selectors_resolve_every_playlist_master_in_folder_order(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             output_directory = Path(temporary_directory) / "playlists"

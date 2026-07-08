@@ -65,6 +65,16 @@ class PlaylistConfigPrinterTests(unittest.TestCase):
             self.assertIn("- None configured.", output)
             self.assertIn("No playlists configured yet.", output)
 
+    def test_main_reports_os_errors_with_shared_cli_boundary(self):
+        with (
+            patch.object(printer, "ensure_playlist_config_file", side_effect=OSError("disk full")),
+            patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            exit_code = printer.main(["--config", "config/playlist-map.json"])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "Error: disk full\n")
+
 
 if __name__ == "__main__":
     unittest.main()

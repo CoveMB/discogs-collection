@@ -1,3 +1,4 @@
+import csv
 import io
 import sys
 import tempfile
@@ -349,6 +350,17 @@ class PlaylistMapperTests(unittest.TestCase):
                 "python3 scripts/discogs_style_enricher.py",
                 stderr.getvalue(),
             )
+
+    def test_main_reports_csv_errors_with_shared_cli_boundary(self):
+        with (
+            patch.object(mapper, "parse_args", return_value=object()),
+            patch.object(mapper, "run_playlist_mapping", side_effect=csv.Error("bad csv")),
+            patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            exit_code = mapper.main([])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "Error: bad csv\n")
 
     def test_parse_args_defaults_to_playlist_report_path(self):
         with patch("shared.reports.readable_timestamp", return_value="2026-06-05_15-30-00"):

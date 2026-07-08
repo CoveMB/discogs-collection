@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from shared.files import write_json_file
+from shared.config_files import load_or_create_json_file, reject_unknown_keys
 
 
 DEFAULT_WORKFLOW_CONFIG_PATH = Path("config/workflow.json")
@@ -39,12 +38,11 @@ def default_workflow_config_payload() -> dict[str, object]:
 
 
 def load_or_create_workflow_config(path: Path) -> WorkflowConfig:
-    if not path.exists():
-        write_json_file(path, default_workflow_config_payload())
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as error:
-        raise ValueError(f"malformed workflow config JSON: {path}") from error
+    payload = load_or_create_json_file(
+        path,
+        default_payload=default_workflow_config_payload(),
+        malformed_label="workflow config",
+    )
     return normalize_workflow_config(payload)
 
 
@@ -52,9 +50,7 @@ def normalize_workflow_config(payload: object) -> WorkflowConfig:
     if not isinstance(payload, Mapping):
         raise ValueError("workflow config must be a JSON object")
 
-    unknown_keys = sorted(str(key) for key in payload if key not in WORKFLOW_CONFIG_KEYS)
-    if unknown_keys:
-        raise ValueError(f"unknown workflow config key: {', '.join(unknown_keys)}")
+    reject_unknown_keys(payload, allowed_keys=WORKFLOW_CONFIG_KEYS, config_label="workflow config")
 
     max_rows_per_split = payload.get("max_rows_per_split", DEFAULT_MAX_ROWS_PER_SPLIT)
     if isinstance(max_rows_per_split, bool) or not isinstance(max_rows_per_split, int):

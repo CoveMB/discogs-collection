@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from shared.files import write_json_file
+from shared.text import clean_cell
 
 
 TOKEN_CACHE_SCHEMA_VERSION = 1
@@ -69,7 +70,3 @@ def parse_int(value: object, field_name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"Spotify token cache field must be an integer: {field_name}")
     return value
-
-
-def clean_cell(value: object) -> str:
-    return str(value or "").strip()

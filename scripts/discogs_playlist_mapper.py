@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 import argparse
-import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from shared.cli import run_cli
 from shared.discogs_columns import GENRE_COLUMN, RELEASE_ID_COLUMN, STYLE_COLUMN, move_release_id_to_front
 from shared.files import read_csv_file, write_csv_file
 from shared.playlist_config import (
@@ -28,10 +28,11 @@ from shared.reports import (
     write_text_report,
 )
 from shared.text import split_unique_comma_separated as split_discogs_terms
+from shared.workflow_paths import DEFAULT_ENRICHED_MASTER_PATH
 
 
 PLAYLISTS_COLUMN = "Playlists"
-DEFAULT_INPUT_PATH = Path("collection/enriched-collection.csv")
+DEFAULT_INPUT_PATH = DEFAULT_ENRICHED_MASTER_PATH
 
 
 @dataclass(frozen=True)
@@ -242,14 +243,7 @@ def print_summary(summary: PlaylistMappingSummary) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    try:
-        args = parse_args(argv)
-        summary = run_playlist_mapping(args)
-    except (FileNotFoundError, NotADirectoryError, ValueError) as error:
-        print(f"Error: {error}", file=sys.stderr)
-        return 1
-    print_summary(summary)
-    return 0
+    return run_cli(parse_args, run_playlist_mapping, print_summary, argv)
 
 
 if __name__ == "__main__":

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from shared.config_files import load_json_file, reject_unknown_keys
 from shared.files import write_json_file
 from shared.reports import format_report_section
 
@@ -35,9 +35,7 @@ def normalize_playlist_config(payload: object) -> PlaylistConfig:
     if not isinstance(payload, Mapping):
         raise ValueError("playlist config must be a JSON object")
 
-    unknown_keys = sorted(str(key) for key in payload if key not in PLAYLIST_CONFIG_KEYS)
-    if unknown_keys:
-        raise ValueError(f"unknown playlist config key: {', '.join(unknown_keys)}")
+    reject_unknown_keys(payload, allowed_keys=PLAYLIST_CONFIG_KEYS, config_label="playlist config")
 
     excluded_terms = payload.get("excluded_terms", [])
     if not isinstance(excluded_terms, list) or not all(isinstance(term, str) for term in excluded_terms):
@@ -92,10 +90,7 @@ def normalize_term(term: str) -> str:
 
 
 def load_playlist_config(path: Path) -> PlaylistConfig:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as error:
-        raise ValueError(f"malformed playlist map JSON: {path}") from error
+    payload = load_json_file(path, malformed_label="playlist map")
     return normalize_playlist_config(payload)
 
 

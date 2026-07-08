@@ -4,18 +4,18 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import os
 import re
-import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 import discogs_playlist_exporter as exporter
+import discogs_tracklists as tracklists
 from publishers.spotify import publish_playlist as spotify_publisher
 from publishers.spotify.env import DEFAULT_ENV_PATH, DEFAULT_TOKEN_CACHE_PATH
+from shared.cli import EXPECTED_CLI_ERRORS, run_cli
 from shared.debug_log import DebugLog, build_debug_logger
 from shared.discogs_columns import RELEASE_ID_COLUMN
 from shared.files import write_json_file
@@ -27,18 +27,25 @@ from shared.playlist_selection import (
 from shared.progress import ProgressReporter
 from shared.publisher_config import (
     DEFAULT_PUBLISHER_CONFIG_PATH,
+    NO_PUBLISHER,
+    PUBLISHER_CHOICES,
+    SPOTIFY_PUBLISHER,
     PublisherConfig,
     load_or_create_publisher_config,
 )
 from shared.reports import format_report_section, format_report_title, print_report_section, script_report_path, write_text_report
+from shared.workflow_paths import (
+    DEFAULT_ON_THE_FLY_PLAYLIST_DIRECTORY,
+    DEFAULT_SPOTIFY_MATCH_CACHE_PATH,
+    DEFAULT_TRACKLIST_CACHE_PATH,
+)
 
 
 PLAYLISTS_COLUMN = exporter.PLAYLISTS_COLUMN
-DEFAULT_OUTPUT_DIRECTORY = Path("collection/playlists/on-the-fly")
-DEFAULT_TRACKLIST_CACHE_PATH = exporter.DEFAULT_CACHE_PATH
-DEFAULT_MATCH_CACHE_PATH = spotify_publisher.DEFAULT_MATCH_CACHE_PATH
+DEFAULT_OUTPUT_DIRECTORY = DEFAULT_ON_THE_FLY_PLAYLIST_DIRECTORY
+DEFAULT_MATCH_CACHE_PATH = DEFAULT_SPOTIFY_MATCH_CACHE_PATH
 DEFAULT_USER_AGENT = "DiscogsReleasePlaylist/1.0 +https://www.discogs.com"
-SUPPORTED_PUBLISHERS = ("spotify", "none")
+SUPPORTED_PUBLISHERS = PUBLISHER_CHOICES
 RELEASE_PLAYLIST_METADATA_FILENAME = ".release-playlist.json"
 RELEASE_PLAYLIST_METADATA_SCHEMA_VERSION = 1
 RELEASE_PLAYLIST_METADATA_RECORD_TYPE = "discogs_release_playlist"
@@ -69,7 +76,7 @@ def create_release_playlist(
     release_ids: Sequence[str],
     output_directory: Path,
     report_path: Path,
-    lookup_tracklist: Callable[[Mapping[str, str]], exporter.ReleaseTracklistLookup],
+    lookup_tracklist: Callable[[Mapping[str, str]], tracklists.ReleaseTracklistLookup],
     progress: ProgressReporter | None = None,
 ) -> ReleasePlaylistSummary:
     clean_playlist_name = normalize_playlist_name(playlist_name)
@@ -237,11 +244,11 @@ def resolve_publisher(args: argparse.Namespace) -> str:
 
 
 def ad_hoc_publisher_config() -> PublisherConfig:
-    return PublisherConfig(default_publisher="spotify", playlist_prefix="", playlist_suffix="")
+    return PublisherConfig(default_publisher=SPOTIFY_PUBLISHER, playlist_prefix="", playlist_suffix="")
 
 
 def build_spotify_publisher_args(args: argparse.Namespace) -> argparse.Namespace:
-    return argparse.Namespace(
+    return spotify_publisher.build_spotify_publisher_namespace(
         env_file=args.env_file,
         playlist_output_dir=args.output_dir,
         report=args.publisher_report,
@@ -258,7 +265,6 @@ def build_spotify_publisher_args(args: argparse.Namespace) -> argparse.Namespace
         refresh_match_cache=args.refresh_match_cache,
         dry_run=args.publishing_dry_run,
         progress=args.progress,
-        apply=not args.publishing_dry_run,
     )
 
 
@@ -292,7 +298,7 @@ def run_release_playlist(args: argparse.Namespace) -> ReleasePlaylistSummary:
     publisher = resolve_publisher(args)
     if debug_log:
         debug_log(f"resolved_publisher value={publisher}")
-    lookup_tracklist = exporter.make_cached_tracklist_lookup(
+    lookup_tracklist = tracklists.make_cached_tracklist_lookup(
         cache_path=args.tracklist_cache,
         token=args.discogs_token,
         user_agent=args.user_agent,
@@ -308,11 +314,11 @@ def run_release_playlist(args: argparse.Namespace) -> ReleasePlaylistSummary:
         lookup_tracklist=lookup_tracklist,
         progress=progress,
     )
-    if publisher == "none":
+    if publisher == NO_PUBLISHER:
         summary = replace(summary, publisher=publisher)
         write_release_playlist_report(summary)
         return summary
-    if publisher != "spotify":
+    if publisher != SPOTIFY_PUBLISHER:
         raise ValueError(f"unsupported publisher: {publisher}")
 
     summary = replace(summary, publisher=publisher)
@@ -444,14 +450,13 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    try:
-        args = parse_args(argv)
-        summary = run_release_playlist(args)
-    except (FileNotFoundError, NotADirectoryError, ValueError, OSError, csv.Error, spotify_publisher.SpotifyApiError) as error:
-        print(f"Error: {error}", file=sys.stderr)
-        return 1
-    print_summary(summary)
-    return 0
+    return run_cli(
+        parse_args,
+        run_release_playlist,
+        print_summary,
+        argv,
+        expected_errors=(*EXPECTED_CLI_ERRORS, spotify_publisher.SpotifyApiError),
+    )
 
 
 if __name__ == "__main__":

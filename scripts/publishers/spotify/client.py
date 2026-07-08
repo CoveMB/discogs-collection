@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from publishers.spotify.matching import SpotifyTrackCandidate
 from shared.debug_log import DebugLog
+from shared.text import clean_cell
 
 
 SPOTIFY_API_ROOT = "https://api.spotify.com/v1"
@@ -608,7 +609,3 @@ def classify_transport_error(body: str) -> str:
     ):
         return "connection_failure"
     return "transport_error"
-
-
-def clean_cell(value: object) -> str:
-    return str(value or "").strip()

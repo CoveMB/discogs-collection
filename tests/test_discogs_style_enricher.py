@@ -18,6 +18,7 @@ sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 
 from helpers import read_csv_text  # noqa: E402
 import discogs_style_enricher as enricher  # noqa: E402
+from shared import discogs_api  # noqa: E402
 from discogs_style_enricher import (  # noqa: E402
     DEFAULT_MASTER_PATH,
     DiscogsRateLimiter,
@@ -1033,7 +1034,7 @@ class RateLimitTests(unittest.TestCase):
 
         limiter = FakeLimiter()
 
-        with patch.object(enricher, "urlopen", return_value=FakeResponse()):
+        with patch.object(discogs_api, "urlopen", return_value=FakeResponse()):
             body = enricher.http_get(
                 "https://api.discogs.com/releases/1",
                 user_agent="test",
@@ -1601,6 +1602,30 @@ class RunEnrichmentTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 1)
             self.assertIn("Error: export CSV header is missing required Discogs export columns", stderr.getvalue())
+
+    def test_main_reports_csv_errors_with_shared_cli_boundary(self):
+        with (
+            patch.object(enricher, "parse_args", return_value=object()),
+            patch.object(enricher, "run_enrichment", side_effect=csv.Error("bad csv")),
+            patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            exit_code = main([])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "Error: bad csv\n")
+
+    def test_main_keeps_partial_success_exit_code_for_lookup_errors(self):
+        summary = type("Summary", (), {"error_count": 1})()
+
+        with (
+            patch.object(enricher, "parse_args", return_value=object()),
+            patch.object(enricher, "run_enrichment", return_value=summary),
+            patch.object(enricher, "print_summary") as print_summary,
+        ):
+            exit_code = main([])
+
+        self.assertEqual(exit_code, 2)
+        print_summary.assert_called_once_with(summary)
 
 
 if __name__ == "__main__":

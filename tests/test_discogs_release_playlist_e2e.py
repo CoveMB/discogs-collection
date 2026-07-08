@@ -17,6 +17,7 @@ sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 import discogs_make_playlists as make_playlists  # noqa: E402
 import discogs_release_playlist as release_playlist  # noqa: E402
 from publishers.spotify import publish_playlist as spotify_publisher  # noqa: E402
+from shared.tunemymusic import TUNEMYMUSIC_COLUMNS  # noqa: E402
 
 
 DISCOGS_EXPORT_COLUMNS = (
@@ -33,14 +34,6 @@ DISCOGS_EXPORT_COLUMNS = (
     "Collection Media Condition",
     "Collection Sleeve Condition",
     "Collection Notes",
-)
-TUNEMYMUSIC_COLUMNS = (
-    "Release Id",
-    "Album Name",
-    "Track Number",
-    "Track Name",
-    "Artist Name",
-    "Spotify Search Query",
 )
 FAST_DISCOGS_HEADERS = {
     "x-discogs-ratelimit": "1000000",
@@ -212,7 +205,7 @@ def patched_discogs(
     with ExitStack() as stack:
         stack.enter_context(
             patch(
-                "discogs_style_enricher.urlopen",
+                "shared.discogs_api.urlopen",
                 side_effect=fake_urlopen(
                     payloads_by_release_id,
                     requested_urls,
@@ -221,8 +214,8 @@ def patched_discogs(
                 ),
             )
         )
-        stack.enter_context(patch("discogs_style_enricher.DiscogsRateLimiter", FastDiscogsRateLimiter))
-        stack.enter_context(patch("discogs_playlist_exporter.DiscogsRateLimiter", FastDiscogsRateLimiter))
+        stack.enter_context(patch("shared.discogs_api.DiscogsRateLimiter", FastDiscogsRateLimiter))
+        stack.enter_context(patch("discogs_tracklists.DiscogsRateLimiter", FastDiscogsRateLimiter))
         yield
 
 

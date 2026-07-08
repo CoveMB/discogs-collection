@@ -1,3 +1,4 @@
+import argparse
 import csv
 import contextlib
 import io
@@ -15,6 +16,7 @@ sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 
 import discogs_playlist_exporter as exporter  # noqa: E402
 import discogs_playlist_splitter as splitter  # noqa: E402
+from shared.tunemymusic import TUNEMYMUSIC_COLUMNS  # noqa: E402
 
 
 def playlist_row(release_id: str, track_number: int) -> dict[str, str]:
@@ -35,7 +37,7 @@ def read_csv_file(path: Path) -> list[dict[str, str]]:
 def write_master(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as output_file:
-        writer = csv.DictWriter(output_file, fieldnames=exporter.TUNEMYMUSIC_COLUMNS)
+        writer = csv.DictWriter(output_file, fieldnames=TUNEMYMUSIC_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -45,6 +47,11 @@ def write_split(path: Path, rows: list[dict[str, str]]) -> None:
 
 
 class PlaylistSplitterTests(unittest.TestCase):
+    def setUp(self):
+        self.stdout_patcher = patch("sys.stdout", new_callable=io.StringIO)
+        self.stdout_patcher.start()
+        self.addCleanup(self.stdout_patcher.stop)
+
     def test_parse_args_defaults_to_script_report_path(self):
         with patch("shared.reports.readable_timestamp", return_value="2026-06-10_14-30-00"):
             args = splitter.parse_args([])
@@ -666,6 +673,25 @@ class PlaylistSplitterTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertTrue((splits_directory / "2-2.csv").exists())
             self.assertIn("Preserved split CSVs", report_path.read_text(encoding="utf-8"))
+
+    def test_main_reports_os_errors_with_shared_cli_boundary(self):
+        args = argparse.Namespace(
+            output_dir=Path("collection/playlists"),
+            report=Path("reports/split-report.txt"),
+            regenerate=None,
+            workflow_config=Path("config/workflow.json"),
+            max_rows=None,
+        )
+
+        with (
+            patch.object(splitter, "parse_args", return_value=args),
+            patch.object(splitter, "resolve_workflow_config", side_effect=OSError("disk full")),
+            patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            exit_code = splitter.main([])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "Error: disk full\n")
 
     def test_cli_accepts_max_rows_over_default_limit_for_other_playlist_tools(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

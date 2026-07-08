@@ -27,6 +27,17 @@ class PlaylistExporterTests(unittest.TestCase):
 
         self.assertEqual(args.report, Path("reports/2026-06-10_14-30-00_discogs_playlist_exporter.txt"))
 
+    def test_main_reports_csv_errors_with_shared_cli_boundary(self):
+        with (
+            patch.object(exporter, "parse_args", return_value=object()),
+            patch.object(exporter, "run_playlist_export", side_effect=csv.Error("bad csv")),
+            patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            exit_code = exporter.main([])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "Error: bad csv\n")
+
     def test_reports_row_progress_while_exporting_playlist_csvs(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)

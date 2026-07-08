@@ -96,7 +96,7 @@ def plan_single_playlist_dedupe(
 
 def select_playlist_item_to_keep(items: Sequence[ProviderPlaylistItem]) -> ProviderPlaylistItem:
     parsed_items = tuple(
-        (item, parse_spotify_timestamp(item.added_at))
+        (item, parse_iso_timestamp(item.added_at))
         for item in items
     )
     if parsed_items and all(parsed_added_at is not None for _, parsed_added_at in parsed_items):
@@ -107,7 +107,7 @@ def select_playlist_item_to_keep(items: Sequence[ProviderPlaylistItem]) -> Provi
     return min(items, key=lambda item: item.position)
 
 
-def parse_spotify_timestamp(value: str) -> dt.datetime | None:
+def parse_iso_timestamp(value: str) -> dt.datetime | None:
     text = str(value or "").strip()
     if not text:
         return None

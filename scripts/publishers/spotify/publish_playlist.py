@@ -4,10 +4,9 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import sys
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 
@@ -41,13 +40,61 @@ from publishers.spotify.matching import (  # noqa: E402
     TrackMatchDecision,
     SpotifyTrackCandidate,
     build_spotify_track_search_queries,
-    build_spotify_track_search_query,
     choose_best_track_match,
     normalize_music_text,
-    source_artist_matches_candidate,
     track_match_error,
 )
+from publishers.spotify.publish_reports import (  # noqa: E402
+    build_publish_summary,
+    build_summary,
+    cached_matched_publish_decision_count,
+    count_publish_decisions,
+    display_report_value,
+    flatten_report_details,
+    format_ambiguous_track_details,
+    format_artist_names,
+    format_candidate_comparison,
+    format_field_comparison,
+    format_final_playlist_item,
+    format_match_decision,
+    format_publish_decision,
+    format_publish_decisions,
+    format_publish_review_details,
+    format_search_error_details,
+    format_search_query,
+    format_spotify_artists,
+    format_spotify_candidate,
+    format_track_context,
+    format_unmatched_track_details,
+    searched_matched_publish_decision_count,
+    write_dry_run_report,
+    write_publish_report,
+)
+from publishers.spotify.publish_types import (  # noqa: E402
+    ADDED,
+    ALREADY_PRESENT,
+    APPEND_SYNC_MODE,
+    DEFAULT_MAX_NEW_SEARCHES_PER_RUN,
+    DUPLICATE_IN_SOURCE,
+    INCLUDED,
+    MATCH_SOURCE_CACHE,
+    MATCH_SOURCE_SEARCH,
+    PUBLISHER_SYNC_MODES,
+    REPLACE_SYNC_MODE,
+    UNLIMITED_NEW_SEARCHES_PER_RUN,
+    WOULD_ADD,
+    WOULD_INCLUDE,
+    FinalPlaylistItem,
+    InfoLog,
+    PlaylistPublishContext,
+    PlaylistPublishDecision,
+    SpotifyDryRunSummary,
+    SpotifyPublishSummary,
+    SpotifyTrackSearchResult,
+)
 from publishers.spotify.session import get_spotify_access_token  # noqa: E402
+from shared.cli import EXPECTED_CLI_ERRORS, print_cli_error  # noqa: E402
+from shared.cli_args import append_cli_option  # noqa: E402
 from shared.debug_log import DebugLog, build_debug_logger  # noqa: E402
 from shared.files import read_csv_file  # noqa: E402
 from shared.playlist_selection import resolve_playlist_master_paths  # noqa: E402
@@ -59,117 +106,20 @@ from shared.publisher_config import (  # noqa: E402
     DEFAULT_PUBLISHER_CONFIG_PATH,
     PublisherConfig,
     load_or_create_publisher_config,
+    publisher_playlist_name,
 )
-from shared.reports import format_report_section, format_report_title, script_report_path, write_text_report  # noqa: E402
+from shared.reports import script_report_path  # noqa: E402
+from shared.text import clean_cell  # noqa: E402
+from shared.tunemymusic import TUNEMYMUSIC_COLUMNS, missing_tunemymusic_columns  # noqa: E402
+from shared.workflow_paths import (  # noqa: E402
+    DEFAULT_PLAYLIST_OUTPUT_DIRECTORY as SHARED_PLAYLIST_OUTPUT_DIRECTORY,
+    DEFAULT_SPOTIFY_MATCH_CACHE_PATH,
+)
 
 
-DEFAULT_PLAYLIST_OUTPUT_DIRECTORY = Path("collection/playlists")
-DEFAULT_MATCH_CACHE_PATH = Path("collection/cache/spotify-track-matches.cache.json")
-DEFAULT_MAX_NEW_SEARCHES_PER_RUN = 500
-UNLIMITED_NEW_SEARCHES_PER_RUN = 0
-APPEND_SYNC_MODE = "append"
-REPLACE_SYNC_MODE = "replace"
-PUBLISHER_SYNC_MODES = (APPEND_SYNC_MODE, REPLACE_SYNC_MODE)
-ALREADY_PRESENT = "already_present"
-WOULD_ADD = "would_add"
-ADDED = "added"
-WOULD_INCLUDE = "would_include"
-INCLUDED = "included"
-DUPLICATE_IN_SOURCE = "duplicate_in_source"
-MATCH_SOURCE_CACHE = "cache"
-MATCH_SOURCE_SEARCH = "search"
+DEFAULT_PLAYLIST_OUTPUT_DIRECTORY = SHARED_PLAYLIST_OUTPUT_DIRECTORY
+DEFAULT_MATCH_CACHE_PATH = DEFAULT_SPOTIFY_MATCH_CACHE_PATH
 PLAYLIST_DESCRIPTION = "Generated from Discogs collection"
-TUNEMYMUSIC_COLUMNS = (
-    "Release Id",
-    "Album Name",
-    "Track Number",
-    "Track Name",
-    "Artist Name",
-    "Spotify Search Query",
-)
-
-
-@dataclass(frozen=True)
-class SpotifyDryRunSummary:
-    playlist_count: int
-    track_count: int
-    matched_count: int
-    ambiguous_count: int
-    unmatched_count: int
-    error_count: int
-    report_path: Path
-    decisions: tuple[TrackMatchDecision, ...]
-
-
-@dataclass(frozen=True)
-class PlaylistPublishDecision:
-    playlist_name: str
-    target_playlist_name: str
-    track: PlaylistTrack
-    status: str
-    spotify_uri: str
-    reason: str
-    match_source: str
-    candidate: SpotifyTrackCandidate | None = None
-    review_candidates: tuple[SpotifyTrackCandidate, ...] = ()
-    search_queries: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class FinalPlaylistItem:
-    playlist_name: str
-    position: int
-    status: str
-    spotify_uri: str
-    track_name: str
-    artist_names: tuple[str, ...]
-    album_name: str
-    source_track: PlaylistTrack | None = None
-
-
-@dataclass(frozen=True)
-class PlaylistPublishContext:
-    playlist_name: str
-    target_playlist_name: str
-    playlist_id: str
-    existed: bool
-    current_item_count: int
-    info_message: str
-
-
-@dataclass(frozen=True)
-class SpotifyPublishSummary:
-    playlist_count: int
-    track_count: int
-    run_status: str
-    cache_hit_count: int
-    search_count: int
-    searched_row_count: int
-    matched_count: int
-    ambiguous_count: int
-    unmatched_count: int
-    error_count: int
-    already_present_count: int
-    would_add_count: int
-    added_count: int
-    would_include_count: int
-    included_count: int
-    duplicate_in_source_count: int
-    report_path: Path
-    apply: bool
-    publisher_sync_mode: str
-    decisions: tuple[PlaylistPublishDecision, ...]
-    final_items: tuple[FinalPlaylistItem, ...]
-    playlist_contexts: tuple[PlaylistPublishContext, ...]
-
-
-InfoLog = Callable[[str], None]
-
-
-@dataclass(frozen=True)
-class SpotifyTrackSearchResult:
-    decision: TrackMatchDecision
-    search_count: int
 
 
 def search_spotify_track(
@@ -970,10 +920,6 @@ def validate_existing_spotify_playlist_target(playlist: SpotifyPlaylist) -> None
         )
 
 
-def publisher_playlist_name(playlist_name: str, config: PublisherConfig) -> str:
-    return f"{config.playlist_prefix}{playlist_name}{config.playlist_suffix}"
-
-
 def emit_info(info_log: InfoLog | None, message: str) -> None:
     if info_log:
         info_log(message)
@@ -1034,7 +980,7 @@ def playlist_name_for_master_path(
 
 
 def validate_playlist_fieldnames(path: Path, fieldnames: Sequence[str]) -> None:
-    missing_columns = [column for column in TUNEMYMUSIC_COLUMNS if column not in fieldnames]
+    missing_columns = missing_tunemymusic_columns(fieldnames)
     if missing_columns:
         raise ValueError(f"{path}: missing playlist CSV columns: {', '.join(missing_columns)}")
 
@@ -1173,45 +1119,6 @@ def reindex_final_items(final_items: Sequence[FinalPlaylistItem]) -> tuple[Final
             )
         )
     return tuple(reindexed_items)
-
-
-def build_publish_summary(
-    decisions: tuple[PlaylistPublishDecision, ...],
-    final_items: tuple[FinalPlaylistItem, ...],
-    playlist_contexts: tuple[PlaylistPublishContext, ...],
-    report_path: Path,
-    apply: bool,
-    publisher_sync_mode: str,
-    cache_hit_count: int,
-    search_count: int,
-    searched_row_count: int = 0,
-    run_status: str = "complete",
-) -> SpotifyPublishSummary:
-    playlist_names = {context.target_playlist_name for context in playlist_contexts}
-    return SpotifyPublishSummary(
-        playlist_count=len(playlist_names),
-        track_count=len(decisions),
-        run_status=run_status,
-        cache_hit_count=cache_hit_count,
-        search_count=search_count,
-        searched_row_count=searched_row_count,
-        matched_count=sum(1 for decision in decisions if decision.spotify_uri),
-        ambiguous_count=sum(1 for decision in decisions if decision.status == AMBIGUOUS),
-        unmatched_count=sum(1 for decision in decisions if decision.status == UNMATCHED),
-        error_count=sum(1 for decision in decisions if decision.status == ERROR),
-        already_present_count=sum(1 for decision in decisions if decision.status == ALREADY_PRESENT),
-        would_add_count=sum(1 for decision in decisions if decision.status == WOULD_ADD),
-        added_count=sum(1 for decision in decisions if decision.status == ADDED),
-        would_include_count=sum(1 for decision in decisions if decision.status == WOULD_INCLUDE),
-        included_count=sum(1 for decision in decisions if decision.status == INCLUDED),
-        duplicate_in_source_count=sum(1 for decision in decisions if decision.status == DUPLICATE_IN_SOURCE),
-        report_path=report_path,
-        apply=apply,
-        publisher_sync_mode=publisher_sync_mode,
-        decisions=decisions,
-        final_items=final_items,
-        playlist_contexts=playlist_contexts,
-    )
 
 
 def write_publish_summary(
@@ -1370,359 +1277,103 @@ def update_spotify_playlist_inventory(
     )
 
 
-def write_publish_report(path: Path, summary: SpotifyPublishSummary) -> None:
-    title = "Spotify playlist publish report\n" if summary.apply else "Spotify playlist publish dry-run report\n"
-    lines = format_report_title(title)
-    lines.extend(
-        format_report_section(
-            "Summary",
-            [
-                f"- Run status: {summary.run_status}",
-                f"- Publisher sync mode: {summary.publisher_sync_mode}",
-                f"- Playlists: {summary.playlist_count}",
-                f"- Tracks: {summary.track_count}",
-                f"- Cache hits: {summary.cache_hit_count}",
-                f"- Spotify searches: {summary.search_count}",
-                f"- Rows searched with ladder: {summary.searched_row_count}",
-                f"- Cached matched tracks: {cached_matched_publish_decision_count(summary.decisions)}",
-                f"- Cached ambiguous tracks: {count_publish_decisions(summary.decisions, MATCH_SOURCE_CACHE, {AMBIGUOUS})}",
-                f"- Cached unmatched tracks: {count_publish_decisions(summary.decisions, MATCH_SOURCE_CACHE, {UNMATCHED})}",
-                f"- Searched matched tracks: {searched_matched_publish_decision_count(summary.decisions)}",
-                f"- Searched ambiguous tracks: {count_publish_decisions(summary.decisions, MATCH_SOURCE_SEARCH, {AMBIGUOUS})}",
-                f"- Searched unmatched tracks: {count_publish_decisions(summary.decisions, MATCH_SOURCE_SEARCH, {UNMATCHED})}",
-                f"- Searched error tracks: {count_publish_decisions(summary.decisions, MATCH_SOURCE_SEARCH, {ERROR})}",
-                f"- Matched tracks: {summary.matched_count}",
-                f"- Already-present tracks: {summary.already_present_count}",
-                f"- Would add tracks: {summary.would_add_count}",
-                f"- Added tracks: {summary.added_count}",
-                f"- Tracks that would be included in replacement: {summary.would_include_count}",
-                f"- Tracks included in replacement: {summary.included_count}",
-                f"- Duplicate source tracks skipped: {summary.duplicate_in_source_count}",
-                f"- Ambiguous tracks: {summary.ambiguous_count}",
-                f"- Unmatched tracks: {summary.unmatched_count}",
-                f"- Search errors: {summary.error_count}",
-            ],
-        )
-    )
-    lines.extend(
-        format_report_section(
-            "Playlist checks",
-            [f"- {context.info_message}" for context in summary.playlist_contexts] or ["- None"],
-        )
-    )
-    lines.extend(
-        format_report_section(
-            "Already-present tracks",
-            format_publish_decisions(summary.decisions, {ALREADY_PRESENT}),
-        )
-    )
-    lines.extend(
-        format_report_section(
-            "Tracks that would be added",
-            format_publish_decisions(summary.decisions, {WOULD_ADD}),
-        )
-    )
-    lines.extend(
-        format_report_section(
-            "Tracks added",
-            format_publish_decisions(summary.decisions, {ADDED}),
-        )
-    )
-    lines.extend(
-        format_report_section(
-            "Tracks that would be included in replacement",
-            format_publish_decisions(summary.decisions, {WOULD_INCLUDE}),
-        )
-    )
-    lines.extend(
-        format_report_section(
-            "Tracks included in replacement",
-            format_publish_decisions(summary.decisions, {INCLUDED}),
-        )
-    )
-    lines.extend(
-        format_report_section(
-            "Duplicate source tracks skipped",
-            format_publish_decisions(summary.decisions, {DUPLICATE_IN_SOURCE}),
-        )
-    )
-    lines.extend(
-        format_report_section(
-            "Ambiguous tracks needing review",
-            flatten_report_details(format_publish_review_details(decision) for decision in summary.decisions if decision.status == AMBIGUOUS),
-        )
-    )
-    lines.extend(
-        format_report_section(
-            "Unmatched tracks needing review",
-            flatten_report_details(format_publish_review_details(decision) for decision in summary.decisions if decision.status == UNMATCHED),
-        )
-    )
-    lines.extend(
-        format_report_section(
-            "Search errors",
-            flatten_report_details(format_publish_review_details(decision) for decision in summary.decisions if decision.status == ERROR),
-        )
-    )
-    lines.extend(
-        format_report_section(
-            "Final planned playlist state",
-            [format_final_playlist_item(item) for item in summary.final_items] or ["- None"],
-        )
-    )
-    lines.extend(
-        format_report_section(
-            "Track publish decisions",
-            [format_publish_decision(decision) for decision in summary.decisions] or ["- None"],
-        )
-    )
-    write_text_report(path, lines)
-
-
-def count_publish_decisions(
-    decisions: Sequence[PlaylistPublishDecision],
-    match_source: str,
-    statuses: set[str],
-) -> int:
-    return sum(1 for decision in decisions if decision.match_source == match_source and decision.status in statuses)
-
-
-def cached_matched_publish_decision_count(decisions: Sequence[PlaylistPublishDecision]) -> int:
-    return sum(1 for decision in decisions if decision.match_source == MATCH_SOURCE_CACHE and bool(decision.spotify_uri))
-
-
-def searched_matched_publish_decision_count(decisions: Sequence[PlaylistPublishDecision]) -> int:
-    return sum(1 for decision in decisions if decision.match_source == MATCH_SOURCE_SEARCH and bool(decision.spotify_uri))
-
-
-def format_publish_decisions(decisions: Sequence[PlaylistPublishDecision], statuses: set[str]) -> list[str]:
-    return [format_publish_decision(decision) for decision in decisions if decision.status in statuses] or ["- None"]
-
-
-def format_publish_decision(decision: PlaylistPublishDecision) -> str:
-    track = decision.track
-    return (
-        f"- {decision.target_playlist_name} | {track.release_id} | {track.track_number} | "
-        f"{track.artist_name} | {track.track_name} | {decision.status} | "
-        f"{decision.spotify_uri or 'no Spotify URI'} | {display_report_value(decision.reason)}"
-    )
-
-
-def format_publish_review_details(decision: PlaylistPublishDecision) -> list[str]:
-    lines = [
-        f"- {decision.target_playlist_name} | {format_track_context(decision.track)}",
-        f"  Why: {display_report_value(decision.reason)}",
-    ]
-    search_queries = decision.search_queries or (build_spotify_track_search_query(decision.track),)
-    lines.append("  Search queries:")
-    lines.extend(f"    - {display_report_value(query)}" for query in search_queries)
-    if decision.status == ERROR:
-        return lines
-    if decision.status == AMBIGUOUS:
-        if decision.review_candidates:
-            lines.append("  Matching Spotify candidates:")
-            lines.extend(f"    - {format_spotify_candidate(candidate)}" for candidate in decision.review_candidates)
-        else:
-            lines.append("  Matching Spotify candidates: none recorded")
-        return lines
-    if not decision.review_candidates:
-        lines.append("  Spotify returned 0 candidates.")
-        return lines
-    closest_candidate = decision.review_candidates[0]
-    lines.append(f"  Spotify returned {len(decision.review_candidates)} candidate(s).")
-    lines.append(f"  Closest Spotify result: {format_spotify_candidate(closest_candidate)}")
-    lines.append("  Comparison:")
-    lines.extend(format_candidate_comparison(decision.track, closest_candidate))
-    return lines
-
-
-def format_final_playlist_item(item: FinalPlaylistItem) -> str:
-    return (
-        f"- {item.playlist_name} | {item.position} | {item.status} | "
-        f"{format_artist_names(item.artist_names)} | {display_report_value(item.track_name)} | "
-        f"{display_report_value(item.album_name)} | {item.spotify_uri or 'no Spotify URI'}"
-    )
-
-
-def format_artist_names(artist_names: Sequence[str]) -> str:
-    return display_report_value(", ".join(artist_names))
-
-
-def build_summary(decisions: tuple[TrackMatchDecision, ...], report_path: Path) -> SpotifyDryRunSummary:
-    playlist_names = {decision.track.playlist_name for decision in decisions}
-    return SpotifyDryRunSummary(
-        playlist_count=len(playlist_names),
-        track_count=len(decisions),
-        matched_count=sum(1 for decision in decisions if decision.status == MATCHED),
-        ambiguous_count=sum(1 for decision in decisions if decision.status == AMBIGUOUS),
-        unmatched_count=sum(1 for decision in decisions if decision.status == UNMATCHED),
-        error_count=sum(1 for decision in decisions if decision.status == ERROR),
-        report_path=report_path,
-        decisions=decisions,
-    )
-
-
-def write_dry_run_report(path: Path, summary: SpotifyDryRunSummary) -> None:
-    lines = format_report_title("Spotify playlist dry-run report")
-    lines.extend(
-        format_report_section(
-            "Summary",
-            [
-                f"- Playlists: {summary.playlist_count}",
-                f"- Tracks: {summary.track_count}",
-                f"- Matched tracks: {summary.matched_count}",
-                f"- Ambiguous tracks: {summary.ambiguous_count}",
-                f"- Unmatched tracks: {summary.unmatched_count}",
-                f"- Search errors: {summary.error_count}",
-            ],
-        )
-    )
-    lines.extend(
-        format_report_section(
-            "Ambiguous tracks needing review",
-            flatten_report_details(format_ambiguous_track_details(decision) for decision in summary.decisions if decision.status == AMBIGUOUS),
-        )
-    )
-    lines.extend(
-        format_report_section(
-            "Unmatched tracks needing review",
-            flatten_report_details(format_unmatched_track_details(decision) for decision in summary.decisions if decision.status == UNMATCHED),
-        )
-    )
-    lines.extend(
-        format_report_section(
-            "Search errors",
-            flatten_report_details(format_search_error_details(decision) for decision in summary.decisions if decision.status == ERROR),
-        )
-    )
-    lines.extend(
-        format_report_section(
-            "Track match decisions",
-            [format_match_decision(decision) for decision in summary.decisions] or ["- None"],
-        )
-    )
-    write_text_report(path, lines)
-
-
-def format_match_decision(decision: TrackMatchDecision) -> str:
-    track = decision.track
-    return (
-        f"- {track.playlist_name} | {track.release_id} | {track.track_number} | "
-        f"{track.artist_name} | {track.track_name} | {decision.status} | "
-        f"{decision.spotify_uri or 'no Spotify URI'} | {display_report_value(decision.reason)}"
-    )
-
-
-def flatten_report_details(detail_groups: Iterable[list[str]]) -> list[str]:
-    lines: list[str] = []
-    for detail_group in detail_groups:
-        if lines:
-            lines.append("")
-        lines.extend(detail_group)
-    return lines or ["- None"]
-
-
-def format_ambiguous_track_details(decision: TrackMatchDecision) -> list[str]:
-    lines = [
-        f"- {format_track_context(decision.track)}",
-        f"  Search query: {format_search_query(decision.track)}",
-        f"  Why: {display_report_value(decision.reason)}",
-    ]
-    if decision.review_candidates:
-        lines.append("  Matching Spotify candidates:")
-        lines.extend(f"    - {format_spotify_candidate(candidate)}" for candidate in decision.review_candidates)
-    else:
-        lines.append("  Matching Spotify candidates: none recorded")
-    return lines
-
-
-def format_unmatched_track_details(decision: TrackMatchDecision) -> list[str]:
-    lines = [
-        f"- {format_track_context(decision.track)}",
-        f"  Search query: {format_search_query(decision.track)}",
-        f"  Why: {display_report_value(decision.reason)}",
-    ]
-    if not decision.review_candidates:
-        lines.append("  Spotify returned 0 candidates.")
-        return lines
-
-    closest_candidate = decision.review_candidates[0]
-    lines.append(f"  Spotify returned {len(decision.review_candidates)} candidate(s).")
-    lines.append(f"  Closest Spotify result: {format_spotify_candidate(closest_candidate)}")
-    lines.append("  Comparison:")
-    lines.extend(format_candidate_comparison(decision.track, closest_candidate))
-    return lines
-
-
-def format_search_error_details(decision: TrackMatchDecision) -> list[str]:
-    return [
-        f"- {format_track_context(decision.track)}",
-        f"  Search query: {format_search_query(decision.track)}",
-        f"  Error: {display_report_value(decision.reason)}",
-    ]
-
-
-def format_track_context(track: PlaylistTrack) -> str:
-    return (
-        f"{display_report_value(track.playlist_name)} | {display_report_value(track.release_id)} | "
-        f"{display_report_value(track.track_number)} | {display_report_value(track.artist_name)} | "
-        f"{display_report_value(track.track_name)} | {display_report_value(track.album_name)}"
-    )
-
-
-def format_search_query(track: PlaylistTrack) -> str:
-    return display_report_value(build_spotify_track_search_query(track))
-
-
-def format_spotify_candidate(candidate: SpotifyTrackCandidate) -> str:
-    return (
-        f"{candidate.uri} | {format_spotify_artists(candidate)} | "
-        f"{display_report_value(candidate.name)} | {display_report_value(candidate.album_name)}"
-    )
-
-
-def format_spotify_artists(candidate: SpotifyTrackCandidate) -> str:
-    return display_report_value(", ".join(candidate.artists))
-
-
-def format_candidate_comparison(track: PlaylistTrack, candidate: SpotifyTrackCandidate) -> list[str]:
-    return [
-        format_field_comparison(
-            "Track name",
-            track.track_name,
-            candidate.name,
-            normalize_music_text(track.track_name) == normalize_music_text(candidate.name),
-        ),
-        format_field_comparison(
-            "Artist",
-            track.artist_name,
-            ", ".join(candidate.artists),
-            source_artist_matches_candidate(track.artist_name, candidate.artists),
-        ),
-        format_field_comparison(
-            "Album",
-            track.album_name,
-            candidate.album_name,
-            normalize_music_text(track.album_name) == normalize_music_text(candidate.album_name),
-        ),
-    ]
-
-
-def format_field_comparison(label: str, discogs_value: str, spotify_value: str, matches: bool) -> str:
-    status = "matches" if matches else "different"
-    return (
-        f"    {label}: {status} "
-        f"(Discogs: {display_report_value(discogs_value)}; Spotify: {display_report_value(spotify_value)})"
-    )
-
-
-def display_report_value(value: object) -> str:
-    text = " ".join(str(value or "").split())
-    return text if text else "(blank)"
-
-
 def default_report_path() -> Path:
     return script_report_path(__file__)
+
+
+def build_spotify_publisher_argv(
+    *,
+    env_file: Path | None = None,
+    playlist_output_dir: Path | None = None,
+    report: Path | None = None,
+    token_cache: Path | None = None,
+    match_cache: Path | None = None,
+    publisher_config: Path | None = None,
+    debug_log: Path | None = None,
+    reauthorize: bool = False,
+    playlists: Sequence[str] | None = None,
+    search_limit: int | None = None,
+    max_new_searches_per_run: int | None = None,
+    publisher_sync_mode: str | None = None,
+    refresh_match_cache: bool = False,
+    dry_run: bool = False,
+    no_progress: bool = False,
+) -> list[str]:
+    arguments: list[str] = []
+    append_cli_option(arguments, "--env-file", env_file)
+    append_cli_option(arguments, "--playlist-output-dir", playlist_output_dir)
+    append_cli_option(arguments, "--report", report)
+    append_cli_option(arguments, "--token-cache", token_cache)
+    append_cli_option(arguments, "--match-cache", match_cache)
+    append_cli_option(arguments, "--publisher-config", publisher_config)
+    append_cli_option(arguments, "--debug-log", debug_log)
+    if reauthorize:
+        arguments.append("--reauthorize")
+    if playlists:
+        arguments.append("--playlists")
+        arguments.extend(str(playlist) for playlist in playlists)
+    if no_progress:
+        arguments.append("--no-progress")
+    if dry_run:
+        arguments.append("--publishing-dry-run")
+    append_cli_option(arguments, "--search-limit", search_limit)
+    append_cli_option(arguments, "--max-new-searches-per-run", max_new_searches_per_run)
+    append_cli_option(arguments, "--publisher-sync-mode", publisher_sync_mode)
+    if refresh_match_cache:
+        arguments.append("--refresh-match-cache")
+    return arguments
+
+
+def build_spotify_publisher_namespace(
+    *,
+    env_file: Path = DEFAULT_ENV_PATH,
+    playlist_output_dir: Path = DEFAULT_PLAYLIST_OUTPUT_DIRECTORY,
+    report: Path | None = None,
+    token_cache: Path = DEFAULT_TOKEN_CACHE_PATH,
+    match_cache: Path = DEFAULT_MATCH_CACHE_PATH,
+    publisher_config: Path = DEFAULT_PUBLISHER_CONFIG_PATH,
+    debug_log: Path | None = None,
+    reauthorize: bool = False,
+    access_token: str | None = None,
+    playlists: Sequence[str] | None = None,
+    search_limit: int = 10,
+    max_new_searches_per_run: int = DEFAULT_MAX_NEW_SEARCHES_PER_RUN,
+    publisher_sync_mode: str = APPEND_SYNC_MODE,
+    refresh_match_cache: bool = False,
+    dry_run: bool = False,
+    progress: bool = True,
+) -> argparse.Namespace:
+    return argparse.Namespace(
+        env_file=env_file,
+        playlist_output_dir=playlist_output_dir,
+        report=report or default_report_path(),
+        token_cache=token_cache,
+        match_cache=match_cache,
+        publisher_config=publisher_config,
+        debug_log=debug_log,
+        reauthorize=reauthorize,
+        access_token=access_token,
+        playlists=list(playlists) if playlists is not None else None,
+        search_limit=search_limit,
+        max_new_searches_per_run=max_new_searches_per_run,
+        publisher_sync_mode=publisher_sync_mode,
+        refresh_match_cache=refresh_match_cache,
+        dry_run=dry_run,
+        progress=progress,
+        apply=not dry_run,
+    )
+
+
+def validate_spotify_publisher_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.search_limit < 1 or args.search_limit > 10:
+        parser.error("--search-limit must be between 1 and 10")
+    if args.max_new_searches_per_run < 0:
+        parser.error("--max-new-searches-per-run must be non-negative")
+
+
+def apply_spotify_publisher_arg_defaults(args: argparse.Namespace) -> None:
+    args.apply = not args.dry_run
+    args.report = args.report or default_report_path()
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -1752,12 +1403,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--publishing-dry-run", action="store_true", dest="dry_run", help="Preview Spotify playlist changes without creating or updating playlists.")
     parser.add_argument("--no-progress", action="store_false", dest="progress", help="Disable terminal progress output.")
     args = parser.parse_args(argv)
-    if args.search_limit < 1 or args.search_limit > 10:
-        parser.error("--search-limit must be between 1 and 10")
-    if args.max_new_searches_per_run < 0:
-        parser.error("--max-new-searches-per-run must be non-negative")
-    args.apply = not args.dry_run
-    args.report = args.report or default_report_path()
+    validate_spotify_publisher_args(parser, args)
+    apply_spotify_publisher_arg_defaults(args)
     return args
 
 
@@ -1835,8 +1482,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"would_add={summary.would_add_count} added={summary.added_count} "
                 f"ambiguous={summary.ambiguous_count} unmatched={summary.unmatched_count} errors={summary.error_count}"
             )
-    except (FileNotFoundError, NotADirectoryError, ValueError, csv.Error, SpotifyApiError) as error:
-        print(f"Error: {error}", file=sys.stderr)
+    except (*EXPECTED_CLI_ERRORS, SpotifyApiError) as error:
+        print_cli_error(error)
         rate_limit_stop = isinstance(error, (SpotifyRateLimitDeferredError, SpotifyRateLimitRetriesExhaustedError))
         if rate_limit_stop and "args" in locals() and args.report.exists():
             print(f"Spotify publish report: {args.report}", file=sys.stderr)
@@ -1866,10 +1513,6 @@ def get_access_token_for_run(settings, force_reauthorize: bool = False) -> str:
         settings=settings,
         required_scopes=DEFAULT_AUTHORIZE_SCOPES,
     )
-
-
-def clean_cell(value: object) -> str:
-    return str(value or "").strip()
 
 
 if __name__ == "__main__":

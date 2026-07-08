@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
-import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from shared.files import write_json_file
+from shared.config_files import load_or_create_json_file, reject_unknown_keys
 
 
 DEFAULT_PUBLISHER_CONFIG_PATH = Path("config/publisher.json")
-SUPPORTED_PUBLISHERS = frozenset({"spotify", "none"})
+SPOTIFY_PUBLISHER = "spotify"
+NO_PUBLISHER = "none"
+PUBLISHER_CHOICES = (SPOTIFY_PUBLISHER, NO_PUBLISHER)
+SUPPORTED_PUBLISHERS = frozenset(PUBLISHER_CHOICES)
+NON_PUBLISHING_PUBLISHERS = frozenset({NO_PUBLISHER})
 PUBLISHER_CONFIG_KEYS = frozenset({"default_publisher", "playlist_prefix", "playlist_suffix"})
-DEFAULT_PUBLISHER = "none"
+DEFAULT_PUBLISHER = NO_PUBLISHER
 DEFAULT_PLAYLIST_PREFIX = "Discogs - "
 DEFAULT_PLAYLIST_SUFFIX = ""
 
@@ -34,12 +37,11 @@ def default_publisher_config_payload() -> dict[str, object]:
 
 
 def load_or_create_publisher_config(path: Path = DEFAULT_PUBLISHER_CONFIG_PATH) -> PublisherConfig:
-    if not path.exists():
-        write_json_file(path, default_publisher_config_payload())
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as error:
-        raise ValueError(f"malformed publisher config JSON: {path}") from error
+    payload = load_or_create_json_file(
+        path,
+        default_payload=default_publisher_config_payload(),
+        malformed_label="publisher config",
+    )
     return normalize_publisher_config(payload)
 
 
@@ -47,9 +49,7 @@ def normalize_publisher_config(payload: object) -> PublisherConfig:
     if not isinstance(payload, Mapping):
         raise ValueError("publisher config must be a JSON object")
 
-    unknown_keys = sorted(str(key) for key in payload if key not in PUBLISHER_CONFIG_KEYS)
-    if unknown_keys:
-        raise ValueError(f"unknown publisher config key: {', '.join(unknown_keys)}")
+    reject_unknown_keys(payload, allowed_keys=PUBLISHER_CONFIG_KEYS, config_label="publisher config")
 
     default_publisher = payload.get("default_publisher", DEFAULT_PUBLISHER)
     if not isinstance(default_publisher, str) or default_publisher not in SUPPORTED_PUBLISHERS:
@@ -68,3 +68,37 @@ def normalize_publisher_config(payload: object) -> PublisherConfig:
         playlist_prefix=playlist_prefix,
         playlist_suffix=playlist_suffix,
     )
+
+
+def publishing_publishers(supported_publishers: Sequence[str] | None = None) -> tuple[str, ...]:
+    publishers = PUBLISHER_CHOICES if supported_publishers is None else supported_publishers
+    return tuple(publisher for publisher in publishers if publisher not in NON_PUBLISHING_PUBLISHERS)
+
+
+def publisher_playlist_name(playlist_name: str, config: PublisherConfig) -> str:
+    return f"{config.playlist_prefix}{playlist_name}{config.playlist_suffix}"
+
+
+def publisher_local_name_from_target(playlist_name: object, config: PublisherConfig) -> str | None:
+    name = clean_text(playlist_name)
+    prefix = config.playlist_prefix
+    suffix = config.playlist_suffix
+    if prefix and not name.startswith(prefix):
+        return None
+    if suffix and not name.endswith(suffix):
+        return None
+    without_prefix = name[len(prefix) :] if prefix else name
+    without_suffix = without_prefix[: -len(suffix)] if suffix else without_prefix
+    local_name = clean_text(without_suffix)
+    return local_name or None
+
+
+def validate_publisher_naming_is_safe(config: PublisherConfig) -> None:
+    if not config.playlist_prefix and not config.playlist_suffix:
+        raise ValueError(
+            "playlist_prefix or playlist_suffix must be configured before deduping provider playlists"
+        )
+
+
+def clean_text(value: object) -> str:
+    return str(value or "").strip()

@@ -23,8 +23,6 @@ class ProgressReporter:
         self.started = False
         self.last_line_length = 0
 
-        print("\n")
-
     def stream_is_terminal(self) -> bool:
         is_terminal = getattr(self.stream, "isatty", None)
         return bool(is_terminal and is_terminal())

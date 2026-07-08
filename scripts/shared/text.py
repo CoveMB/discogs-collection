@@ -5,6 +5,15 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 
 
+def clean_cell(value: object) -> str:
+    return str(value or "").strip()
+
+
+def display_report_value(value: object) -> str:
+    text = " ".join(str(value or "").split())
+    return text if text else "(blank)"
+
+
 def is_string_list(value: object) -> bool:
     return isinstance(value, list) and all(isinstance(item, str) for item in value)
 

@@ -235,6 +235,8 @@ CSVs under `collection/playlists`, matches rows to Spotify tracks, fetches the
 current Spotify playlist state, and writes a local publish report. When you run
 this script directly, it creates or updates Spotify playlists by default. Pass
 `--publishing-dry-run` to preview the same decisions without writing to Spotify.
+There is no `--apply` flag for publishing; omitting `--publishing-dry-run` is
+the mode that can write changes.
 
 Spotify settings come from `.env` by default. Copy `.env.example` to `.env` or
 create `.env` with:
@@ -479,6 +481,9 @@ playlist label, such as `House`, the Spotify target name, such as
 pass the owned, private, non-collaborative, publisher-managed checks. If any
 selector is blank, `all`, ambiguous, missing, or matches only skipped playlists,
 the script stops before fetching playlist tracks.
+
+The singular `--playlist` selector is not supported. Use `--playlists` even when
+you want to process one playlist.
 
 Duplicates are exact Spotify track URI matches inside the same playlist. The
 same track URI in two different playlists is not a duplicate. For each duplicate
@@ -1146,6 +1151,10 @@ cached results are reused.
 
 Each script prints a run summary at the end.
 
+Handled runtime errors print a single `Error: ...` line to `stderr` and return
+`1`. This includes file, directory, CSV, JSON, config, cache, validation, and
+supported Spotify API failures for the scripts that can hit those cases.
+
 - `discogs_style_enricher.py` returns `0` when the run finishes without lookup
   errors.
 - `discogs_style_enricher.py` returns `2` when the run finishes, but at least
@@ -1476,7 +1485,8 @@ Playlist dedupe options:
 --playlists VALUE [VALUE ...]
     Dedupe one or more eligible playlists. Each value can be the local playlist
     label, Spotify target name, or Spotify playlist ID. Omit this flag to process
-    every eligible playlist.
+    every eligible playlist. Use --playlists for one selector too; --playlist is
+    not supported.
 
 --report PATH
     Dedupe report path. Defaults to

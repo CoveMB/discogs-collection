@@ -14,12 +14,19 @@ from publishers.dedupe import (
     plan_playlist_dedupe,
 )
 from publishers.spotify.client import SpotifyApiError, SpotifyClient, SpotifyPlaylist, SpotifyPlaylistItem
+from shared.playlist_selection import normalize_playlist_selectors as normalize_playlist_selector_values
 from shared.progress import ProgressReporter
-from shared.publisher_config import PublisherConfig
+from shared.publisher_config import (
+    SPOTIFY_PUBLISHER,
+    PublisherConfig,
+    publisher_local_name_from_target,
+    validate_publisher_naming_is_safe,
+)
 from shared.reports import format_report_section, format_report_title, script_report_path, write_text_report
+from shared.text import clean_cell, display_report_value
 
 
-MANAGED_PLAYLIST_PROVIDER = "spotify"
+MANAGED_PLAYLIST_PROVIDER = SPOTIFY_PUBLISHER
 
 InfoLog = Callable[[str], None]
 
@@ -220,27 +227,6 @@ def apply_spotify_dedupe_removals(
     return removed_count
 
 
-def publisher_local_name_from_target(playlist_name: str, config: PublisherConfig) -> str | None:
-    name = clean_cell(playlist_name)
-    prefix = config.playlist_prefix
-    suffix = config.playlist_suffix
-    if prefix and not name.startswith(prefix):
-        return None
-    if suffix and not name.endswith(suffix):
-        return None
-    without_prefix = name[len(prefix) :] if prefix else name
-    without_suffix = without_prefix[: -len(suffix)] if suffix else without_prefix
-    local_name = clean_cell(without_suffix)
-    return local_name or None
-
-
-def validate_publisher_naming_is_safe(config: PublisherConfig) -> None:
-    if not config.playlist_prefix and not config.playlist_suffix:
-        raise ValueError(
-            "playlist_prefix or playlist_suffix must be configured before deduping provider playlists"
-        )
-
-
 def split_spotify_playlists_for_dedupe(
     playlists: Sequence[SpotifyPlaylist],
     current_user_id: str,
@@ -336,17 +322,11 @@ def normalize_playlist_selectors(
         selector_values = (playlist_selector,)
     else:
         selector_values = playlist_selectors
-    if selector_values is None:
-        return ()
-    normalized_selectors: list[str] = []
-    for selector in selector_values:
-        normalized = clean_cell(selector)
-        if not normalized:
-            raise ValueError("playlist selector cannot be blank")
-        if normalized.casefold() == "all":
-            raise ValueError("playlist selector 'all' is not allowed; omit --playlists to process every eligible playlist")
-        normalized_selectors.append(normalized)
-    return tuple(normalized_selectors)
+    return normalize_playlist_selector_values(
+        selector_values,
+        blank_error="playlist selector cannot be blank",
+        all_error="playlist selector 'all' is not allowed; omit --playlists to process every eligible playlist",
+    )
 
 
 def selector_match_key(value: str) -> str:
@@ -535,15 +515,6 @@ def default_report_path() -> Path:
     return script_report_path(__file__)
 
 
-def display_report_value(value: object) -> str:
-    text = " ".join(str(value or "").split())
-    return text if text else "(blank)"
-
-
 def emit_info(info_log: InfoLog | None, message: str) -> None:
     if info_log:
         info_log(message)
-
-
-def clean_cell(value: object) -> str:
-    return str(value or "").strip()

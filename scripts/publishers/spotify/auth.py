@@ -13,6 +13,7 @@ from collections.abc import Sequence
 from publishers.spotify.client import HttpRequest, HttpResponse, Transport, urllib_transport
 from publishers.spotify.env import SpotifySettings
 from publishers.spotify.token_cache import SpotifyToken
+from shared.text import clean_cell
 
 
 SPOTIFY_ACCOUNTS_ROOT = "https://accounts.spotify.com"
@@ -142,7 +143,3 @@ def token_error_code(body: str) -> str:
     if not isinstance(payload, dict):
         return ""
     return clean_cell(payload.get("error"))
-
-
-def clean_cell(value: object) -> str:
-    return str(value or "").strip()

@@ -18,12 +18,25 @@ def playlist_master_path(folder_path: Path) -> Path:
 
 
 def playlist_selection_from_flag(values: Sequence[str] | None) -> tuple[str, ...]:
+    return normalize_playlist_selectors(values, allow_all_selector=True)
+
+
+def normalize_playlist_selectors(
+    values: Sequence[str] | None,
+    allow_all_selector: bool = False,
+    blank_error: str = "playlist selectors cannot be blank",
+    all_error: str = "playlist selector 'all' is not allowed; omit the playlist flag to process every playlist",
+) -> tuple[str, ...]:
     if not values:
         return ()
     selectors = tuple(str(value or "").strip() for value in values)
     blank_selectors = [selector for selector in selectors if not selector]
     if blank_selectors:
-        raise ValueError("playlist selectors cannot be blank")
+        raise ValueError(blank_error)
+    if any(selector.casefold() == "all" for selector in selectors):
+        if allow_all_selector and len(selectors) == 1:
+            return selectors
+        raise ValueError(all_error)
     return selectors
 
 
@@ -37,7 +50,7 @@ def resolve_playlist_master_paths(
     if not selected_values:
         return resolve_all_playlist_master_paths(output_directory)
     if any(selector.casefold() == "all" for selector in selected_values):
-        if allow_all_selector and len(selected_values) == 1:
+        if allow_all_selector:
             return resolve_all_playlist_master_paths(output_directory)
         raise ValueError("playlist selector 'all' is not allowed; omit the playlist flag to process every playlist")
 
