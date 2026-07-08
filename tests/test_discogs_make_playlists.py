@@ -434,13 +434,15 @@ class DiscogsMakePlaylistsTests(unittest.TestCase):
                 exit_code = maker.main(["--publisher-config", str(publisher_config_path)])
 
         output = stdout.getvalue()
-        splitter_position = output.find("Running Discogs playlist splitter...")
+        splitter_position = output.find("Step 4/5\n--------\nRunning: Discogs playlist splitter")
         available_publishers = ", ".join(maker.available_playlist_publishers())
-        publisher_notice_position = output.find(
+        publisher_notice = (
             "Playlist publishing skipped because the resolved publisher is none. "
-            f"Run with --publisher {available_publishers} to publish the playlist. "
+            f"Run with --publisher {available_publishers} to publish the playlist."
         )
+        publisher_notice_position = output.find(publisher_notice)
         self.assertEqual(exit_code, 0)
+        self.assertIn(f"Publisher\n---------\n{publisher_notice}", output)
         self.assertGreaterEqual(splitter_position, 0)
         self.assertGreater(publisher_notice_position, splitter_position)
         publisher_main.assert_not_called()

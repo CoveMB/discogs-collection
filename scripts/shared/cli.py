@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import csv
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 from typing import TypeVar
+
+from shared.reports import print_report_section
 
 
 ArgsT = TypeVar("ArgsT")
@@ -22,8 +25,59 @@ EXPECTED_CLI_ERRORS = (
 )
 
 
+@dataclass(frozen=True)
+class ConsoleSection:
+    title: str
+    lines: tuple[str, ...]
+
+
 def print_cli_error(error: BaseException) -> None:
     print(f"Error: {error}", file=sys.stderr)
+
+
+def console_section(title: str, lines: Iterable[str]) -> ConsoleSection:
+    return ConsoleSection(title=title, lines=tuple(lines))
+
+
+def files_section(lines: Iterable[str]) -> ConsoleSection:
+    return console_section("Files", lines)
+
+
+def processed_section(lines: Iterable[str]) -> ConsoleSection:
+    return console_section("Processed", lines)
+
+
+def print_console_sections(sections: Iterable[ConsoleSection]) -> None:
+    for section in sections:
+        print_report_section(section.title, section.lines)
+
+
+def print_cli_summary(
+    *,
+    files: Iterable[str] = (),
+    processed: Iterable[str] = (),
+    extra_sections: Iterable[ConsoleSection] = (),
+) -> None:
+    sections: list[ConsoleSection] = []
+    file_lines = tuple(files)
+    processed_lines = tuple(processed)
+    if file_lines:
+        sections.append(files_section(file_lines))
+    if processed_lines:
+        sections.append(processed_section(processed_lines))
+    sections.extend(extra_sections)
+    print_console_sections(sections)
+
+
+def print_step_header(label: str, step_index: int = 1, total_steps: int = 1) -> None:
+    print_console_sections(
+        [
+            console_section(
+                f"Step {step_index}/{total_steps}",
+                [f"Running: {label}"],
+            )
+        ]
+    )
 
 
 def run_cli(

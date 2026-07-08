@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from shared.cli import run_cli
+from shared.cli import console_section, print_cli_summary, run_cli
 from shared.discogs_columns import GENRE_COLUMN, RELEASE_ID_COLUMN, STYLE_COLUMN, move_release_id_to_front
 from shared.files import read_csv_file, write_csv_file
 from shared.playlist_config import (
@@ -23,7 +23,6 @@ from shared.playlist_config import (
 from shared.reports import (
     format_report_section,
     format_report_title,
-    print_report_section,
     script_report_path,
     write_text_report,
 )
@@ -224,22 +223,22 @@ def format_playlist_association_lines(row_number: int, row: Mapping[str, str]) -
 
 
 def print_summary(summary: PlaylistMappingSummary) -> None:
-    print_report_section(
-        "Files",
-        [
+    extra_sections = []
+    if summary.playlist_association_lines:
+        extra_sections.append(
+            console_section("Release to playlist associations", summary.playlist_association_lines)
+        )
+    print_cli_summary(
+        files=[
             f"Output: {summary.output_path}",
             f"Report: {summary.report_path}",
         ],
-    )
-    print_report_section(
-        "Processed",
-        [
+        processed=[
             f"Input rows: {summary.input_rows}",
             f"Output rows: {summary.output_rows}",
         ],
+        extra_sections=extra_sections,
     )
-    if summary.playlist_association_lines:
-        print_report_section("Release to playlist associations", summary.playlist_association_lines)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

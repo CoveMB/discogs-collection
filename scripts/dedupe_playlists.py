@@ -21,7 +21,7 @@ from publishers.spotify.dedupe import (  # noqa: E402
 )
 from publishers.spotify.env import DEFAULT_ENV_PATH, DEFAULT_TOKEN_CACHE_PATH, load_spotify_settings  # noqa: E402
 from publishers.spotify.publish_playlist import get_access_token_for_run  # noqa: E402
-from shared.cli import EXPECTED_CLI_ERRORS, run_cli  # noqa: E402
+from shared.cli import EXPECTED_CLI_ERRORS, print_cli_summary, run_cli  # noqa: E402
 from shared.debug_log import build_debug_logger  # noqa: E402
 from shared.playlist_selection import normalize_playlist_selectors  # noqa: E402
 from shared.progress import ProgressReporter  # noqa: E402
@@ -102,13 +102,19 @@ def run_dedupe(args: argparse.Namespace) -> SpotifyDedupeSummary:
 
 
 def print_summary(summary: SpotifyDedupeSummary) -> None:
-    print(f"Playlist dedupe report: {summary.report_path}")
-    print(f"Provider playlists fetched: {summary.provider_playlist_count}")
-    print(f"Eligible playlists: {summary.eligible_playlist_count}")
-    print(f"Skipped playlists: {summary.skipped_playlist_count}")
-    print(f"Tracks checked: {summary.track_count}")
-    print(f"Duplicates planned: {summary.duplicate_count}")
-    print(f"Duplicates removed: {summary.removed_count}")
+    print_cli_summary(
+        files=[
+            f"Report: {summary.report_path}",
+        ],
+        processed=[
+            f"Provider playlists fetched: {summary.provider_playlist_count}",
+            f"Eligible playlists: {summary.eligible_playlist_count}",
+            f"Skipped playlists: {summary.skipped_playlist_count}",
+            f"Tracks checked: {summary.track_count}",
+            f"Duplicates planned: {summary.duplicate_count}",
+            f"Duplicates removed: {summary.removed_count}",
+        ],
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

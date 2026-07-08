@@ -93,7 +93,7 @@ from publishers.spotify.publish_types import (  # noqa: E402
     SpotifyTrackSearchResult,
 )
 from publishers.spotify.session import get_spotify_access_token  # noqa: E402
-from shared.cli import EXPECTED_CLI_ERRORS, print_cli_error  # noqa: E402
+from shared.cli import EXPECTED_CLI_ERRORS, print_cli_error, print_cli_summary  # noqa: E402
 from shared.cli_args import append_cli_option  # noqa: E402
 from shared.debug_log import DebugLog, build_debug_logger  # noqa: E402
 from shared.files import read_csv_file  # noqa: E402
@@ -1461,6 +1461,30 @@ def run_spotify_publish_from_args(
     )
 
 
+def print_summary(summary: SpotifyPublishSummary) -> None:
+    print_cli_summary(
+        files=[
+            f"Report: {summary.report_path}",
+        ],
+        processed=[
+            f"Tracks: {summary.track_count}",
+            f"Cache hits: {summary.cache_hit_count}",
+            f"Spotify searches: {summary.search_count}",
+            f"Rows searched with ladder: {summary.searched_row_count}",
+            f"Matched: {summary.matched_count}",
+            f"Already present: {summary.already_present_count}",
+            f"Would add: {summary.would_add_count}",
+            f"Added: {summary.added_count}",
+            f"Would include in replacement: {summary.would_include_count}",
+            f"Included in replacement: {summary.included_count}",
+            f"Duplicate source tracks skipped: {summary.duplicate_in_source_count}",
+            f"Ambiguous: {summary.ambiguous_count}",
+            f"Unmatched: {summary.unmatched_count}",
+            f"Search errors: {summary.error_count}",
+        ],
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = parse_args(argv)
@@ -1488,21 +1512,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if rate_limit_stop and "args" in locals() and args.report.exists():
             print(f"Spotify publish report: {args.report}", file=sys.stderr)
         return 1
-    print(f"Spotify publish report: {summary.report_path}")
-    print(f"Tracks: {summary.track_count}")
-    print(f"Cache hits: {summary.cache_hit_count}")
-    print(f"Spotify searches: {summary.search_count}")
-    print(f"Rows searched with ladder: {summary.searched_row_count}")
-    print(f"Matched: {summary.matched_count}")
-    print(f"Already present: {summary.already_present_count}")
-    print(f"Would add: {summary.would_add_count}")
-    print(f"Added: {summary.added_count}")
-    print(f"Would include in replacement: {summary.would_include_count}")
-    print(f"Included in replacement: {summary.included_count}")
-    print(f"Duplicate source tracks skipped: {summary.duplicate_in_source_count}")
-    print(f"Ambiguous: {summary.ambiguous_count}")
-    print(f"Unmatched: {summary.unmatched_count}")
-    print(f"Search errors: {summary.error_count}")
+    print_summary(summary)
     return 0
 
 

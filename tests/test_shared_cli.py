@@ -11,7 +11,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIRECTORY = PROJECT_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 
-from shared.cli import run_cli  # noqa: E402
+from shared.cli import (  # noqa: E402
+    ConsoleSection,
+    files_section,
+    print_cli_summary,
+    print_console_sections,
+    print_step_header,
+    processed_section,
+    run_cli,
+)
 
 
 @dataclass(frozen=True)
@@ -67,6 +75,82 @@ class SharedCliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assertEqual(stderr.getvalue(), "Error: bad csv\n")
+
+    def test_print_console_sections_uses_shared_section_format(self):
+        stdout = io.StringIO()
+
+        with patch("sys.stdout", stdout):
+            print_console_sections(
+                [
+                    ConsoleSection("Files", ("Report: reports/run.txt",)),
+                    ConsoleSection("Processed", ("Rows: 3",)),
+                ]
+            )
+
+        self.assertEqual(
+            stdout.getvalue().splitlines(),
+            [
+                "",
+                "Files",
+                "-----",
+                "Report: reports/run.txt",
+                "",
+                "Processed",
+                "---------",
+                "Rows: 3",
+            ],
+        )
+
+    def test_print_cli_summary_prints_standard_files_and_processed_sections(self):
+        stdout = io.StringIO()
+
+        with patch("sys.stdout", stdout):
+            print_cli_summary(
+                files=("Report: reports/run.txt",),
+                processed=("Rows: 3",),
+                extra_sections=(ConsoleSection("Review", ("None",)),),
+            )
+
+        self.assertEqual(
+            stdout.getvalue().splitlines(),
+            [
+                "",
+                "Files",
+                "-----",
+                "Report: reports/run.txt",
+                "",
+                "Processed",
+                "---------",
+                "Rows: 3",
+                "",
+                "Review",
+                "------",
+                "None",
+            ],
+        )
+
+    def test_named_summary_section_helpers_materialize_lines_once(self):
+        files = files_section(line for line in ("Output: out.csv", "Report: report.txt"))
+        processed = processed_section(["Rows: 3"])
+
+        self.assertEqual(files, ConsoleSection("Files", ("Output: out.csv", "Report: report.txt")))
+        self.assertEqual(processed, ConsoleSection("Processed", ("Rows: 3",)))
+
+    def test_print_step_header_uses_numbered_section_shape(self):
+        stdout = io.StringIO()
+
+        with patch("sys.stdout", stdout):
+            print_step_header("Discogs playlist splitter", step_index=4, total_steps=5)
+
+        self.assertEqual(
+            stdout.getvalue().splitlines(),
+            [
+                "",
+                "Step 4/5",
+                "--------",
+                "Running: Discogs playlist splitter",
+            ],
+        )
 
 
 if __name__ == "__main__":

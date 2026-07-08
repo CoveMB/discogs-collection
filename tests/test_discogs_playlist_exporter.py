@@ -623,7 +623,7 @@ class PlaylistExporterTests(unittest.TestCase):
         self.assertNotIn("Added Tracks By Playlist", output.getvalue())
         self.assertNotIn("Beta Artist | Beta One | Beta Album | track 1 | Release ID 222", output.getvalue())
         self.assertNotIn("- Discogs - Breakbeat: collection/playlists/Discogs - Breakbeat.csv", output.getvalue())
-        self.assertIn("Playlist Release Changes\n------------------------", output.getvalue())
+        self.assertIn("Playlist release changes\n------------------------", output.getvalue())
         self.assertIn("222 | Beta Artist | Beta Album | 1 track row", output.getvalue())
 
     def test_format_playlist_release_change_lines_collapses_unchanged_playlists(self):

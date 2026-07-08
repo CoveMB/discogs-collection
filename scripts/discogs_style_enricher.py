@@ -35,14 +35,13 @@ from shared.discogs_api import (
     parse_int_header,
     parse_retry_after_seconds,
 )
-from shared.cli import run_cli
+from shared.cli import console_section, print_cli_summary, run_cli
 from shared.discogs_columns import GENRE_COLUMN, RELEASE_ID_COLUMN, STYLE_COLUMN, move_release_id_to_front
 from shared.files import read_csv_file, write_csv_file, write_json_file
 from shared.progress import ProgressReporter
 from shared.reports import (
     format_report_section,
     format_report_title,
-    print_report_section,
     script_report_path,
     write_text_report,
 )
@@ -1200,10 +1199,22 @@ def print_summary(summary: RunSummary) -> None:
         file_lines.append(f"Seen terms: {summary.seen_terms_path}")
     if summary.processed_export_path:
         file_lines.append(f"Processed export: {summary.processed_export_path}")
-    print_report_section("Files", file_lines)
-    print_report_section(
-        "Processed",
-        [
+    extra_sections = []
+    if summary.seen_terms_path and has_new_discogs_terms(summary):
+        extra_sections.append(
+            console_section(
+                "Styles and Genres",
+                [
+                    f"New styles or genres found, add them to your playlist mapper config if desired: {summary.seen_terms_path}",
+                    "",
+                    f"New styles: {len(summary.new_styles)}",
+                    f"New genres: {len(summary.new_genres)}",
+                ],
+            )
+        )
+    print_cli_summary(
+        files=file_lines,
+        processed=[
             f"Input export rows: {summary.input_rows}",
             f"Master rows before: {summary.master_rows_before}",
             f"Output rows: {summary.output_rows}",
@@ -1215,17 +1226,8 @@ def print_summary(summary: RunSummary) -> None:
             f"Left blank / not sure: {summary.blank_count}",
             f"Lookup errors: {summary.error_count}",
         ],
+        extra_sections=extra_sections,
     )
-    if summary.seen_terms_path and has_new_discogs_terms(summary):
-        print_report_section(
-            "Styles and Genres",
-            [
-                f"New styles or genres found, add them to your playlist mapper config if desired: {summary.seen_terms_path}",
-                "",
-                f"New styles: {len(summary.new_styles)}",
-                f"New genres: {len(summary.new_genres)}",
-            ],
-        )
 
 
 def enrichment_exit_code(summary: RunSummary) -> int:

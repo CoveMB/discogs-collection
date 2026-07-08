@@ -9,13 +9,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from shared.cli import run_cli
+from shared.cli import print_cli_summary, run_cli
 from shared.files import read_csv_file, write_csv_file
 from shared.playlist_selection import resolve_playlist_master_paths
 from shared.reports import (
     format_report_section,
     format_report_title,
-    print_report_section,
     script_report_path,
     write_text_report,
 )
@@ -638,15 +637,11 @@ def write_report(
 
 
 def print_summary(report_path: Path, summaries: Sequence[PlaylistSplitSummary]) -> None:
-    print_report_section(
-        "Files",
-        [
+    print_cli_summary(
+        files=[
             f"Report: {report_path}",
         ],
-    )
-    print_report_section(
-        "Processed",
-        [
+        processed=[
             f"Playlists: {len(summaries)}",
             f"Split CSVs written: {sum(len(summary.written_split_paths) for summary in summaries)}",
             f"Split CSVs updated: {sum(len(summary.updated_split_paths) for summary in summaries)}",

@@ -33,7 +33,8 @@ from shared.publisher_config import (
     PublisherConfig,
     load_or_create_publisher_config,
 )
-from shared.reports import format_report_section, format_report_title, print_report_section, script_report_path, write_text_report
+from shared.cli import print_cli_summary
+from shared.reports import format_report_section, format_report_title, script_report_path, write_text_report
 from shared.workflow_paths import (
     DEFAULT_ON_THE_FLY_PLAYLIST_DIRECTORY,
     DEFAULT_SPOTIFY_MATCH_CACHE_PATH,
@@ -366,9 +367,8 @@ def write_release_playlist_report(summary: ReleasePlaylistSummary) -> None:
 
 
 def print_summary(summary: ReleasePlaylistSummary) -> None:
-    print_report_section(
-        "Files",
-        [
+    print_cli_summary(
+        files=[
             f"Master CSV: {summary.master_path}",
             f"Report: {summary.report_path}",
             *(
@@ -377,10 +377,7 @@ def print_summary(summary: ReleasePlaylistSummary) -> None:
                 else []
             ),
         ],
-    )
-    print_report_section(
-        "Processed",
-        [
+        processed=[
             f"Playlist: {summary.playlist_name}",
             f"Unique release IDs: {len(summary.release_ids)}",
             f"Duplicate release IDs skipped: {len(summary.duplicate_release_ids)}",

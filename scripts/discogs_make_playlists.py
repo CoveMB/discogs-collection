@@ -13,6 +13,7 @@ import discogs_playlist_mapper as mapper
 import discogs_playlist_splitter as splitter
 import discogs_style_enricher as enricher
 from publishers.spotify import publish_playlist as spotify_publisher
+from shared.cli import console_section, print_console_sections, print_step_header
 from shared.cli_args import append_cli_option as append_option
 from shared.debug_log import DebugLog, build_debug_logger
 from shared.publisher_config import (
@@ -135,8 +136,8 @@ def available_playlist_publishers(supported_publishers: Sequence[str] | None = N
 
 def publisher_disabled_message() -> str:
     return (
-        "\nPlaylist publishing skipped because the resolved publisher is none. "
-        f"Run with --publisher {', '.join(available_playlist_publishers())} to publish the playlist. "
+        "Playlist publishing skipped because the resolved publisher is none. "
+        f"Run with --publisher {', '.join(available_playlist_publishers())} to publish the playlist."
     )
 
 
@@ -211,7 +212,7 @@ def resolve_publisher(args: argparse.Namespace) -> str:
 
 
 def skip_publisher(_argv: Sequence[str] | None = None) -> int:
-    print(publisher_disabled_message())
+    print_console_sections([console_section("Publisher", [publisher_disabled_message()])])
     return 0
 
 
@@ -246,8 +247,7 @@ def run_step(
             f"step_start index={step_index} total={total_steps} label={label} "
             f"arg_count={len(step_args)} options={step_option_names(step_args)}"
         )
-    print(f"\n------------------------------------")
-    print(f"\nRunning {label}...")
+    print_step_header(label, step_index=step_index, total_steps=total_steps)
     exit_code = step_main(step_args)
     normalized_exit_code = 0 if exit_code is None else int(exit_code)
     if debug_log:

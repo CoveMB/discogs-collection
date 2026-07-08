@@ -1765,6 +1765,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertEqual(client.replace_calls, [])
         self.assertIn("Playlist Discogs - House does not exist, creating", info_lines)
         self.assertIn("Spotify playlist publish report", report_text)
+        self.assertIn("Spotify playlist publish report\n===============================", report_text)
         self.assertIn("Added tracks: 1", report_text)
         self.assertIn("Tracks added", report_text)
         self.assertIn("Discogs - House | 111 | 1 | Alpha Artist | Alpha One | added | spotify:track:alpha", report_text)
@@ -2532,7 +2533,9 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertNotIn("------------------------------------", output)
         self.assertNotIn("Running Spotify playlist publisher...", output)
-        self.assertIn("Spotify publish report:", output)
+        self.assertIn("Files\n-----\nReport:", output)
+        self.assertIn("Processed\n---------", output)
+        self.assertIn("Tracks: 0", output)
 
     def test_main_does_not_log_spotify_rate_limit_waits(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

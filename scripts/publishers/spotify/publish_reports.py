@@ -76,7 +76,7 @@ def build_publish_summary(
 
 
 def write_publish_report(path: Path, summary: SpotifyPublishSummary) -> None:
-    title = "Spotify playlist publish report\n" if summary.apply else "Spotify playlist publish dry-run report\n"
+    title = "Spotify playlist publish report" if summary.apply else "Spotify playlist publish dry-run report"
     lines = format_report_title(title)
     lines.extend(
         format_report_section(
@@ -374,4 +374,3 @@ def format_field_comparison(label: str, discogs_value: str, spotify_value: str, 
         f"    {label}: {status} "
         f"(Discogs: {display_report_value(discogs_value)}; Spotify: {display_report_value(spotify_value)})"
     )
-

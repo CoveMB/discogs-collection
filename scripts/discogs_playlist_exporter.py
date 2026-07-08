@@ -32,7 +32,7 @@ from discogs_tracklists import (
     tracklist_lookup_from_cache_record,
     tracklist_lookup_to_cache_record,
 )
-from shared.cli import run_cli
+from shared.cli import console_section, print_cli_summary, run_cli
 from shared.discogs_columns import RELEASE_ID_COLUMN
 from shared.files import read_csv_file, write_csv_file
 from shared.playlist_selection import playlist_master_path, safe_playlist_filename
@@ -40,7 +40,6 @@ from shared.progress import ProgressReporter
 from shared.reports import (
     format_report_section,
     format_report_title,
-    print_report_section,
     script_report_path,
     write_text_report,
 )
@@ -646,26 +645,24 @@ def format_playlist_release_change_lines(changes: Sequence[PlaylistReleaseChange
 
 
 def print_summary(summary: PlaylistExportSummary) -> None:
-    print_report_section(
-        "Files",
-        [
+    print_cli_summary(
+        files=[
             f"Output directory: {summary.output_directory}",
             f"Report: {summary.report_path}",
         ],
-    )
-    print_report_section(
-        "Processed",
-        [
+        processed=[
             f"Input rows: {summary.input_rows}",
             f"Exported playlists: {summary.playlist_count}",
             f"Output track rows: {summary.track_row_count}",
             f"Release-level fallback rows: {summary.fallback_row_count}",
             f"Skipped rows without playlists: {summary.skipped_unassigned_count}",
         ],
-    )
-    print_report_section(
-        "Playlist Release Changes",
-        format_playlist_release_change_lines(summary.playlist_release_changes),
+        extra_sections=(
+            console_section(
+                "Playlist release changes",
+                format_playlist_release_change_lines(summary.playlist_release_changes),
+            ),
+        ),
     )
 
 
