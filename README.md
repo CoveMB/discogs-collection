@@ -208,6 +208,10 @@ from the combined workflow, pass `--publisher spotify` or set
 resolved Spotify publisher to preview changes without creating or updating
 playlists.
 
+Pass `--skip-publish-playlist` to skip the final publisher for one run, even
+when the publisher config defaults to Spotify. This is a convenience alias for
+`--publisher none`.
+
 When Spotify publishing is enabled, the combined workflow accepts
 `--max-new-searches-per-run N` and passes it to the Spotify publisher. Use `0`
 for an uncapped publisher run.
@@ -1255,6 +1259,10 @@ Combined workflow options:
     none, so the final workflow step prints a skip notice. When resolved to
     spotify, the final workflow step runs the Spotify publisher after split CSVs
     are written.
+
+--skip-publish-playlist
+    Skip the final playlist publisher for this run. This is equivalent to
+    --publisher none and cannot be combined with --publisher.
 
 --publishing-dry-run
     Preview playlist publishing without creating or updating Spotify playlists.

@@ -65,7 +65,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--debug-log", type=Path, help="Write sanitized make-playlists pipeline debug logs to this path.")
     parser.add_argument("--regenerate-splits", help="Playlist folder/display name/path to regenerate, or all, passed to the splitter.")
     parser.add_argument("--publisher-config", type=Path, default=DEFAULT_PUBLISHER_CONFIG_PATH, help="Publisher JSON config. Defaults to config/publisher.json.")
-    parser.add_argument("--publisher", choices=SUPPORTED_MAIN_PUBLISHERS, help="Publisher override for the workflow. Omit to use default_publisher from the publisher config.")
+    publisher_group = parser.add_mutually_exclusive_group()
+    publisher_group.add_argument("--publisher", choices=SUPPORTED_MAIN_PUBLISHERS, help="Publisher override for the workflow. Omit to use default_publisher from the publisher config.")
+    publisher_group.add_argument(
+        "--skip-publish-playlist",
+        action="store_const",
+        const=NO_PUBLISHER,
+        dest="publisher",
+        help="Skip the final playlist publisher for this run. Equivalent to --publisher none.",
+    )
     parser.add_argument("--publishing-dry-run", action="store_true", help="Preview playlist publishing without creating or updating Spotify playlists.")
     parser.add_argument("--refresh-existing", action="store_true", help="Ask the enricher to replace existing Style and Genre values.")
     parser.add_argument("--no-seen-terms", action="store_true", help="Disable seen Discogs terms tracking in the enricher.")

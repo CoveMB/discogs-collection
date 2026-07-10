@@ -499,6 +499,61 @@ class DiscogsMakePlaylistsTests(unittest.TestCase):
 
         self.assertEqual(publisher, "none")
 
+    def test_skip_publish_playlist_alias_overrides_configured_spotify_publisher(self):
+        calls: list[str] = []
+
+        def record_step(name: str):
+            def step(_argv):
+                calls.append(name)
+                return 0
+
+            return step
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            publisher_config_path = Path(temporary_directory) / "publisher.json"
+            publisher_config_path.write_text(
+                json.dumps(
+                    {
+                        "default_publisher": "spotify",
+                        "playlist_prefix": "Prefix ",
+                        "playlist_suffix": " Suffix",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(maker.enricher, "main", side_effect=record_step("enricher")),
+                patch.object(maker.mapper, "main", side_effect=record_step("mapper")),
+                patch.object(maker.exporter, "main", side_effect=record_step("exporter")),
+                patch.object(maker.splitter, "main", side_effect=record_step("splitter")),
+                patch.object(spotify_publisher, "main") as publisher_main,
+                patch("sys.stdout", new_callable=io.StringIO) as stdout,
+            ):
+                exit_code = maker.main(
+                    [
+                        "--publisher-config",
+                        str(publisher_config_path),
+                        "--skip-publish-playlist",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls, ["enricher", "mapper", "exporter", "splitter"])
+        self.assertIn("Playlist publishing skipped because the resolved publisher is none.", stdout.getvalue())
+        publisher_main.assert_not_called()
+
+    def test_skip_publish_playlist_alias_rejects_publisher_override(self):
+        stderr = io.StringIO()
+        with (
+            patch("sys.stderr", stderr),
+            self.assertRaises(SystemExit) as exit_context,
+        ):
+            maker.parse_args(["--publisher", "spotify", "--skip-publish-playlist"])
+
+        self.assertEqual(exit_context.exception.code, 2)
+        self.assertIn("not allowed with argument --publisher", stderr.getvalue())
+
     def test_invalid_publisher_config_stops_before_workflow_steps(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             publisher_config_path = Path(temporary_directory) / "publisher.json"
