@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 
@@ -70,6 +70,13 @@ from publishers.spotify.publish_reports import (  # noqa: E402
     write_dry_run_report,
     write_publish_report,
 )
+from publishers.spotify.publish_state import (  # noqa: E402
+    SpotifyPublishState,
+    load_spotify_publish_state,
+    record_spotify_publish_state_track,
+    save_spotify_publish_state,
+    spotify_publish_state_has_track,
+)
 from publishers.spotify.publish_types import (  # noqa: E402
     ADDED,
     ALREADY_PRESENT,
@@ -114,12 +121,41 @@ from shared.tunemymusic import TUNEMYMUSIC_COLUMNS, missing_tunemymusic_columns 
 from shared.workflow_paths import (  # noqa: E402
     DEFAULT_PLAYLIST_OUTPUT_DIRECTORY as SHARED_PLAYLIST_OUTPUT_DIRECTORY,
     DEFAULT_SPOTIFY_MATCH_CACHE_PATH,
+    DEFAULT_SPOTIFY_PUBLISH_STATE_CACHE_PATH,
 )
 
 
 DEFAULT_PLAYLIST_OUTPUT_DIRECTORY = SHARED_PLAYLIST_OUTPUT_DIRECTORY
 DEFAULT_MATCH_CACHE_PATH = DEFAULT_SPOTIFY_MATCH_CACHE_PATH
+DEFAULT_PUBLISH_STATE_CACHE_PATH = DEFAULT_SPOTIFY_PUBLISH_STATE_CACHE_PATH
 PLAYLIST_DESCRIPTION = "Generated from Discogs collection"
+
+
+@dataclass(frozen=True)
+class PendingAppendTrack:
+    decision_index: int
+    identity_key: str
+    spotify_uri: str
+    source_position: int
+    known_to_publisher: bool
+    final_item: FinalPlaylistItem
+
+
+@dataclass(frozen=True)
+class AppendWriteOperation:
+    decision_index: int
+    identity_key: str
+    spotify_uri: str
+    source_position: int
+    position: int | None
+    known_to_publisher: bool
+    final_item: FinalPlaylistItem
+
+
+@dataclass(frozen=True)
+class AppendPlaylistPlan:
+    final_items: tuple[FinalPlaylistItem, ...]
+    write_operations: tuple[AppendWriteOperation, ...]
 
 
 def search_spotify_track(
@@ -256,6 +292,7 @@ def publish_spotify_playlists(
     playlist_names_by_master_path: Mapping[Path, str] | None = None,
     debug_log: DebugLog | None = None,
     match_cache_path: Path = DEFAULT_MATCH_CACHE_PATH,
+    publish_state_cache_path: Path | None = None,
     publisher_config: PublisherConfig | None = None,
     apply: bool = True,
     publisher_sync_mode: str = APPEND_SYNC_MODE,
@@ -280,7 +317,9 @@ def publish_spotify_playlists(
         allow_all_selector=False,
     )
     playlist_name_overrides = normalize_playlist_names_by_master_path(playlist_names_by_master_path)
+    resolved_publish_state_cache_path = publish_state_cache_path or default_publish_state_cache_path(match_cache_path)
     match_cache = load_spotify_track_match_cache(match_cache_path)
+    publish_state = load_spotify_publish_state(resolved_publish_state_cache_path)
     timestamp = utc_timestamp()
     spotify_playlists = spotify_client.list_current_user_playlists(access_token=access_token)
     current_user_id = spotify_client.get_current_user_id(access_token=access_token)
@@ -318,46 +357,50 @@ def publish_spotify_playlists(
             )
             context_index = len(playlist_contexts)
             playlist_contexts.append(context)
-            if publisher_sync_mode == APPEND_SYNC_MODE:
-                final_items.extend(existing_final_playlist_items(target_playlist_name, existing_items))
             planned_write_uris: list[str] = []
-            pending_decision_indexes: list[int] = []
-            pending_final_item_indexes: list[int] = []
-            pending_uris: list[str] = []
+            append_candidates: list[PendingAppendTrack] = []
+            source_positions_by_identity = source_identity_positions_by_identity(target_playlist_name, playlist_tracks)
+            source_tracks_by_identity = source_tracks_by_identity_key(target_playlist_name, playlist_tracks)
             seen_source_identity_keys: set[str] = set()
             existing_identity_keys = {
                 spotify_playlist_item_identity_key(target_playlist_name, item)
                 for item in existing_items
             }
             existing_incomplete_spotify_uris = incomplete_spotify_playlist_item_uris(existing_items)
-            for track in playlist_tracks:
+            for source_position, track in enumerate(playlist_tracks, start=1):
                 cached_match = None
                 if not refresh_match_cache:
                     cached_match = cached_track_match(track, match_cache, seen_at=timestamp)
                 if cached_match is None and new_search_budget_reached(search_count, max_new_searches_per_run):
-                    if publisher_sync_mode == APPEND_SYNC_MODE and apply:
-                        while pending_uris:
-                            spotify_playlists, pending_decision_indexes, pending_final_item_indexes, pending_uris = flush_incremental_append_batch(
-                                spotify_client=spotify_client,
-                                access_token=access_token,
-                                context_index=context_index,
-                                playlist_contexts=playlist_contexts,
-                                spotify_playlists=spotify_playlists,
-                                current_user_id=current_user_id,
-                                pending_decision_indexes=pending_decision_indexes,
-                                pending_final_item_indexes=pending_final_item_indexes,
-                                pending_uris=pending_uris,
-                                decisions=decisions,
-                                final_items=final_items,
-                                report_path=report_path,
-                                cache_path=match_cache_path,
-                                match_cache=match_cache,
-                                cache_hit_count=cache_hit_count,
-                                search_count=search_count,
-                                searched_row_count=searched_row_count,
-                                run_status=search_budget_run_status(search_count),
-                            )
+                    if publisher_sync_mode == APPEND_SYNC_MODE:
+                        final_items, playlist_contexts, spotify_playlists = finalize_append_playlist(
+                            spotify_client=spotify_client,
+                            access_token=access_token,
+                            context_index=context_index,
+                            playlist_contexts=playlist_contexts,
+                            existing_items=existing_items,
+                            append_candidates=append_candidates,
+                            source_positions_by_identity=source_positions_by_identity,
+                            source_tracks_by_identity=source_tracks_by_identity,
+                            decisions=decisions,
+                            final_items=final_items,
+                            spotify_playlists=spotify_playlists,
+                            current_user_id=current_user_id,
+                            publish_state=publish_state,
+                            publish_state_cache_path=resolved_publish_state_cache_path,
+                            report_path=report_path,
+                            match_cache_path=match_cache_path,
+                            match_cache=match_cache,
+                            apply=apply,
+                            cache_hit_count=cache_hit_count,
+                            search_count=search_count,
+                            searched_row_count=searched_row_count,
+                            timestamp=timestamp,
+                            run_status=search_budget_run_status(search_count),
+                        )
                     save_spotify_track_match_cache(match_cache_path, match_cache)
+                    if apply and publisher_sync_mode == APPEND_SYNC_MODE:
+                        save_spotify_publish_state(resolved_publish_state_cache_path, publish_state)
                     return write_publish_summary(
                         decisions=tuple(decisions),
                         final_items=tuple(reindex_final_items(final_items)),
@@ -404,41 +447,69 @@ def publish_spotify_playlists(
                     decision_index = len(decisions)
                     decisions.append(publish_decision)
                     identity_key = publish_decision_identity_key(publish_decision)
+                    if identity_key:
+                        source_positions_by_identity.setdefault(identity_key, source_position)
+                        source_tracks_by_identity.setdefault(identity_key, track)
                     if publish_decision.status in {WOULD_ADD, ADDED, WOULD_INCLUDE, INCLUDED}:
                         seen_source_identity_keys.add(identity_key)
-                        if publisher_sync_mode == APPEND_SYNC_MODE and apply:
-                            pending_decision_indexes.append(decision_index)
-                            pending_uris.append(publish_decision.spotify_uri)
+                        if publisher_sync_mode == APPEND_SYNC_MODE:
+                            known_to_publisher = spotify_publish_state_has_track(
+                                publish_state,
+                                target_playlist_name,
+                                identity_key,
+                            )
+                            publish_decision = replace(
+                                publish_decision,
+                                reason=append_publish_reason(known_to_publisher),
+                            )
+                            decisions[decision_index] = publish_decision
+                            append_candidates.append(
+                                PendingAppendTrack(
+                                    decision_index=decision_index,
+                                    identity_key=identity_key,
+                                    spotify_uri=publish_decision.spotify_uri,
+                                    source_position=source_position,
+                                    known_to_publisher=known_to_publisher,
+                                    final_item=final_playlist_item_from_decision(source_position, publish_decision),
+                                )
+                            )
                         else:
                             planned_write_uris.append(publish_decision.spotify_uri)
-                        final_item_index = len(final_items)
-                        final_items.append(final_playlist_item_from_decision(len(final_items) + 1, publish_decision))
-                        if publisher_sync_mode == APPEND_SYNC_MODE and apply:
-                            pending_final_item_indexes.append(final_item_index)
+                            final_items.append(final_playlist_item_from_decision(len(final_items) + 1, publish_decision))
                     elif identity_key and publish_decision.status in {ALREADY_PRESENT, DUPLICATE_IN_SOURCE}:
                         seen_source_identity_keys.add(identity_key)
                     if match_source == MATCH_SOURCE_SEARCH:
                         cache_track_match(match_cache, decision, matched_at=timestamp)
-                    while publisher_sync_mode == APPEND_SYNC_MODE and apply and len(pending_uris) >= 100:
-                        spotify_playlists, pending_decision_indexes, pending_final_item_indexes, pending_uris = flush_incremental_append_batch(
+                    if publisher_sync_mode == APPEND_SYNC_MODE and apply and len(append_candidates) >= 100:
+                        final_items, playlist_contexts, spotify_playlists = finalize_append_playlist(
                             spotify_client=spotify_client,
                             access_token=access_token,
                             context_index=context_index,
                             playlist_contexts=playlist_contexts,
-                            spotify_playlists=spotify_playlists,
-                            current_user_id=current_user_id,
-                            pending_decision_indexes=pending_decision_indexes,
-                            pending_final_item_indexes=pending_final_item_indexes,
-                            pending_uris=pending_uris,
+                            existing_items=existing_items,
+                            append_candidates=append_candidates,
+                            source_positions_by_identity=source_positions_by_identity,
+                            source_tracks_by_identity=source_tracks_by_identity,
                             decisions=decisions,
                             final_items=final_items,
+                            spotify_playlists=spotify_playlists,
+                            current_user_id=current_user_id,
+                            publish_state=publish_state,
+                            publish_state_cache_path=resolved_publish_state_cache_path,
                             report_path=report_path,
-                            cache_path=match_cache_path,
+                            match_cache_path=match_cache_path,
                             match_cache=match_cache,
+                            apply=apply,
                             cache_hit_count=cache_hit_count,
                             search_count=search_count,
                             searched_row_count=searched_row_count,
+                            timestamp=timestamp,
                         )
+                        context = playlist_contexts[context_index]
+                        existing_items = spotify_playlist_items_from_final_items(
+                            playlist_final_items(final_items, target_playlist_name)
+                        )
+                        append_candidates = []
                     if debug_log:
                         debug_log(f"publish_track_done index={processed_track_count} status={publish_decision.status} source={match_source}")
                     if should_stop_for_new_search_budget(
@@ -447,29 +518,35 @@ def publish_spotify_playlists(
                         processed_track_count=processed_track_count,
                         total_tracks=total_tracks,
                     ):
-                        if publisher_sync_mode == APPEND_SYNC_MODE and apply:
-                            while pending_uris:
-                                spotify_playlists, pending_decision_indexes, pending_final_item_indexes, pending_uris = flush_incremental_append_batch(
-                                    spotify_client=spotify_client,
-                                    access_token=access_token,
-                                    context_index=context_index,
-                                    playlist_contexts=playlist_contexts,
-                                    spotify_playlists=spotify_playlists,
-                                    current_user_id=current_user_id,
-                                    pending_decision_indexes=pending_decision_indexes,
-                                    pending_final_item_indexes=pending_final_item_indexes,
-                                    pending_uris=pending_uris,
-                                    decisions=decisions,
-                                    final_items=final_items,
-                                    report_path=report_path,
-                                    cache_path=match_cache_path,
-                                    match_cache=match_cache,
-                                    cache_hit_count=cache_hit_count,
-                                    search_count=search_count,
-                                    searched_row_count=searched_row_count,
-                                    run_status=search_budget_run_status(search_count),
-                                )
+                        if publisher_sync_mode == APPEND_SYNC_MODE:
+                            final_items, playlist_contexts, spotify_playlists = finalize_append_playlist(
+                                spotify_client=spotify_client,
+                                access_token=access_token,
+                                context_index=context_index,
+                                playlist_contexts=playlist_contexts,
+                                existing_items=existing_items,
+                                append_candidates=append_candidates,
+                                source_positions_by_identity=source_positions_by_identity,
+                                source_tracks_by_identity=source_tracks_by_identity,
+                                decisions=decisions,
+                                final_items=final_items,
+                                spotify_playlists=spotify_playlists,
+                                current_user_id=current_user_id,
+                                publish_state=publish_state,
+                                publish_state_cache_path=resolved_publish_state_cache_path,
+                                report_path=report_path,
+                                match_cache_path=match_cache_path,
+                                match_cache=match_cache,
+                                apply=apply,
+                                cache_hit_count=cache_hit_count,
+                                search_count=search_count,
+                                searched_row_count=searched_row_count,
+                                timestamp=timestamp,
+                                run_status=search_budget_run_status(search_count),
+                            )
                         save_spotify_track_match_cache(match_cache_path, match_cache)
+                        if apply and publisher_sync_mode == APPEND_SYNC_MODE:
+                            save_spotify_publish_state(resolved_publish_state_cache_path, publish_state)
                         return write_publish_summary(
                             decisions=tuple(decisions),
                             final_items=tuple(reindex_final_items(final_items)),
@@ -486,27 +563,31 @@ def publish_spotify_playlists(
                     if progress:
                         progress.update(processed_track_count)
 
-            if publisher_sync_mode == APPEND_SYNC_MODE and apply:
-                while pending_uris:
-                    spotify_playlists, pending_decision_indexes, pending_final_item_indexes, pending_uris = flush_incremental_append_batch(
-                        spotify_client=spotify_client,
-                        access_token=access_token,
-                        context_index=context_index,
-                        playlist_contexts=playlist_contexts,
-                        spotify_playlists=spotify_playlists,
-                        current_user_id=current_user_id,
-                        pending_decision_indexes=pending_decision_indexes,
-                        pending_final_item_indexes=pending_final_item_indexes,
-                        pending_uris=pending_uris,
-                        decisions=decisions,
-                        final_items=final_items,
-                        report_path=report_path,
-                        cache_path=match_cache_path,
-                        match_cache=match_cache,
-                        cache_hit_count=cache_hit_count,
-                        search_count=search_count,
-                        searched_row_count=searched_row_count,
-                    )
+            if publisher_sync_mode == APPEND_SYNC_MODE:
+                final_items, playlist_contexts, spotify_playlists = finalize_append_playlist(
+                    spotify_client=spotify_client,
+                    access_token=access_token,
+                    context_index=context_index,
+                    playlist_contexts=playlist_contexts,
+                    existing_items=existing_items,
+                    append_candidates=append_candidates,
+                    source_positions_by_identity=source_positions_by_identity,
+                    source_tracks_by_identity=source_tracks_by_identity,
+                    decisions=decisions,
+                    final_items=final_items,
+                    spotify_playlists=spotify_playlists,
+                    current_user_id=current_user_id,
+                    publish_state=publish_state,
+                    publish_state_cache_path=resolved_publish_state_cache_path,
+                    report_path=report_path,
+                    match_cache_path=match_cache_path,
+                    match_cache=match_cache,
+                    apply=apply,
+                    cache_hit_count=cache_hit_count,
+                    search_count=search_count,
+                    searched_row_count=searched_row_count,
+                    timestamp=timestamp,
+                )
             else:
                 planned_write_uris_by_playlist[target_playlist_name] = tuple(planned_write_uris)
     except (SpotifyRateLimitDeferredError, SpotifyRateLimitRetriesExhaustedError):
@@ -537,6 +618,8 @@ def publish_spotify_playlists(
             progress.finish()
 
     save_spotify_track_match_cache(match_cache_path, match_cache)
+    if apply and publisher_sync_mode == APPEND_SYNC_MODE:
+        save_spotify_publish_state(resolved_publish_state_cache_path, publish_state)
     summary = write_publish_summary(
         decisions=tuple(decisions),
         final_items=tuple(reindex_final_items(final_items)),
@@ -606,46 +689,78 @@ def append_checkpoint_run_status(search_count: int) -> str:
     return f"checkpoint - append progress saved after {search_count} searches; run still in progress"
 
 
-def flush_incremental_append_batch(
+def finalize_append_playlist(
     spotify_client: SpotifyClient,
     access_token: str,
     context_index: int,
     playlist_contexts: list[PlaylistPublishContext],
+    existing_items: Sequence[SpotifyPlaylistItem],
+    append_candidates: Sequence[PendingAppendTrack],
+    source_positions_by_identity: Mapping[str, int],
+    source_tracks_by_identity: Mapping[str, PlaylistTrack],
     spotify_playlists: Sequence[SpotifyPlaylist],
     current_user_id: str,
-    pending_decision_indexes: list[int],
-    pending_final_item_indexes: list[int],
-    pending_uris: list[str],
     decisions: list[PlaylistPublishDecision],
     final_items: list[FinalPlaylistItem],
     report_path: Path,
-    cache_path: Path,
+    match_cache_path: Path,
     match_cache: Mapping[str, Mapping[str, object]],
+    publish_state: SpotifyPublishState,
+    publish_state_cache_path: Path,
+    apply: bool,
     cache_hit_count: int,
     search_count: int,
     searched_row_count: int = 0,
+    timestamp: str = "",
     run_status: str | None = None,
-) -> tuple[tuple[SpotifyPlaylist, ...], list[int], list[int], list[str]]:
-    if not pending_uris:
-        return tuple(spotify_playlists), pending_decision_indexes, pending_final_item_indexes, pending_uris
-    batch_uris = tuple(pending_uris[:100])
-    batch_decision_indexes = pending_decision_indexes[:100]
-    batch_final_item_indexes = pending_final_item_indexes[:100]
+) -> tuple[list[FinalPlaylistItem], list[PlaylistPublishContext], tuple[SpotifyPlaylist, ...]]:
     context = playlist_contexts[context_index]
+    observe_existing_publish_state_tracks(
+        publish_state=publish_state,
+        target_playlist_name=context.target_playlist_name,
+        existing_items=existing_items,
+        source_positions_by_identity=source_positions_by_identity,
+        source_tracks_by_identity=source_tracks_by_identity,
+        timestamp=timestamp,
+    )
+    plan = build_append_playlist_plan(
+        target_playlist_name=context.target_playlist_name,
+        existing_items=existing_items,
+        append_candidates=append_candidates,
+        source_positions_by_identity=source_positions_by_identity,
+        previous_final_items=playlist_final_items(final_items, context.target_playlist_name),
+    )
+    replace_final_items_for_playlist(final_items, context.target_playlist_name, plan.final_items)
+    if not apply:
+        return final_items, playlist_contexts, tuple(spotify_playlists)
+    if not plan.write_operations:
+        save_spotify_publish_state(publish_state_cache_path, publish_state)
+        return final_items, playlist_contexts, tuple(spotify_playlists)
+    applied_context = ensure_spotify_playlist_for_writes(
+        spotify_client=spotify_client,
+        access_token=access_token,
+        context=context,
+        has_writes=bool(plan.write_operations),
+    )
+    playlist_contexts[context_index] = applied_context
     try:
-        applied_context = apply_playlist_writes(
+        apply_append_write_operations(
             spotify_client=spotify_client,
             access_token=access_token,
-            context=context,
-            planned_write_uris=batch_uris,
-            publisher_sync_mode=APPEND_SYNC_MODE,
+            context=applied_context,
+            operations=plan.write_operations,
+            decisions=decisions,
+            final_items=final_items,
+            publish_state=publish_state,
+            timestamp=timestamp,
         )
     except (SpotifyApiError, ValueError) as error:
         playlist_contexts[context_index] = replace(
-            context,
-            info_message=f"{context.info_message}; publishing failed: {display_report_value(error)}",
+            applied_context,
+            info_message=f"{applied_context.info_message}; publishing failed: {display_report_value(error)}",
         )
-        save_spotify_track_match_cache(cache_path, match_cache)
+        save_spotify_track_match_cache(match_cache_path, match_cache)
+        save_spotify_publish_state(publish_state_cache_path, publish_state)
         write_publish_summary(
             decisions=tuple(decisions),
             final_items=tuple(reindex_final_items(final_items)),
@@ -656,16 +771,12 @@ def flush_incremental_append_batch(
             cache_hit_count=cache_hit_count,
             search_count=search_count,
             searched_row_count=searched_row_count,
-            run_status=f"failed - publishing stopped while writing {context.target_playlist_name}",
+            run_status=f"failed - publishing stopped while writing {applied_context.target_playlist_name}",
         )
         raise
-    playlist_contexts[context_index] = applied_context
     updated_playlists = update_spotify_playlist_inventory(spotify_playlists, applied_context, current_user_id)
-    for decision_index in batch_decision_indexes:
-        decisions[decision_index] = replace(decisions[decision_index], status=ADDED)
-    for final_item_index in batch_final_item_indexes:
-        final_items[final_item_index] = replace(final_items[final_item_index], status=ADDED)
-    save_spotify_track_match_cache(cache_path, match_cache)
+    save_spotify_track_match_cache(match_cache_path, match_cache)
+    save_spotify_publish_state(publish_state_cache_path, publish_state)
     write_publish_summary(
         decisions=tuple(decisions),
         final_items=tuple(reindex_final_items(final_items)),
@@ -678,12 +789,242 @@ def flush_incremental_append_batch(
         searched_row_count=searched_row_count,
         run_status=run_status or append_checkpoint_run_status(search_count),
     )
-    return (
-        tuple(updated_playlists),
-        pending_decision_indexes[100:],
-        pending_final_item_indexes[100:],
-        pending_uris[100:],
+    return final_items, playlist_contexts, tuple(updated_playlists)
+
+
+def build_append_playlist_plan(
+    target_playlist_name: str,
+    existing_items: Sequence[SpotifyPlaylistItem],
+    append_candidates: Sequence[PendingAppendTrack],
+    source_positions_by_identity: Mapping[str, int],
+    previous_final_items: Sequence[FinalPlaylistItem] = (),
+) -> AppendPlaylistPlan:
+    previous_final_items_by_identity = {
+        final_playlist_item_identity_key(item): item
+        for item in previous_final_items
+    }
+    planned_items = [
+        append_plan_item_from_existing(
+            target_playlist_name,
+            item,
+            source_positions_by_identity,
+            previous_final_items_by_identity,
+        )
+        for item in existing_items
+    ]
+    operations_by_identity: dict[str, AppendWriteOperation] = {}
+    for candidate in sorted(append_candidates, key=lambda item: item.source_position):
+        final_item = replace(candidate.final_item, status=WOULD_ADD)
+        if candidate.known_to_publisher:
+            insert_index = append_restore_insert_index(planned_items, candidate.source_position)
+            planned_items.insert(
+                insert_index,
+                AppendPlanItem(
+                    identity_key=candidate.identity_key,
+                    source_position=candidate.source_position,
+                    final_item=final_item,
+                    pending_candidate=candidate,
+                ),
+            )
+        else:
+            planned_items.append(
+                AppendPlanItem(
+                    identity_key=candidate.identity_key,
+                    source_position=None,
+                    final_item=final_item,
+                    pending_candidate=candidate,
+                ),
+            )
+    final_items = tuple(item.final_item for item in planned_items)
+    for index, item in enumerate(planned_items):
+        candidate = item.pending_candidate
+        if not candidate:
+            continue
+        operations_by_identity[candidate.identity_key] = AppendWriteOperation(
+            decision_index=candidate.decision_index,
+            identity_key=candidate.identity_key,
+            spotify_uri=candidate.spotify_uri,
+            source_position=candidate.source_position,
+            position=index if candidate.known_to_publisher else None,
+            known_to_publisher=candidate.known_to_publisher,
+            final_item=item.final_item,
+        )
+    known_operations = tuple(
+        operation
+        for operation in operations_by_identity.values()
+        if operation.known_to_publisher
     )
+    new_operations = tuple(
+        sorted(
+            (operation for operation in operations_by_identity.values() if not operation.known_to_publisher),
+            key=lambda operation: operation.source_position,
+        )
+    )
+    return AppendPlaylistPlan(
+        final_items=final_items,
+        write_operations=known_operations + new_operations,
+    )
+
+
+@dataclass(frozen=True)
+class AppendPlanItem:
+    identity_key: str
+    source_position: int | None
+    final_item: FinalPlaylistItem
+    pending_candidate: PendingAppendTrack | None = None
+
+
+def append_plan_item_from_existing(
+    target_playlist_name: str,
+    item: SpotifyPlaylistItem,
+    source_positions_by_identity: Mapping[str, int],
+    previous_final_items_by_identity: Mapping[str, FinalPlaylistItem],
+) -> AppendPlanItem:
+    identity_key = spotify_playlist_item_identity_key(target_playlist_name, item)
+    previous_final_item = previous_final_items_by_identity.get(identity_key)
+    final_item = (
+        previous_final_item
+        if previous_final_item and previous_final_item.spotify_uri == item.uri
+        else FinalPlaylistItem(
+            playlist_name=target_playlist_name,
+            position=0,
+            status="existing",
+            spotify_uri=item.uri,
+            track_name=item.name,
+            artist_names=item.artists,
+            album_name=item.album_name,
+            source_track=None,
+        )
+    )
+    return AppendPlanItem(
+        identity_key=identity_key,
+        source_position=source_positions_by_identity.get(identity_key),
+        final_item=final_item,
+    )
+
+
+def append_restore_insert_index(planned_items: Sequence[AppendPlanItem], source_position: int) -> int:
+    for index, item in enumerate(planned_items):
+        if item.source_position is not None and item.source_position > source_position:
+            return index
+    return len(planned_items)
+
+
+def ensure_spotify_playlist_for_writes(
+    spotify_client: SpotifyClient,
+    access_token: str,
+    context: PlaylistPublishContext,
+    has_writes: bool,
+) -> PlaylistPublishContext:
+    if context.playlist_id or not has_writes:
+        return context
+    playlist = spotify_client.create_playlist(
+        access_token=access_token,
+        name=context.target_playlist_name,
+        public=False,
+        description=PLAYLIST_DESCRIPTION,
+    )
+    return replace(context, playlist_id=playlist.playlist_id)
+
+
+def apply_append_write_operations(
+    spotify_client: SpotifyClient,
+    access_token: str,
+    context: PlaylistPublishContext,
+    operations: Sequence[AppendWriteOperation],
+    decisions: list[PlaylistPublishDecision],
+    final_items: list[FinalPlaylistItem],
+    publish_state: SpotifyPublishState,
+    timestamp: str,
+) -> None:
+    for operation_group in grouped_append_write_operations(operations):
+        first_operation = operation_group[0]
+        spotify_client.add_playlist_items(
+            access_token=access_token,
+            playlist_id=context.playlist_id,
+            uris=tuple(operation.spotify_uri for operation in operation_group),
+            position=first_operation.position,
+        )
+        for operation in operation_group:
+            decisions[operation.decision_index] = replace(decisions[operation.decision_index], status=ADDED)
+            mark_final_item_applied(final_items, operation)
+            record_spotify_publish_state_track(
+                state=publish_state,
+                playlist_name=context.target_playlist_name,
+                identity_key=operation.identity_key,
+                spotify_uri=operation.spotify_uri,
+                source_position=operation.source_position,
+                track=decisions[operation.decision_index].track,
+                timestamp=timestamp,
+                event="published",
+            )
+
+
+def grouped_append_write_operations(operations: Sequence[AppendWriteOperation]) -> tuple[tuple[AppendWriteOperation, ...], ...]:
+    groups: list[tuple[AppendWriteOperation, ...]] = []
+    index = 0
+    while index < len(operations):
+        operation = operations[index]
+        if operation.position is not None:
+            groups.append((operation,))
+            index += 1
+            continue
+        append_group = tuple(operations[index:index + 100])
+        groups.append(append_group)
+        index += len(append_group)
+    return tuple(groups)
+
+
+def mark_final_item_applied(final_items: list[FinalPlaylistItem], operation: AppendWriteOperation) -> None:
+    for index, item in enumerate(final_items):
+        if item.status != WOULD_ADD or item.spotify_uri != operation.spotify_uri:
+            continue
+        if final_playlist_item_identity_key(item) != operation.identity_key:
+            continue
+        final_items[index] = replace(item, status=ADDED)
+        return
+
+
+def final_playlist_item_identity_key(item: FinalPlaylistItem) -> str:
+    return spotify_track_identity_key(
+        target_playlist_name=item.playlist_name,
+        artist_names=item.artist_names,
+        album_name=item.album_name,
+        track_name=item.track_name,
+    )
+
+
+def observe_existing_publish_state_tracks(
+    publish_state: SpotifyPublishState,
+    target_playlist_name: str,
+    existing_items: Sequence[SpotifyPlaylistItem],
+    source_positions_by_identity: Mapping[str, int],
+    source_tracks_by_identity: Mapping[str, PlaylistTrack],
+    timestamp: str,
+) -> None:
+    if not timestamp:
+        return
+    for item in existing_items:
+        identity_key = spotify_playlist_item_identity_key(target_playlist_name, item)
+        source_position = source_positions_by_identity.get(identity_key)
+        if source_position is None:
+            continue
+        record_spotify_publish_state_track(
+            state=publish_state,
+            playlist_name=target_playlist_name,
+            identity_key=identity_key,
+            spotify_uri=item.uri,
+            source_position=source_position,
+            track=source_tracks_by_identity.get(identity_key),
+            timestamp=timestamp,
+            event="observed",
+        )
+
+
+def append_publish_reason(known_to_publisher: bool) -> str:
+    if known_to_publisher:
+        return "Spotify artist, album, and track will be restored at its source-order position"
+    return "Spotify artist, album, and track is newly seen and will be appended to playlist"
 
 
 def resolve_track_match(
@@ -1001,12 +1342,77 @@ def existing_final_playlist_items(playlist_name: str, existing_items: Sequence[S
     )
 
 
+def replace_final_items_for_playlist(
+    final_items: list[FinalPlaylistItem],
+    playlist_name: str,
+    playlist_items: Sequence[FinalPlaylistItem],
+) -> None:
+    final_items[:] = [
+        item
+        for item in final_items
+        if item.playlist_name != playlist_name
+    ] + list(playlist_items)
+
+
+def playlist_final_items(
+    final_items: Sequence[FinalPlaylistItem],
+    playlist_name: str,
+) -> tuple[FinalPlaylistItem, ...]:
+    return tuple(item for item in final_items if item.playlist_name == playlist_name)
+
+
+def spotify_playlist_items_from_final_items(final_items: Sequence[FinalPlaylistItem]) -> tuple[SpotifyPlaylistItem, ...]:
+    return tuple(
+        SpotifyPlaylistItem(
+            uri=item.spotify_uri,
+            name=item.track_name,
+            artists=item.artist_names,
+            album_name=item.album_name,
+            position=index,
+        )
+        for index, item in enumerate(final_items)
+    )
+
+
 def spotify_playlist_item_identity_key(target_playlist_name: str, item: SpotifyPlaylistItem) -> str:
     return spotify_track_identity_key(
         target_playlist_name=target_playlist_name,
         artist_names=item.artists,
         album_name=item.album_name,
         track_name=item.name,
+    )
+
+
+def source_identity_positions_by_identity(
+    target_playlist_name: str,
+    tracks: Sequence[PlaylistTrack],
+) -> dict[str, int]:
+    positions: dict[str, int] = {}
+    for position, track in enumerate(tracks, start=1):
+        identity_key = source_track_identity_key(target_playlist_name, track)
+        if identity_key:
+            positions.setdefault(identity_key, position)
+    return positions
+
+
+def source_tracks_by_identity_key(
+    target_playlist_name: str,
+    tracks: Sequence[PlaylistTrack],
+) -> dict[str, PlaylistTrack]:
+    tracks_by_identity: dict[str, PlaylistTrack] = {}
+    for track in tracks:
+        identity_key = source_track_identity_key(target_playlist_name, track)
+        if identity_key:
+            tracks_by_identity.setdefault(identity_key, track)
+    return tracks_by_identity
+
+
+def source_track_identity_key(target_playlist_name: str, track: PlaylistTrack) -> str:
+    return spotify_track_identity_key(
+        target_playlist_name=target_playlist_name,
+        artist_names=(track.artist_name,),
+        album_name=track.album_name,
+        track_name=track.track_name,
     )
 
 
@@ -1281,6 +1687,12 @@ def default_report_path() -> Path:
     return script_report_path(__file__)
 
 
+def default_publish_state_cache_path(match_cache_path: Path) -> Path:
+    if match_cache_path == DEFAULT_MATCH_CACHE_PATH:
+        return DEFAULT_PUBLISH_STATE_CACHE_PATH
+    return match_cache_path.with_name(DEFAULT_PUBLISH_STATE_CACHE_PATH.name)
+
+
 def build_spotify_publisher_argv(
     *,
     env_file: Path | None = None,
@@ -1288,6 +1700,7 @@ def build_spotify_publisher_argv(
     report: Path | None = None,
     token_cache: Path | None = None,
     match_cache: Path | None = None,
+    publish_state_cache: Path | None = None,
     publisher_config: Path | None = None,
     debug_log: Path | None = None,
     reauthorize: bool = False,
@@ -1305,6 +1718,7 @@ def build_spotify_publisher_argv(
     append_cli_option(arguments, "--report", report)
     append_cli_option(arguments, "--token-cache", token_cache)
     append_cli_option(arguments, "--match-cache", match_cache)
+    append_cli_option(arguments, "--publish-state-cache", publish_state_cache)
     append_cli_option(arguments, "--publisher-config", publisher_config)
     append_cli_option(arguments, "--debug-log", debug_log)
     if reauthorize:
@@ -1331,6 +1745,7 @@ def build_spotify_publisher_namespace(
     report: Path | None = None,
     token_cache: Path = DEFAULT_TOKEN_CACHE_PATH,
     match_cache: Path = DEFAULT_MATCH_CACHE_PATH,
+    publish_state_cache: Path = DEFAULT_PUBLISH_STATE_CACHE_PATH,
     publisher_config: Path = DEFAULT_PUBLISHER_CONFIG_PATH,
     debug_log: Path | None = None,
     reauthorize: bool = False,
@@ -1349,6 +1764,7 @@ def build_spotify_publisher_namespace(
         report=report or default_report_path(),
         token_cache=token_cache,
         match_cache=match_cache,
+        publish_state_cache=publish_state_cache,
         publisher_config=publisher_config,
         debug_log=debug_log,
         reauthorize=reauthorize,
@@ -1383,6 +1799,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--report", type=Path, help="Publish report path. Defaults to reports/<timestamp>_publish_playlist.txt.")
     parser.add_argument("--token-cache", type=Path, default=DEFAULT_TOKEN_CACHE_PATH, help="Spotify token cache path.")
     parser.add_argument("--match-cache", type=Path, default=DEFAULT_MATCH_CACHE_PATH, help="Spotify track match cache path.")
+    parser.add_argument("--publish-state-cache", type=Path, default=DEFAULT_PUBLISH_STATE_CACHE_PATH, help="Spotify publish state cache path.")
     parser.add_argument("--publisher-config", type=Path, default=DEFAULT_PUBLISHER_CONFIG_PATH, help="Publisher JSON config. Defaults to config/publisher.json.")
     parser.add_argument("--debug-log", type=Path, help="Write sanitized Spotify publisher debug logs to this path.")
     parser.add_argument("--reauthorize", action="store_true", help="Force a fresh Spotify login before running the publisher.")
@@ -1452,6 +1869,7 @@ def run_spotify_publish_from_args(
         playlist_names_by_master_path=playlist_names_by_master_path,
         debug_log=debug_log,
         match_cache_path=args.match_cache,
+        publish_state_cache_path=args.publish_state_cache,
         publisher_config=resolved_publisher_config,
         apply=args.apply,
         publisher_sync_mode=args.publisher_sync_mode,

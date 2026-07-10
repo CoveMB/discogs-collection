@@ -241,19 +241,25 @@ class SpotifyClient:
         access_token: str,
         playlist_id: str,
         uris: Sequence[str],
+        position: int | None = None,
     ) -> tuple[str, ...]:
         snapshots: list[str] = []
         for batch in chunk_values(tuple(uris), 100):
+            body: dict[str, object] = {"uris": list(batch)}
+            if position is not None:
+                body["position"] = position
             request = HttpRequest(
                 method="POST",
                 url=f"{SPOTIFY_API_ROOT}/playlists/{urllib.parse.quote(playlist_id)}/items",
                 headers=spotify_json_headers(access_token),
-                body=json.dumps({"uris": list(batch)}).encode("utf-8"),
+                body=json.dumps(body).encode("utf-8"),
             )
             response = self.request_with_rate_limit_retries(request, operation_name="spotify_playlist_add_items")
             if response.status != 201:
                 raise SpotifyApiError(f"Spotify playlist add items failed with status {response.status}: {response.body}")
             snapshots.append(parse_snapshot_id(response.body))
+            if position is not None:
+                position += len(batch)
         return tuple(snapshots)
 
     def replace_playlist_items(

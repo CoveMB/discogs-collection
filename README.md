@@ -282,6 +282,17 @@ album, and track name. The publisher reads it before searching Spotify. It store
 `matched`, `ambiguous`, and `unmatched` decisions so later runs can avoid repeat
 searches. Search errors are not cached.
 
+Append publishing also keeps a small publish-state cache:
+
+```text
+collection/cache/spotify-publish-state.cache.json
+```
+
+This cache records tracks the publisher has seen in, or successfully added to, a
+target Spotify playlist. It is separate from the match cache because dry runs and
+failed searches can populate match data without proving that a track has ever
+belonged in the Spotify playlist.
+
 Preview the publisher without writing to Spotify:
 
 ```bash
@@ -339,15 +350,23 @@ has a different Spotify URI. Duplicate artist, album, and track matches inside
 the same source run are skipped and reported. The same artist and track can
 still be added when it appears on a different album.
 
+Append mode is source-aware. If a track is missing from Spotify but the
+publish-state cache shows that the publisher already knew that track for the
+target playlist, the script inserts it before the next current source-order
+anchor. Manual Spotify-only tracks keep their relative order. If the missing
+track is new to the publisher, the script appends it to the end. A track deleted
+before the publish-state cache ever observed it cannot be distinguished from a
+newly seen track, so the first source-aware run may still append that track.
+
 Append publishing is incremental. The publisher reads the playlist CSVs in
 source order and checks the local Spotify match cache before searching Spotify.
 For uncached rows, it searches up to 500 new tracks per run by default. Cache
 hits do not count against that limit. As matched tracks are found, the publisher
-writes append batches of up to 100 URIs, saves the match cache, and rewrites the
-report. When the search budget is reached, the run exits successfully with a
-partial run status. Later runs start from the CSVs again, reuse cached matches,
-fetch the current Spotify playlist contents, and skip tracks that are already
-present.
+writes source-aware append batches of up to 100 new URIs, saves the match cache
+and publish-state cache, and rewrites the report. When the search budget is
+reached, the run exits successfully with a partial run status. Later runs start
+from the CSVs again, reuse cached matches, fetch the current Spotify playlist
+contents, and skip tracks that are already present.
 
 To change the per-run search budget:
 
@@ -1434,6 +1453,10 @@ release_ids
 --match-cache PATH
     Spotify track match cache path. Defaults to
     collection/cache/spotify-track-matches.cache.json.
+
+--publish-state-cache PATH
+    Spotify publish-state cache path. Defaults to
+    collection/cache/spotify-publish-state.cache.json.
 
 --env-file PATH
     Local env file containing Spotify app settings. Defaults to .env.

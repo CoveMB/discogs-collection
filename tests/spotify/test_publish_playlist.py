@@ -20,9 +20,10 @@ from publishers.spotify.client import (
     SpotifyRateLimitRetriesExhaustedError,
 )
 from publishers.spotify.env import SpotifySettings
-from publishers.spotify.matching import SpotifyTrackCandidate
+from publishers.spotify.matching import PlaylistTrack, SpotifyTrackCandidate
 from publishers.spotify.authorization_flow import DEFAULT_AUTHORIZE_SCOPES
 from publishers.spotify.publish_playlist import dry_run_spotify_playlist_publish, publish_spotify_playlists
+from publishers.spotify.publish_state import record_spotify_publish_state_track, save_spotify_publish_state
 from discogs_playlist_exporter import safe_playlist_filename
 from shared.progress import ProgressReporter
 from shared.publisher_config import PublisherConfig
@@ -148,12 +149,18 @@ class PublishingSpotifyClient(FakeSpotifyClient):
         self.playlist_items_by_id[playlist_id] = []
         return playlist
 
-    def add_playlist_items(self, access_token, playlist_id, uris):
-        self.add_calls.append((playlist_id, tuple(uris)))
-        self.playlist_items_by_id.setdefault(playlist_id, []).extend(
+    def add_playlist_items(self, access_token, playlist_id, uris, position=None):
+        self.add_calls.append((playlist_id, tuple(uris), position))
+        new_items = [
             self.playlist_item_for_uri(uri)
             for uri in uris
-        )
+        ]
+        if position is None:
+            self.playlist_items_by_id.setdefault(playlist_id, []).extend(new_items)
+        else:
+            playlist_items = self.playlist_items_by_id.setdefault(playlist_id, [])
+            insert_position = max(0, min(position, len(playlist_items)))
+            playlist_items[insert_position:insert_position] = new_items
         return ("snapshot-add",) if uris else ()
 
     def replace_playlist_items(self, access_token, playlist_id, uris):
@@ -201,10 +208,10 @@ class InterruptedAfterCheckpointPublishingClient(PublishingSpotifyClient):
 
 
 class FailingSecondPlaylistPublishClient(PublishingSpotifyClient):
-    def add_playlist_items(self, access_token, playlist_id, uris):
+    def add_playlist_items(self, access_token, playlist_id, uris, position=None):
         if playlist_id == "playlist-techno":
             raise SpotifyApiError("Spotify playlist add items failed with status 500: temporary failure")
-        return super().add_playlist_items(access_token, playlist_id, uris)
+        return super().add_playlist_items(access_token, playlist_id, uris, position=position)
 
 
 class SearchErrorPublishingClient(PublishingSpotifyClient):
@@ -215,10 +222,10 @@ class SearchErrorPublishingClient(PublishingSpotifyClient):
 
 
 class FailingReplaceRemainderPublishClient(PublishingSpotifyClient):
-    def add_playlist_items(self, access_token, playlist_id, uris):
+    def add_playlist_items(self, access_token, playlist_id, uris, position=None):
         if self.replace_calls:
             raise SpotifyApiError("Spotify playlist add items failed with status 500: temporary failure")
-        return super().add_playlist_items(access_token, playlist_id, uris)
+        return super().add_playlist_items(access_token, playlist_id, uris, position=position)
 
 
 class FailingFirstAppendBatchClient(PublishingSpotifyClient):
@@ -243,17 +250,25 @@ class FailingFirstAppendBatchClient(PublishingSpotifyClient):
             for candidate in candidates
         }
 
-    def add_playlist_items(self, access_token, playlist_id, uris):
+    def add_playlist_items(self, access_token, playlist_id, uris, position=None):
         for batch_start in range(0, len(uris), 100):
             batch = tuple(uris[batch_start : batch_start + 100])
-            self.add_calls.append((playlist_id, batch))
-            self.playlist_items_by_id.setdefault(playlist_id, []).extend(
+            self.add_calls.append((playlist_id, batch, position))
+            new_items = [
                 self.playlist_item_for_uri(uri)
                 for uri in batch
-            )
+            ]
+            if position is None:
+                self.playlist_items_by_id.setdefault(playlist_id, []).extend(new_items)
+            else:
+                playlist_items = self.playlist_items_by_id.setdefault(playlist_id, [])
+                insert_position = max(0, min(position, len(playlist_items)))
+                playlist_items[insert_position:insert_position] = new_items
             if playlist_id == self.fail_playlist_id and self.fail_next_append:
                 self.fail_next_append = False
                 raise SpotifyApiError("Spotify playlist add items failed with status 429: Too many requests")
+            if position is not None:
+                position += len(batch)
         return ("snapshot-add",) if uris else ()
 
     def playlist_item_for_uri(self, uri):
@@ -294,6 +309,48 @@ def matching_candidate(row: dict[str, str]) -> SpotifyTrackCandidate:
     )
 
 
+def playlist_track(playlist_name: str, release_id: str, album_name: str, track_name: str, artist_name: str) -> PlaylistTrack:
+    return PlaylistTrack(
+        playlist_name=playlist_name,
+        release_id=release_id,
+        album_name=album_name,
+        track_number="1",
+        track_name=track_name,
+        artist_name=artist_name,
+        spotify_search_query=f"{artist_name} {track_name} {album_name}",
+    )
+
+
+def seed_known_publish_state(path: Path, playlist_name: str, row: dict[str, str], source_position: int) -> None:
+    from publishers.spotify import publish_playlist
+
+    state = {}
+    track = playlist_track(
+        "House",
+        row["Release Id"],
+        row["Album Name"],
+        row["Track Name"],
+        row["Artist Name"],
+    )
+    identity_key = publish_playlist.spotify_track_identity_key(
+        target_playlist_name=playlist_name,
+        artist_names=(row["Artist Name"],),
+        album_name=row["Album Name"],
+        track_name=row["Track Name"],
+    )
+    record_spotify_publish_state_track(
+        state=state,
+        playlist_name=playlist_name,
+        identity_key=identity_key,
+        spotify_uri=f"spotify:track:{row['Release Id']}",
+        source_position=source_position,
+        track=track,
+        timestamp="2026-07-09T00:00:00Z",
+        event="published",
+    )
+    save_spotify_publish_state(path, state)
+
+
 def publish_summary_stub(**overrides):
     values = {
         "report_path": Path("reports/spotify_playlist_publish_report.txt"),
@@ -317,6 +374,207 @@ def publish_summary_stub(**overrides):
 
 
 class SpotifyPublishPlaylistTests(unittest.TestCase):
+    def test_append_plan_places_known_missing_track_before_next_source_anchor(self):
+        from publishers.spotify import publish_playlist
+
+        existing_items = (
+            SpotifyPlaylistItem(
+                uri="spotify:track:111",
+                name="Alpha One",
+                artists=("Alpha Artist",),
+                album_name="Alpha Album",
+            ),
+            SpotifyPlaylistItem(
+                uri="spotify:track:manual",
+                name="Manual One",
+                artists=("Manual Artist",),
+                album_name="Manual Album",
+            ),
+            SpotifyPlaylistItem(
+                uri="spotify:track:333",
+                name="Gamma One",
+                artists=("Gamma Artist",),
+                album_name="Gamma Album",
+            ),
+        )
+        beta_track = playlist_track("House", "222", "Beta Album", "Beta One", "Beta Artist")
+        beta_candidate = SpotifyTrackCandidate(
+            uri="spotify:track:222",
+            name="Beta One",
+            artists=("Beta Artist",),
+            album_name="Beta Album",
+        )
+        decision = publish_playlist.PlaylistPublishDecision(
+            playlist_name="House",
+            target_playlist_name="Discogs - House",
+            track=beta_track,
+            status="would_add",
+            spotify_uri="spotify:track:222",
+            reason="",
+            match_source="search",
+            candidate=beta_candidate,
+        )
+        beta_identity = publish_playlist.publish_decision_identity_key(decision)
+        candidate = publish_playlist.PendingAppendTrack(
+            decision_index=0,
+            identity_key=beta_identity,
+            spotify_uri="spotify:track:222",
+            source_position=2,
+            known_to_publisher=True,
+            final_item=publish_playlist.final_playlist_item_from_decision(2, decision),
+        )
+
+        plan = publish_playlist.build_append_playlist_plan(
+            target_playlist_name="Discogs - House",
+            existing_items=existing_items,
+            append_candidates=(candidate,),
+            source_positions_by_identity={
+                publish_playlist.spotify_playlist_item_identity_key("Discogs - House", existing_items[0]): 1,
+                beta_identity: 2,
+                publish_playlist.spotify_playlist_item_identity_key("Discogs - House", existing_items[2]): 3,
+            },
+        )
+
+        self.assertEqual([item.track_name for item in plan.final_items], ["Alpha One", "Manual One", "Beta One", "Gamma One"])
+        self.assertEqual(plan.write_operations[0].position, 2)
+
+    def test_append_apply_restores_known_deleted_track_at_source_position(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            rows = [
+                playlist_row("111", "Alpha Album", "Alpha One", "Alpha Artist"),
+                playlist_row("222", "Beta Album", "Beta One", "Beta Artist"),
+                playlist_row("333", "Gamma Album", "Gamma One", "Gamma Artist"),
+            ]
+            write_playlist_master(playlist_directory / "House" / "House.csv", rows)
+            report_path = directory / "reports" / "spotify-report.txt"
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            publish_state_cache_path = directory / "collection" / "cache" / "spotify-publish-state.cache.json"
+            client = PublishingSpotifyClient(
+                {
+                    f'track:"{row["Track Name"]}" artist:"{row["Artist Name"]}" album:"{row["Album Name"]}"': (
+                        matching_candidate(row),
+                    )
+                    for row in rows
+                },
+                playlists=(
+                    SpotifyPlaylist(
+                        playlist_id="playlist-house",
+                        name="Discogs - House",
+                        url="",
+                        owner_id="current-user",
+                        public=False,
+                    ),
+                ),
+                playlist_items_by_id={
+                    "playlist-house": (
+                        SpotifyPlaylistItem(uri="spotify:track:111", name="Alpha One", artists=("Alpha Artist",), album_name="Alpha Album"),
+                        SpotifyPlaylistItem(uri="spotify:track:manual", name="Manual One", artists=("Manual Artist",), album_name="Manual Album"),
+                        SpotifyPlaylistItem(uri="spotify:track:333", name="Gamma One", artists=("Gamma Artist",), album_name="Gamma Album"),
+                    )
+                },
+            )
+            seed_known_publish_state(
+                publish_state_cache_path,
+                playlist_name="Discogs - House",
+                row=rows[1],
+                source_position=2,
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publish_state_cache_path=publish_state_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                publisher_sync_mode="append",
+                max_new_searches_per_run=0,
+            )
+            report_text = report_path.read_text(encoding="utf-8")
+            publish_state_payload = json.loads(publish_state_cache_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(summary.already_present_count, 2)
+        self.assertEqual(summary.added_count, 1)
+        self.assertEqual(client.add_calls, [("playlist-house", ("spotify:track:222",), 2)])
+        self.assertEqual(
+            [item.name for item in client.playlist_items_by_id["playlist-house"]],
+            ["Alpha One", "Manual One", "Beta One", "Gamma One"],
+        )
+        self.assertIn("3 | added | Beta Artist | Beta One | Beta Album | spotify:track:222", report_text)
+        self.assertIn("will be restored at its source-order position", report_text)
+        self.assertIn("discogs house|beta artist|beta album|beta one", publish_state_payload["playlists"]["Discogs - House"]["tracks"])
+
+    def test_append_apply_appends_newly_seen_missing_track(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            rows = [
+                playlist_row("111", "Alpha Album", "Alpha One", "Alpha Artist"),
+                playlist_row("222", "Beta Album", "Beta One", "Beta Artist"),
+                playlist_row("333", "Gamma Album", "Gamma One", "Gamma Artist"),
+            ]
+            write_playlist_master(playlist_directory / "House" / "House.csv", rows)
+            report_path = directory / "reports" / "spotify-report.txt"
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            publish_state_cache_path = directory / "collection" / "cache" / "spotify-publish-state.cache.json"
+            client = PublishingSpotifyClient(
+                {
+                    f'track:"{row["Track Name"]}" artist:"{row["Artist Name"]}" album:"{row["Album Name"]}"': (
+                        matching_candidate(row),
+                    )
+                    for row in rows
+                },
+                playlists=(
+                    SpotifyPlaylist(
+                        playlist_id="playlist-house",
+                        name="Discogs - House",
+                        url="",
+                        owner_id="current-user",
+                        public=False,
+                    ),
+                ),
+                playlist_items_by_id={
+                    "playlist-house": (
+                        SpotifyPlaylistItem(uri="spotify:track:111", name="Alpha One", artists=("Alpha Artist",), album_name="Alpha Album"),
+                        SpotifyPlaylistItem(uri="spotify:track:333", name="Gamma One", artists=("Gamma Artist",), album_name="Gamma Album"),
+                    )
+                },
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publish_state_cache_path=publish_state_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                publisher_sync_mode="append",
+                max_new_searches_per_run=0,
+            )
+            report_text = report_path.read_text(encoding="utf-8")
+
+        self.assertEqual(summary.already_present_count, 2)
+        self.assertEqual(summary.added_count, 1)
+        self.assertEqual(client.add_calls, [("playlist-house", ("spotify:track:222",), None)])
+        self.assertEqual(
+            [item.name for item in client.playlist_items_by_id["playlist-house"]],
+            ["Alpha One", "Gamma One", "Beta One"],
+        )
+        self.assertIn("3 | added | Beta Artist | Beta One | Beta Album | spotify:track:222", report_text)
+        self.assertIn("newly seen and will be appended", report_text)
+
     def test_dry_run_reports_row_progress_while_searching_spotify_tracks(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
@@ -1307,7 +1565,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             (item.artists, item.album_name, item.name)
             for item in final_items
         }
-        self.assertEqual([len(batch) for _, batch in client.add_calls], [100, 50])
+        self.assertEqual([len(batch) for _, batch, _ in client.add_calls], [100, 50])
         self.assertEqual(summary.already_present_count, 100)
         self.assertEqual(summary.added_count, 50)
         self.assertEqual(len(final_items), 150)
@@ -1357,7 +1615,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertEqual(summary.would_add_count, 0)
         self.assertEqual(len(client.searches), 500)
         self.assertEqual(client.created_playlists, [("Discogs - House", False, "Generated from Discogs collection")])
-        self.assertEqual([len(batch) for _, batch in client.add_calls], [100, 100, 100, 100, 100])
+        self.assertEqual([len(batch) for _, batch, _ in client.add_calls], [100, 100, 100, 100, 100])
         self.assertIn("Run status: partial - new Spotify search budget reached after 500 searches", report_text)
         self.assertIn("Tracks added", report_text)
         self.assertIn("500|1|artist 500|album 500|track 500", cache_payload["matches"])
@@ -1422,7 +1680,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertEqual(second_summary.already_present_count, 500)
         self.assertEqual(second_summary.added_count, 50)
         self.assertEqual(len(client.searches) - searches_after_first_run, 50)
-        self.assertEqual([len(batch) for _, batch in client.add_calls], [100, 100, 100, 100, 100, 50])
+        self.assertEqual([len(batch) for _, batch, _ in client.add_calls], [100, 100, 100, 100, 100, 50])
         self.assertEqual(len(final_items), 550)
         self.assertEqual(len(final_identities), 550)
 
@@ -1464,7 +1722,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             report_text = report_path.read_text(encoding="utf-8")
             cache_payload = json.loads(match_cache_path.read_text(encoding="utf-8"))
 
-        self.assertEqual([len(batch) for _, batch in client.add_calls], [100])
+        self.assertEqual([len(batch) for _, batch, _ in client.add_calls], [100])
         self.assertEqual(len(client.playlist_items_by_id["created-1"]), 100)
         self.assertIn("Run status: aborted - Spotify rate limit stopped the run after 100 of 101 tracks", report_text)
         self.assertIn("append checkpoints completed before the rate limit stop were written", report_text)
@@ -1509,7 +1767,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
                 )
             report_text = report_path.read_text(encoding="utf-8")
 
-        self.assertEqual([len(batch) for _, batch in client.add_calls], [100])
+        self.assertEqual([len(batch) for _, batch, _ in client.add_calls], [100])
         self.assertIn("Run status: checkpoint - append progress saved after 100 searches; run still in progress", report_text)
         self.assertNotIn("Run status: complete", report_text)
 
@@ -1761,7 +2019,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertEqual(summary.added_count, 1)
         self.assertEqual(summary.would_add_count, 0)
         self.assertEqual(client.created_playlists, [("Discogs - House", False, "Generated from Discogs collection")])
-        self.assertEqual(client.add_calls, [("created-1", ("spotify:track:alpha",))])
+        self.assertEqual(client.add_calls, [("created-1", ("spotify:track:alpha",), None)])
         self.assertEqual(client.replace_calls, [])
         self.assertIn("Playlist Discogs - House does not exist, creating", info_lines)
         self.assertIn("Spotify playlist publish report", report_text)
@@ -1899,7 +2157,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
                 )
             report_text = report_path.read_text(encoding="utf-8")
 
-        self.assertEqual(client.add_calls, [("playlist-house", ("spotify:track:alpha",))])
+        self.assertEqual(client.add_calls, [("playlist-house", ("spotify:track:alpha",), None)])
         self.assertIn("Run status: failed - publishing stopped while writing Discogs - Techno", report_text)
         self.assertNotIn("Run status: complete", report_text)
         self.assertIn("Discogs - House | 111 | 1 | Alpha Artist | Alpha One | added | spotify:track:alpha", report_text)
@@ -2137,7 +2395,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
 
         self.assertEqual(summary.added_count, 1)
         self.assertEqual(client.created_playlists, [("Discogs - House", False, "Generated from Discogs collection")])
-        self.assertEqual(client.add_calls, [("created-1", ("spotify:track:alpha",))])
+        self.assertEqual(client.add_calls, [("created-1", ("spotify:track:alpha",), None)])
 
     def test_publish_rejects_owned_public_playlist_without_writing(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -2767,6 +3025,11 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         )
         self.assertFalse(default_args.refresh_match_cache)
         self.assertTrue(publish_playlist.parse_args(["--refresh-match-cache"]).refresh_match_cache)
+        self.assertEqual(default_args.publish_state_cache, Path("collection/cache/spotify-publish-state.cache.json"))
+        self.assertEqual(
+            publish_playlist.parse_args(["--publish-state-cache", "custom-state.json"]).publish_state_cache,
+            Path("custom-state.json"),
+        )
         self.assertTrue(default_args.apply)
         self.assertFalse(default_args.dry_run)
         self.assertTrue(publishing_dry_run_args.dry_run)
@@ -2781,6 +3044,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             no_progress=True,
             dry_run=True,
             max_new_searches_per_run=25,
+            publish_state_cache=Path("collection/cache/custom-publish-state.json"),
         )
 
         self.assertEqual(
@@ -2788,6 +3052,8 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             [
                 "--playlist-output-dir",
                 "collection/custom-playlists",
+                "--publish-state-cache",
+                "collection/cache/custom-publish-state.json",
                 "--publisher-config",
                 "config/custom-publisher.json",
                 "--no-progress",
@@ -2804,6 +3070,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             playlist_output_dir=Path("collection/custom-playlists"),
             report=Path("reports/publish.txt"),
             publisher_config=Path("config/custom-publisher.json"),
+            publish_state_cache=Path("collection/cache/custom-publish-state.json"),
             max_new_searches_per_run=25,
             dry_run=True,
             progress=False,
@@ -2812,6 +3079,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertEqual(args.playlist_output_dir, Path("collection/custom-playlists"))
         self.assertEqual(args.report, Path("reports/publish.txt"))
         self.assertEqual(args.publisher_config, Path("config/custom-publisher.json"))
+        self.assertEqual(args.publish_state_cache, Path("collection/cache/custom-publish-state.json"))
         self.assertEqual(args.max_new_searches_per_run, 25)
         self.assertFalse(args.apply)
         self.assertFalse(args.progress)

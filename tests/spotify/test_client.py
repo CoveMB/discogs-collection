@@ -413,6 +413,32 @@ class SpotifyClientTests(unittest.TestCase):
         self.assertEqual(captured_requests[0].url, "https://api.spotify.com/v1/playlists/playlist-1/items")
         self.assertEqual(len(json.loads(captured_requests[0].body.decode("utf-8"))["uris"]), 100)
         self.assertEqual(json.loads(captured_requests[1].body.decode("utf-8"))["uris"], ["spotify:track:100"])
+        self.assertNotIn("position", json.loads(captured_requests[0].body.decode("utf-8")))
+        self.assertNotIn("position", json.loads(captured_requests[1].body.decode("utf-8")))
+
+    def test_add_playlist_items_posts_position_when_provided(self):
+        captured_requests = []
+
+        def transport(request):
+            captured_requests.append(request)
+            return HttpResponse(status=201, headers={}, body='{"snapshot_id":"snapshot"}')
+
+        client = SpotifyClient(transport=transport)
+
+        client.add_playlist_items(
+            access_token="access-token",
+            playlist_id="playlist-1",
+            uris=("spotify:track:alpha", "spotify:track:beta"),
+            position=2,
+        )
+
+        self.assertEqual(
+            json.loads(captured_requests[0].body.decode("utf-8")),
+            {
+                "uris": ["spotify:track:alpha", "spotify:track:beta"],
+                "position": 2,
+            },
+        )
 
     def test_replace_playlist_items_puts_first_uri_batch(self):
         captured_requests = []
