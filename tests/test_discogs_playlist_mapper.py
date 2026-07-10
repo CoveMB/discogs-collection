@@ -143,7 +143,7 @@ class PlaylistMapperTests(unittest.TestCase):
         )
 
     def test_playlist_prefix_config_is_rejected_for_playlist_map(self):
-        payload = sample_config()
+        payload: dict[str, object] = dict(sample_config())
         payload["playlist_prefix"] = "Discogs - "
 
         with self.assertRaisesRegex(ValueError, "unknown playlist config key: playlist_prefix"):

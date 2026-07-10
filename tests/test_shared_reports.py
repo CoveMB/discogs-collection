@@ -15,7 +15,7 @@ from shared.reports import format_report_section, print_report_section  # noqa: 
 
 class ReportTests(unittest.TestCase):
     def test_script_report_path_uses_timestamp_then_script_name(self):
-        script_report_path = getattr(reports, "script_report_path", None)
+        script_report_path = reports.script_report_path
         self.assertIsNotNone(script_report_path)
 
         with patch("shared.reports.readable_timestamp", return_value="2026-06-10_14-30-00"):

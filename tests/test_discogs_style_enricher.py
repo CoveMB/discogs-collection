@@ -1032,6 +1032,9 @@ class RateLimitTests(unittest.TestCase):
             def update_from_headers(self, headers):
                 self.updated_headers = headers
 
+            def sleep_for_retry_after(self, retry_after_seconds):
+                pass
+
         limiter = FakeLimiter()
 
         with patch.object(discogs_api, "urlopen", return_value=FakeResponse()):
@@ -1046,6 +1049,7 @@ class RateLimitTests(unittest.TestCase):
 
         self.assertEqual(body, '{"ok": true}')
         self.assertTrue(limiter.waited)
+        assert limiter.updated_headers is not None
         self.assertEqual(limiter.updated_headers["x-discogs-ratelimit"], "25")
 
 

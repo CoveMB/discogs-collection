@@ -17,6 +17,9 @@ venv/
 env/
 .idea/
 
+# Local development dependencies
+node_modules/
+
 # Python packaging/build output
 build/
 dist/

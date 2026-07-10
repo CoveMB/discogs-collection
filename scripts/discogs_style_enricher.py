@@ -496,6 +496,8 @@ def parse_master_id(payload: Mapping[str, object] | None) -> int:
 
 
 def parse_int_or_zero(value: object) -> int:
+    if not isinstance(value, (str, int, float, bytes, bytearray)):
+        return 0
     try:
         return int(value or 0)
     except (TypeError, ValueError):

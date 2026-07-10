@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from publishers.dedupe import (
     DedupeRemoval,
@@ -13,7 +14,12 @@ from publishers.dedupe import (
     ProviderPlaylistItem,
     plan_playlist_dedupe,
 )
-from publishers.spotify.client import SpotifyApiError, SpotifyClient, SpotifyPlaylist, SpotifyPlaylistItem
+from publishers.spotify.client import (
+    SpotifyApiError,
+    SpotifyPlaylist,
+    SpotifyPlaylistItem,
+    SpotifyPlaylistReadClient,
+)
 from shared.playlist_selection import normalize_playlist_selectors as normalize_playlist_selector_values
 from shared.progress import ProgressReporter
 from shared.publisher_config import (
@@ -29,6 +35,22 @@ from shared.text import clean_cell, display_report_value
 MANAGED_PLAYLIST_PROVIDER = SPOTIFY_PUBLISHER
 
 InfoLog = Callable[[str], None]
+
+
+class SpotifyDedupeClient(SpotifyPlaylistReadClient, Protocol):
+    def replace_playlist_items(
+        self,
+        access_token: str,
+        playlist_id: str,
+        uris: Sequence[str],
+    ) -> object: ...
+
+    def add_playlist_items(
+        self,
+        access_token: str,
+        playlist_id: str,
+        uris: Sequence[str],
+    ) -> object: ...
 
 
 @dataclass(frozen=True)
@@ -64,7 +86,7 @@ class SpotifyDedupeSummary:
 
 
 def dedupe_spotify_managed_playlists(
-    spotify_client: SpotifyClient,
+    spotify_client: SpotifyDedupeClient,
     access_token: str,
     report_path: Path,
     publisher_config: PublisherConfig,
@@ -188,7 +210,7 @@ def dedupe_spotify_managed_playlists(
 
 
 def apply_spotify_dedupe_removals(
-    spotify_client: SpotifyClient,
+    spotify_client: SpotifyDedupeClient,
     access_token: str,
     eligible_playlists: Sequence[SpotifyPlaylist],
     info_log: InfoLog | None,
@@ -383,7 +405,7 @@ def deduped_playlist_uris(
 
 
 def replace_spotify_playlist_items(
-    spotify_client: SpotifyClient,
+    spotify_client: SpotifyDedupeClient,
     access_token: str,
     playlist_id: str,
     uris: Sequence[str],

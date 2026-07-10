@@ -6,6 +6,12 @@ import csv
 import io
 import json
 from pathlib import Path
+from typing import TypedDict
+
+
+class SamplePlaylistConfig(TypedDict):
+    excluded_terms: list[str]
+    playlists: dict[str, list[str]]
 
 
 def read_csv_text(csv_text: str) -> list[dict[str, str]]:
@@ -16,7 +22,7 @@ def write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
-def sample_playlist_config() -> dict[str, object]:
+def sample_playlist_config() -> SamplePlaylistConfig:
     return {
         "excluded_terms": ["Electronic", "Electro"],
         "playlists": {

@@ -9,6 +9,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
+from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -20,6 +21,14 @@ DISCOGS_RATE_LIMIT_SAFETY_MARGIN = 2
 DISCOGS_AUTHENTICATED_RATE_LIMIT = 60
 DISCOGS_UNAUTHENTICATED_RATE_LIMIT = 25
 MAX_RETRIES = 3
+
+
+class DiscogsRateLimiterProtocol(Protocol):
+    def wait_before_request(self) -> None: ...
+
+    def update_from_headers(self, headers: object) -> None: ...
+
+    def sleep_for_retry_after(self, retry_after_seconds: float) -> None: ...
 
 
 class DiscogsRateLimiter:
@@ -188,7 +197,7 @@ def http_get(
     token: str,
     timeout_seconds: int,
     accept: str,
-    rate_limiter: DiscogsRateLimiter | None = None,
+    rate_limiter: DiscogsRateLimiterProtocol | None = None,
 ) -> str | None:
     last_error = ""
     for attempt_number in range(1, MAX_RETRIES + 1):

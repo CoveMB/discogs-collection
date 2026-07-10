@@ -1593,11 +1593,24 @@ marked with `missing release_id` notes.
 
 ## Tests
 
-Run the unit tests with:
+Install the locked development tooling after cloning the repository or when
+`package-lock.json` changes:
 
 ```bash
+npm ci --ignore-scripts
+```
+
+Run the Pylance-compatible type check and the unit tests with:
+
+```bash
+npm run typecheck
 python3 -m unittest discover -s tests
 ```
+
+Pylance and the command-line check both read `pyrightconfig.json`. The Pyright
+version and its development dependencies are locked in `package-lock.json`, so
+local checks and CI use the same checker. Pyright is a development tool; the
+collection scripts still use only the Python standard library at runtime.
 
 ## Pre-commit hook
 
@@ -1609,6 +1622,7 @@ git config core.hooksPath .githooks
 ```
 
 Before each commit, the hook checks staged project text files for trailing
-whitespace and missing final newlines, runs Python syntax linting with
-`compileall`, and runs the unit tests. It skips private workflow data folders
-such as `collection`, `config`, `export`, `processed`, and `reports`.
+whitespace and missing final newlines, runs Python syntax and type checks, and
+runs the unit tests. Run `npm ci --ignore-scripts` first if the hook reports that
+Pyright is not installed. The hook skips private workflow data folders such as
+`collection`, `config`, `export`, `processed`, and `reports`.

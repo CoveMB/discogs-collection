@@ -142,6 +142,28 @@ Run the unit tests after code changes:
 python3 -m unittest discover -s tests
 ```
 
+Write new or changed Python code to pass the repository's Pyright configuration
+without new diagnostics. Use accurate annotations, explicit type narrowing, and
+existing typed interfaces. Do not weaken the checker or add casts or
+suppressions only to make the check pass. Keep justified casts narrow. Document
+a suppression with the verified checker limitation that requires it.
+
+Install the locked development tooling after cloning the repository or when
+`package-lock.json` changes:
+
+```bash
+npm ci --ignore-scripts
+```
+
+Run the Pylance-compatible type check after changing Python code:
+
+```bash
+npm run typecheck
+```
+
+Keep `pyrightconfig.json` aligned with the Python version used in CI. Fix type
+errors before finishing the task.
+
 For documentation-only changes, run tests when the edit describes behavior that
 could drift from implementation.
 

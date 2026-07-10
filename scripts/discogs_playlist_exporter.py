@@ -180,7 +180,7 @@ def export_playlist_rows(
     written_playlist_paths: set[Path] = set()
     track_row_count = 0
     fallback_row_count = 0
-    playlist_paths = build_playlist_paths(records_by_playlist.keys(), output_directory)
+    playlist_paths = build_playlist_paths(tuple(records_by_playlist), output_directory)
     for playlist_name, records in records_by_playlist.items():
         output_rows, playlist_fallback_count = build_playlist_output_rows(records)
         output_path = playlist_paths[playlist_name]

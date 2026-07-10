@@ -8,6 +8,7 @@ import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import cast
 
 
 SCRIPTS_DIRECTORY = Path(__file__).resolve().parents[2]
@@ -20,8 +21,11 @@ from publishers.spotify.client import (  # noqa: E402
     SpotifyClient,
     SpotifyPlaylist,
     SpotifyPlaylistItem,
+    SpotifyPlaylistPlanningClient,
+    SpotifyPlaylistPublishClient,
     SpotifyRateLimitDeferredError,
     SpotifyRateLimitRetriesExhaustedError,
+    SpotifyTrackSearchClient,
 )
 from publishers.spotify.env import DEFAULT_ENV_PATH, DEFAULT_TOKEN_CACHE_PATH, load_spotify_settings  # noqa: E402
 from publishers.spotify.match_cache import (  # noqa: E402
@@ -160,7 +164,7 @@ class AppendPlaylistPlan:
 
 def search_spotify_track(
     track: PlaylistTrack,
-    spotify_client: SpotifyClient,
+    spotify_client: SpotifyTrackSearchClient,
     access_token: str,
     search_limit: int,
 ) -> SpotifyTrackSearchResult:
@@ -218,7 +222,7 @@ def is_query_specific_spotify_search_error(error: SpotifyApiError) -> bool:
 def dry_run_spotify_playlist_publish(
     playlist_output_directory: Path,
     report_path: Path,
-    spotify_client: SpotifyClient,
+    spotify_client: SpotifyTrackSearchClient,
     access_token: str,
     search_limit: int = 10,
     progress: ProgressReporter | None = None,
@@ -283,7 +287,7 @@ def dry_run_spotify_playlist_publish(
 def publish_spotify_playlists(
     playlist_output_directory: Path,
     report_path: Path,
-    spotify_client: SpotifyClient,
+    spotify_client: SpotifyPlaylistPlanningClient,
     access_token: str,
     search_limit: int = 10,
     progress: ProgressReporter | None = None,
@@ -306,6 +310,8 @@ def publish_spotify_playlists(
         raise ValueError("max_new_searches_per_run must be non-negative")
     if playlist_selectors is not None and playlist_master_paths is not None:
         raise ValueError("playlist_selectors and playlist_master_paths cannot both be provided")
+    # Planning-only clients are valid for dry runs. Write methods are called only when apply is true.
+    write_client = cast(SpotifyPlaylistPublishClient, spotify_client)
     config = publisher_config or PublisherConfig(
         default_publisher=DEFAULT_PUBLISHER,
         playlist_prefix=DEFAULT_PLAYLIST_PREFIX,
@@ -374,7 +380,7 @@ def publish_spotify_playlists(
                 if cached_match is None and new_search_budget_reached(search_count, max_new_searches_per_run):
                     if publisher_sync_mode == APPEND_SYNC_MODE:
                         final_items, playlist_contexts, spotify_playlists = finalize_append_playlist(
-                            spotify_client=spotify_client,
+                            spotify_client=write_client,
                             access_token=access_token,
                             context_index=context_index,
                             playlist_contexts=playlist_contexts,
@@ -482,7 +488,7 @@ def publish_spotify_playlists(
                         cache_track_match(match_cache, decision, matched_at=timestamp)
                     if publisher_sync_mode == APPEND_SYNC_MODE and apply and len(append_candidates) >= 100:
                         final_items, playlist_contexts, spotify_playlists = finalize_append_playlist(
-                            spotify_client=spotify_client,
+                            spotify_client=write_client,
                             access_token=access_token,
                             context_index=context_index,
                             playlist_contexts=playlist_contexts,
@@ -520,7 +526,7 @@ def publish_spotify_playlists(
                     ):
                         if publisher_sync_mode == APPEND_SYNC_MODE:
                             final_items, playlist_contexts, spotify_playlists = finalize_append_playlist(
-                                spotify_client=spotify_client,
+                                spotify_client=write_client,
                                 access_token=access_token,
                                 context_index=context_index,
                                 playlist_contexts=playlist_contexts,
@@ -565,7 +571,7 @@ def publish_spotify_playlists(
 
             if publisher_sync_mode == APPEND_SYNC_MODE:
                 final_items, playlist_contexts, spotify_playlists = finalize_append_playlist(
-                    spotify_client=spotify_client,
+                    spotify_client=write_client,
                     access_token=access_token,
                     context_index=context_index,
                     playlist_contexts=playlist_contexts,
@@ -633,8 +639,8 @@ def publish_spotify_playlists(
     )
     if apply and not (publisher_sync_mode == APPEND_SYNC_MODE):
         validate_replace_apply_decisions(tuple(decisions), publisher_sync_mode)
-        decisions, final_items, playlist_contexts, spotify_playlists = apply_planned_playlist_writes(
-            spotify_client=spotify_client,
+        applied_decisions, applied_final_items, applied_playlist_contexts, spotify_playlists = apply_planned_playlist_writes(
+            spotify_client=write_client,
             access_token=access_token,
             decisions=tuple(decisions),
             final_items=tuple(final_items),
@@ -651,9 +657,9 @@ def publish_spotify_playlists(
             searched_row_count=searched_row_count,
         )
         summary = write_publish_summary(
-            decisions=tuple(decisions),
-            final_items=tuple(reindex_final_items(final_items)),
-            playlist_contexts=tuple(playlist_contexts),
+            decisions=applied_decisions,
+            final_items=reindex_final_items(applied_final_items),
+            playlist_contexts=applied_playlist_contexts,
             report_path=report_path,
             apply=apply,
             publisher_sync_mode=publisher_sync_mode,
@@ -690,7 +696,7 @@ def append_checkpoint_run_status(search_count: int) -> str:
 
 
 def finalize_append_playlist(
-    spotify_client: SpotifyClient,
+    spotify_client: SpotifyPlaylistPublishClient,
     access_token: str,
     context_index: int,
     playlist_contexts: list[PlaylistPublishContext],
@@ -911,7 +917,7 @@ def append_restore_insert_index(planned_items: Sequence[AppendPlanItem], source_
 
 
 def ensure_spotify_playlist_for_writes(
-    spotify_client: SpotifyClient,
+    spotify_client: SpotifyPlaylistPublishClient,
     access_token: str,
     context: PlaylistPublishContext,
     has_writes: bool,
@@ -928,7 +934,7 @@ def ensure_spotify_playlist_for_writes(
 
 
 def apply_append_write_operations(
-    spotify_client: SpotifyClient,
+    spotify_client: SpotifyPlaylistPublishClient,
     access_token: str,
     context: PlaylistPublishContext,
     operations: Sequence[AppendWriteOperation],
@@ -1029,7 +1035,7 @@ def append_publish_reason(known_to_publisher: bool) -> str:
 
 def resolve_track_match(
     track: PlaylistTrack,
-    spotify_client: SpotifyClient,
+    spotify_client: SpotifyTrackSearchClient,
     access_token: str,
     search_limit: int,
     match_cache: dict[str, dict[str, object]],
@@ -1128,7 +1134,7 @@ def validate_replace_apply_decisions(
 
 
 def resolve_playlist_context(
-    spotify_client: SpotifyClient,
+    spotify_client: SpotifyPlaylistPlanningClient,
     access_token: str,
     spotify_playlists: Sequence[SpotifyPlaylist],
     current_user_id: str,
@@ -1176,7 +1182,7 @@ def resolve_playlist_context(
 
 
 def apply_playlist_writes(
-    spotify_client: SpotifyClient,
+    spotify_client: SpotifyPlaylistPublishClient,
     access_token: str,
     context: PlaylistPublishContext,
     planned_write_uris: tuple[str, ...],
@@ -1556,7 +1562,7 @@ def write_publish_summary(
 
 
 def apply_planned_playlist_writes(
-    spotify_client: SpotifyClient,
+    spotify_client: SpotifyPlaylistPublishClient,
     access_token: str,
     decisions: tuple[PlaylistPublishDecision, ...],
     final_items: tuple[FinalPlaylistItem, ...],
@@ -1831,7 +1837,7 @@ def run_spotify_publish_from_args(
     playlist_names_by_master_path: Mapping[Path, str] | None = None,
     publisher_config: PublisherConfig | None = None,
     debug_log: DebugLog | None = None,
-    spotify_client: SpotifyClient | None = None,
+    spotify_client: SpotifyPlaylistPlanningClient | None = None,
 ) -> SpotifyPublishSummary:
     if playlist_master_paths is not None:
         selected_master_paths: tuple[Path, ...] | None = tuple(playlist_master_paths)
@@ -1904,6 +1910,7 @@ def print_summary(summary: SpotifyPublishSummary) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    args: argparse.Namespace | None = None
     try:
         args = parse_args(argv)
         debug_log = build_debug_logger(args.debug_log)
@@ -1927,7 +1934,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (*EXPECTED_CLI_ERRORS, SpotifyApiError) as error:
         print_cli_error(error)
         rate_limit_stop = isinstance(error, (SpotifyRateLimitDeferredError, SpotifyRateLimitRetriesExhaustedError))
-        if rate_limit_stop and "args" in locals() and args.report.exists():
+        if rate_limit_stop and args is not None and args.report.exists():
             print(f"Spotify publish report: {args.report}", file=sys.stderr)
         return 1
     print_summary(summary)

@@ -26,6 +26,7 @@ class SharedDebugLogTests(unittest.TestCase):
 
             debug_log = build_debug_logger(debug_log_path)
             self.assertIsNotNone(debug_log)
+            assert debug_log is not None
             debug_log("first event")
             debug_log("second event")
 

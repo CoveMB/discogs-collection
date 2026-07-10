@@ -125,7 +125,11 @@ class CallbackRequestHandler(http.server.BaseHTTPRequestHandler):
         return
 
 
-def wait_for_loopback_callback(redirect_uri: str, authorization_url: str, expected_state: str) -> CallbackRequestHandler:
+def wait_for_loopback_callback(
+    redirect_uri: str,
+    authorization_url: str,
+    expected_state: str,
+) -> type[CallbackRequestHandler]:
     callback = parse_loopback_redirect_uri(redirect_uri)
 
     handler_class = type(

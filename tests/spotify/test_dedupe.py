@@ -51,7 +51,7 @@ class FakeSpotifyDedupeClient:
 
     def replace_playlist_items(self, access_token, playlist_id, uris):
         self.replace_calls.append((playlist_id, tuple(uris)))
-        self.playlist_items_by_id[playlist_id] = tuple(
+        self.playlist_items_by_id[playlist_id] = list(
             SpotifyPlaylistItem(uri=uri, name="", artists=(), album_name="", position=position)
             for position, uri in enumerate(uris)
         )
@@ -64,7 +64,7 @@ class FakeSpotifyDedupeClient:
             SpotifyPlaylistItem(uri=uri, name="", artists=(), album_name="", position=len(existing_items) + offset)
             for offset, uri in enumerate(uris)
         )
-        self.playlist_items_by_id[playlist_id] = existing_items + appended_items
+        self.playlist_items_by_id[playlist_id] = list(existing_items + appended_items)
         return ("snapshot-after-add",) if uris else ()
 
 

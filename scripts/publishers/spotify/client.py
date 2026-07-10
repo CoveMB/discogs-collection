@@ -9,6 +9,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import Protocol
 
 from publishers.spotify.matching import SpotifyTrackCandidate
 from shared.debug_log import DebugLog
@@ -99,6 +100,52 @@ class SpotifyRateLimitRetriesExhaustedError(SpotifyApiError):
             "Spotify rate limit retries were exhausted. "
             f"Retry later; last Retry-After was {format_wait_duration(retry_after_seconds)}."
         )
+
+
+class SpotifyTrackSearchClient(Protocol):
+    def search_tracks(
+        self,
+        access_token: str,
+        query: str,
+        limit: int = 10,
+    ) -> tuple[SpotifyTrackCandidate, ...]: ...
+
+
+class SpotifyPlaylistReadClient(Protocol):
+    def list_current_user_playlists(self, access_token: str) -> tuple[SpotifyPlaylist, ...]: ...
+
+    def get_current_user_id(self, access_token: str) -> str: ...
+
+    def get_playlist_items(self, access_token: str, playlist_id: str) -> tuple[SpotifyPlaylistItem, ...]: ...
+
+
+class SpotifyPlaylistPlanningClient(SpotifyTrackSearchClient, SpotifyPlaylistReadClient, Protocol):
+    pass
+
+
+class SpotifyPlaylistPublishClient(SpotifyPlaylistPlanningClient, Protocol):
+    def create_playlist(
+        self,
+        access_token: str,
+        name: str,
+        public: bool = False,
+        description: str = "",
+    ) -> SpotifyPlaylist: ...
+
+    def add_playlist_items(
+        self,
+        access_token: str,
+        playlist_id: str,
+        uris: Sequence[str],
+        position: int | None = None,
+    ) -> object: ...
+
+    def replace_playlist_items(
+        self,
+        access_token: str,
+        playlist_id: str,
+        uris: Sequence[str],
+    ) -> object: ...
 
 
 class SpotifyClient:
@@ -331,7 +378,7 @@ class SpotifyClient:
                 f"attempt={attempt_number} max_retries={max_retries} wait_seconds={wait_seconds}"
             )
             self.sleep(wait_seconds)
-        return response
+        raise RuntimeError("Spotify request retry loop ended unexpectedly")
 
     def log_debug(self, message: str) -> None:
         if self.debug_log:

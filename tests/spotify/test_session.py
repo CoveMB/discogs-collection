@@ -14,6 +14,13 @@ from publishers.spotify.session import get_spotify_access_token  # noqa: E402
 from publishers.spotify.token_cache import SpotifyToken, load_spotify_token, save_spotify_token  # noqa: E402
 
 
+def load_required_spotify_token(path: Path) -> SpotifyToken:
+    token = load_spotify_token(path)
+    if token is None:
+        raise AssertionError(f"Spotify token was not saved to {path}")
+    return token
+
+
 class SpotifySessionTests(unittest.TestCase):
     def test_returns_cached_access_token_when_valid_and_scoped(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -78,8 +85,9 @@ class SpotifySessionTests(unittest.TestCase):
             )
 
             self.assertEqual(access_token, "refreshed-access-token")
-            self.assertEqual(load_spotify_token(token_cache_path).access_token, "refreshed-access-token")
-            self.assertEqual(load_spotify_token(token_cache_path).refresh_token, "refresh-token")
+            saved_token = load_required_spotify_token(token_cache_path)
+            self.assertEqual(saved_token.access_token, "refreshed-access-token")
+            self.assertEqual(saved_token.refresh_token, "refresh-token")
 
     def test_refresh_preserves_existing_scope_when_spotify_omits_scope(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -116,7 +124,7 @@ class SpotifySessionTests(unittest.TestCase):
             )
 
             self.assertEqual(access_token, "refreshed-access-token")
-            self.assertEqual(load_spotify_token(token_cache_path).scope, "playlist-modify-private")
+            self.assertEqual(load_required_spotify_token(token_cache_path).scope, "playlist-modify-private")
 
     def test_authorizes_when_refresh_token_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -164,7 +172,7 @@ class SpotifySessionTests(unittest.TestCase):
 
             self.assertEqual(access_token, "new-access-token")
             self.assertEqual(authorizer.calls, [settings])
-            self.assertEqual(load_spotify_token(token_cache_path).access_token, "new-access-token")
+            self.assertEqual(load_required_spotify_token(token_cache_path).access_token, "new-access-token")
 
     def test_discards_rejected_refresh_token_before_reauthorizing(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -212,7 +220,7 @@ class SpotifySessionTests(unittest.TestCase):
 
             self.assertEqual(access_token, "new-access-token")
             self.assertEqual(authorizer.calls, [settings])
-            self.assertEqual(load_spotify_token(token_cache_path).access_token, "new-access-token")
+            self.assertEqual(load_required_spotify_token(token_cache_path).access_token, "new-access-token")
 
     def test_authorizes_when_token_cache_is_missing(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -241,7 +249,7 @@ class SpotifySessionTests(unittest.TestCase):
 
             self.assertEqual(access_token, "new-access-token")
             self.assertEqual(authorizer.calls, [settings])
-            self.assertEqual(load_spotify_token(token_cache_path).access_token, "new-access-token")
+            self.assertEqual(load_required_spotify_token(token_cache_path).access_token, "new-access-token")
 
     def test_authorizes_when_cached_token_is_missing_required_scopes(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -279,7 +287,7 @@ class SpotifySessionTests(unittest.TestCase):
             )
 
             self.assertEqual(access_token, "rescoped-access-token")
-            self.assertEqual(load_spotify_token(token_cache_path).access_token, "rescoped-access-token")
+            self.assertEqual(load_required_spotify_token(token_cache_path).access_token, "rescoped-access-token")
 
 
 class RecordingAuthorizer:

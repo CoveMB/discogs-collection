@@ -26,6 +26,15 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install development tooling
+        run: npm ci --ignore-scripts
+
       - name: Show Python version
         run: python --version
 
@@ -34,6 +43,9 @@ jobs:
 
       - name: Check Python syntax
         run: python -m compileall -q scripts tests
+
+      - name: Check Python types
+        run: npm run typecheck
 
       - name: Run tests
         run: python -m unittest discover -s tests

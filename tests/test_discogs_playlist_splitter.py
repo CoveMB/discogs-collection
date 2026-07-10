@@ -37,7 +37,8 @@ def read_csv_file(path: Path) -> list[dict[str, str]]:
 def write_master(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as output_file:
-        writer = csv.DictWriter(output_file, fieldnames=TUNEMYMUSIC_COLUMNS)
+        fieldnames: list[str] = list(TUNEMYMUSIC_COLUMNS)
+        writer = csv.DictWriter(output_file, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 

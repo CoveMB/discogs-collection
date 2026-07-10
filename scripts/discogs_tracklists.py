@@ -198,13 +198,19 @@ def load_tracklist_cache(path: Path) -> dict[str, ReleaseTracklistLookup]:
 
 
 def tracklist_lookup_from_cache_record(release_id: str, record: Mapping[str, object]) -> ReleaseTracklistLookup:
+    track_records = record.get("tracks", [])
+    if not isinstance(track_records, list):
+        track_records = []
+    notes = record.get("notes", [])
+    if not isinstance(notes, list):
+        notes = []
     return ReleaseTracklistLookup(
         release_id=clean_cell(record.get("release_id")) or release_id,
         artist_name=clean_cell(record.get("artist_name")),
         album_name=clean_cell(record.get("album_name")),
         record_year=clean_cell(record.get("record_year")),
-        tracks=tuple(track_from_cache_record(track) for track in record.get("tracks", []) if isinstance(track, Mapping)),
-        notes=tuple(clean_cell(note) for note in record.get("notes", []) if clean_cell(note)),
+        tracks=tuple(track_from_cache_record(track) for track in track_records if isinstance(track, Mapping)),
+        notes=tuple(clean_cell(note) for note in notes if clean_cell(note)),
     )
 
 
@@ -244,4 +250,3 @@ def tracklist_lookup_to_cache_record(lookup: ReleaseTracklistLookup) -> dict[str
         ],
         "notes": list(lookup.notes),
     }
-

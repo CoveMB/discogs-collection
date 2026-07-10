@@ -1,0 +1,10 @@
+{
+  "name": "discogs-collection",
+  "private": true,
+  "scripts": {
+    "typecheck": "pyright --project pyrightconfig.json"
+  },
+  "devDependencies": {
+    "pyright": "1.1.411"
+  }
+}

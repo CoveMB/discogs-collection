@@ -17,5 +17,18 @@ echo "pre-commit: checking staged formatting"
 echo "pre-commit: running Python syntax lint"
 "$python_bin" -m compileall -q scripts tests
 
+if ! command -v npm >/dev/null 2>&1; then
+    echo "pre-commit: npm is not available; install Node.js and run npm ci --ignore-scripts" >&2
+    exit 1
+fi
+
+if [ ! -x node_modules/.bin/pyright ]; then
+    echo "pre-commit: Pyright is not installed; run npm ci --ignore-scripts" >&2
+    exit 1
+fi
+
+echo "pre-commit: running Python type checks"
+npm run typecheck
+
 echo "pre-commit: running unit tests"
 "$python_bin" -m unittest discover -s tests
