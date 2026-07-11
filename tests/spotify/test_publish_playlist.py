@@ -651,6 +651,55 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             self.assertIn("Matched tracks: 1", report_text)
             self.assertIn("Discogs - Breakbeat | 111 | 1 | Alpha Artist | Alpha One | matched | spotify:track:alpha", report_text)
 
+    def test_dry_run_matches_typographic_apostrophe_and_reports_match(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            row = playlist_row(
+                "36500992",
+                "The Poet And The Muse",
+                "Marcel’s Walk",
+                "Mathys Lenne",
+            )
+            row["Track Number"] = "7"
+            write_playlist_master(
+                playlist_directory / "Discogs - Deep Techno" / "Discogs - Deep Techno.csv",
+                [row],
+            )
+            report_path = directory / "reports" / "spotify-dry-run.txt"
+            client = FakeSpotifyClient(
+                {
+                    (
+                        'track:"Marcel’s Walk" artist:"Mathys Lenne" '
+                        'album:"The Poet And The Muse"'
+                    ): (
+                        SpotifyTrackCandidate(
+                            uri="spotify:track:marcels-walk",
+                            name="Marcel's Walk",
+                            artists=("Mathys Lenne",),
+                            album_name="The Poet And The Muse",
+                        ),
+                    )
+                }
+            )
+
+            summary = dry_run_spotify_playlist_publish(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=client,
+                access_token="access-token",
+            )
+            report_text = report_path.read_text(encoding="utf-8")
+
+        self.assertEqual(summary.matched_count, 1)
+        self.assertEqual(summary.unmatched_count, 0)
+        self.assertIn(
+            "Discogs - Deep Techno | 36500992 | 7 | Mathys Lenne | "
+            "Marcel’s Walk | matched | spotify:track:marcels-walk",
+            report_text,
+        )
+        self.assertNotIn("Track name: different", report_text)
+
     def test_dry_run_records_search_errors_and_still_writes_report(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
@@ -868,7 +917,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             report_text = report_path.read_text(encoding="utf-8")
 
         self.assertEqual(first_summary.cache_hit_count, 0)
-        self.assertEqual(first_summary.search_count, 4)
+        self.assertEqual(first_summary.search_count, 5)
         self.assertEqual(first_summary.unmatched_count, 1)
         self.assertEqual(first_summary.ambiguous_count, 1)
         self.assertEqual(cache_payload["matches"]["111|1|alpha artist|alpha album|alpha one"]["match_status"], "unmatched")
@@ -910,7 +959,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
                                 "spotify_url": "",
                                 "match_status": "unmatched",
                                 "match_reason": "no candidates matched track, artist, and album",
-                                "matcher_version": 1,
+                                "matcher_version": 3,
                                 "searched_at": "2026-06-18T00:00:00Z",
                                 "last_seen_at": "2026-06-18T00:00:00Z",
                             }
@@ -1015,6 +1064,451 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             "track and artist matched; album differed",
         )
 
+    def test_publish_ladder_matches_plain_artist_and_title_query(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            row = playlist_row("25308169", "False Hope", "Loosing Time", "Heap")
+            row["Track Number"] = "7"
+            write_playlist_master(
+                playlist_directory / "Deep Techno" / "Deep Techno.csv",
+                [row],
+            )
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            report_path = directory / "reports" / "spotify-report.txt"
+            client = PublishingSpotifyClient(
+                {
+                    "Heap Loosing Time": (
+                        SpotifyTrackCandidate(
+                            uri="spotify:track:heap-loosing-time",
+                            name="Loosing Time",
+                            artists=("Heap",),
+                            album_name="False Hope",
+                        ),
+                    ),
+                }
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+
+        self.assertEqual(
+            client.searches,
+            [
+                ("access-token", 'track:"Loosing Time" artist:"Heap" album:"False Hope"', 10),
+                ("access-token", 'track:"Loosing Time" artist:"Heap"', 10),
+                ("access-token", "Heap Loosing Time", 10),
+            ],
+        )
+        self.assertEqual(summary.search_count, 3)
+        self.assertEqual(summary.matched_count, 1)
+        self.assertEqual(summary.would_add_count, 1)
+
+    def test_publish_ladder_researches_stale_featured_credit_and_accepts_relocated_artists(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            row = playlist_row(
+                "37672899",
+                "Carl Gari",
+                "Swim feat. Polygonia",
+                "Carl Gari",
+            )
+            row["Track Number"] = "2"
+            write_playlist_master(
+                playlist_directory / "Deep Techno" / "Deep Techno.csv",
+                [row],
+            )
+            cache_key = "37672899|2|carl gari|carl gari|swim feat polygonia"
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            match_cache_path.parent.mkdir(parents=True)
+            match_cache_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "record_type": "spotify_track_match_cache",
+                        "matches": {
+                            cache_key: {
+                                "release_id": "37672899",
+                                "track_number": "2",
+                                "artist_name": "Carl Gari",
+                                "album_name": "Carl Gari",
+                                "track_name": "Swim feat. Polygonia",
+                                "search_query": (
+                                    'track:"Swim feat. Polygonia" artist:"Carl Gari" album:"Carl Gari"'
+                                ),
+                                "spotify_uri": "",
+                                "spotify_url": "",
+                                "match_status": "unmatched",
+                                "match_reason": "no candidates matched track, artist, and album",
+                                "matcher_version": 7,
+                                "searched_at": "2026-07-10T00:00:00Z",
+                                "last_seen_at": "2026-07-10T00:00:00Z",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report_path = directory / "reports" / "spotify-report.txt"
+            candidate = SpotifyTrackCandidate(
+                uri="spotify:track:swim",
+                name="Swim",
+                artists=("Carl Gari", "Polygonia"),
+                album_name="Swim",
+            )
+            client = PublishingSpotifyClient(
+                {
+                    'track:"Swim feat. Polygonia" artist:"Carl Gari" album:"Carl Gari"': (
+                        candidate,
+                    ),
+                }
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+            cache_payload = json.loads(match_cache_path.read_text(encoding="utf-8"))
+            report_text = report_path.read_text(encoding="utf-8")
+
+        cache_record = cache_payload["matches"][cache_key]
+        self.assertEqual(summary.cache_hit_count, 0)
+        self.assertEqual(summary.search_count, 1)
+        self.assertEqual(summary.matched_count, 1)
+        self.assertEqual(summary.would_add_count, 1)
+        self.assertEqual(cache_record["matcher_version"], 8)
+        self.assertEqual(cache_record["spotify_uri"], "spotify:track:swim")
+        self.assertEqual(cache_record["spotify_artist_names"], ["Carl Gari", "Polygonia"])
+        self.assertEqual(
+            cache_record["match_reason"],
+            "track matched after moving source featured credit to Spotify artists; "
+            "source and featured artists matched; album differed",
+        )
+        self.assertIn(
+            "track matched after moving source featured credit to Spotify artists; "
+            "source and featured artists matched; album differed",
+            report_text,
+        )
+
+    def test_publish_ladder_uses_featured_credit_base_title_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            row = playlist_row(
+                "37672899",
+                "Carl Gari",
+                "Swim feat. Polygonia",
+                "Carl Gari",
+            )
+            row["Track Number"] = "2"
+            write_playlist_master(
+                playlist_directory / "Deep Techno" / "Deep Techno.csv",
+                [row],
+            )
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            report_path = directory / "reports" / "spotify-report.txt"
+            client = PublishingSpotifyClient(
+                {
+                    'track:"Swim" artist:"Carl Gari" album:"Carl Gari"': (
+                        SpotifyTrackCandidate(
+                            uri="spotify:track:swim",
+                            name="Swim",
+                            artists=("Carl Gari", "Polygonia"),
+                            album_name="Carl Gari",
+                        ),
+                    ),
+                }
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+
+        self.assertEqual(
+            client.searches,
+            [
+                (
+                    "access-token",
+                    'track:"Swim feat. Polygonia" artist:"Carl Gari" album:"Carl Gari"',
+                    10,
+                ),
+                ("access-token", 'track:"Swim feat. Polygonia" artist:"Carl Gari"', 10),
+                ("access-token", "Carl Gari Swim feat. Polygonia", 10),
+                ("access-token", 'track:"Swim" artist:"Carl Gari" album:"Carl Gari"', 10),
+            ],
+        )
+        self.assertEqual(summary.search_count, 4)
+        self.assertEqual(summary.matched_count, 1)
+        self.assertEqual(summary.would_add_count, 1)
+
+    def test_publish_ladder_uses_bracketed_featured_credit_base_title_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            row = playlist_row(
+                "222",
+                "Test Album",
+                "((( soft pressure ))) [feat. Guest Three]",
+                "Main Artist",
+            )
+            row["Track Number"] = "6"
+            write_playlist_master(
+                playlist_directory / "Experimental" / "Experimental.csv",
+                [row],
+            )
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            report_path = directory / "reports" / "spotify-report.txt"
+            client = PublishingSpotifyClient(
+                {
+                    'track:"((( soft pressure )))" artist:"Main Artist" album:"Test Album"': (
+                        SpotifyTrackCandidate(
+                            uri="spotify:track:soft-pressure",
+                            name="((( soft pressure )))",
+                            artists=("Main Artist", "Guest Three"),
+                            album_name="Test Album",
+                        ),
+                    ),
+                }
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+
+        self.assertEqual(summary.search_count, 4)
+        self.assertEqual(summary.matched_count, 1)
+        self.assertEqual(summary.would_add_count, 1)
+        self.assertEqual(
+            client.searches[-1],
+            (
+                "access-token",
+                'track:"((( soft pressure )))" artist:"Main Artist" album:"Test Album"',
+                10,
+            ),
+        )
+
+    def test_publish_ladder_retries_cached_unmatched_and_accepts_leading_in_title_variant(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            row = playlist_row(
+                "29905411",
+                "Environment Control",
+                "Dark Territory",
+                "Polar Inertia",
+            )
+            row["Track Number"] = "3"
+            write_playlist_master(
+                playlist_directory / "Deep Techno" / "Deep Techno.csv",
+                [row],
+            )
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            match_cache_path.parent.mkdir(parents=True)
+            match_cache_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "record_type": "spotify_track_match_cache",
+                        "matches": {
+                            "29905411|3|polar inertia|environment control|dark territory": {
+                                "release_id": "29905411",
+                                "track_number": "3",
+                                "artist_name": "Polar Inertia",
+                                "album_name": "Environment Control",
+                                "track_name": "Dark Territory",
+                                "search_query": (
+                                    'track:"Dark Territory" artist:"Polar Inertia" '
+                                    'album:"Environment Control"'
+                                ),
+                                "spotify_uri": "",
+                                "spotify_url": "",
+                                "match_status": "unmatched",
+                                "match_reason": "no candidates matched track, artist, and album",
+                                "matcher_version": 4,
+                                "searched_at": "2026-07-10T00:00:00Z",
+                                "last_seen_at": "2026-07-10T00:00:00Z",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report_path = directory / "reports" / "spotify-report.txt"
+            candidate = SpotifyTrackCandidate(
+                uri="spotify:track:dark-territory",
+                name="In Dark Territory",
+                artists=("Polar Inertia",),
+                album_name="Environment Control",
+            )
+            client = PublishingSpotifyClient(
+                {
+                    'track:"Dark Territory" artist:"Polar Inertia" album:"Environment Control"': (
+                        candidate,
+                    ),
+                }
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+            cache_payload = json.loads(match_cache_path.read_text(encoding="utf-8"))
+            report_text = report_path.read_text(encoding="utf-8")
+
+        self.assertEqual(
+            client.searches,
+            [
+                (
+                    "access-token",
+                    'track:"Dark Territory" artist:"Polar Inertia" album:"Environment Control"',
+                    10,
+                ),
+                ("access-token", 'track:"Dark Territory" artist:"Polar Inertia"', 10),
+                ("access-token", "Polar Inertia Dark Territory", 10),
+                ("access-token", "Polar Inertia Dark Territory Environment Control", 10),
+            ],
+        )
+        cache_record = cache_payload["matches"][
+            "29905411|3|polar inertia|environment control|dark territory"
+        ]
+        self.assertEqual(summary.cache_hit_count, 0)
+        self.assertEqual(summary.search_count, 4)
+        self.assertEqual(summary.matched_count, 1)
+        self.assertEqual(summary.would_add_count, 1)
+        self.assertEqual(cache_record["match_status"], "matched")
+        self.assertEqual(cache_record["matcher_version"], 8)
+        self.assertEqual(
+            cache_record["match_reason"],
+            "track title differed only by Spotify's leading 'in'; artist and album matched",
+        )
+        self.assertIn(
+            "track title differed only by Spotify's leading 'in'; artist and album matched",
+            report_text,
+        )
+
+    def test_publish_ladder_matches_original_mix_title_without_annotation(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            row = playlist_row(
+                "37196016",
+                "A Thousand Faces",
+                "Skull Shrine (Original Mix)",
+                "Feral",
+            )
+            write_playlist_master(
+                playlist_directory / "Deep Techno" / "Deep Techno.csv",
+                [row],
+            )
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            report_path = directory / "reports" / "spotify-report.txt"
+            client = PublishingSpotifyClient(
+                {
+                    'track:"Skull Shrine" artist:"Feral"': (
+                        SpotifyTrackCandidate(
+                            uri="spotify:track:skull-shrine",
+                            name="Skull Shrine",
+                            artists=("Feral",),
+                            album_name="A Thousand Faces EP",
+                        ),
+                    ),
+                }
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+            report_text = report_path.read_text(encoding="utf-8")
+
+        self.assertEqual(
+            client.searches,
+            [
+                (
+                    "access-token",
+                    'track:"Skull Shrine (Original Mix)" artist:"Feral" album:"A Thousand Faces"',
+                    10,
+                ),
+                ("access-token", 'track:"Skull Shrine (Original Mix)" artist:"Feral"', 10),
+                ("access-token", "Feral Skull Shrine (Original Mix)", 10),
+                ("access-token", 'track:"Skull Shrine" artist:"Feral" album:"A Thousand Faces"', 10),
+                ("access-token", 'track:"Skull Shrine" artist:"Feral"', 10),
+            ],
+        )
+        self.assertEqual(summary.search_count, 5)
+        self.assertEqual(summary.matched_count, 1)
+        self.assertEqual(summary.would_add_count, 1)
+        self.assertIn(
+            "track matched after removing source Original Mix annotation; artist matched; album differed",
+            report_text,
+        )
+        self.assertIn('search query: track:"Skull Shrine" artist:"Feral"', report_text)
+
     def test_search_budget_finishes_started_ladder_then_stops_before_next_uncached_row(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
@@ -1108,7 +1602,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
                                 "spotify_url": "",
                                 "match_status": "unmatched",
                                 "match_reason": "no candidates matched track, artist, and album",
-                                "matcher_version": 1,
+                                "matcher_version": 5,
                                 "searched_at": "2026-06-18T00:00:00Z",
                                 "last_seen_at": "2026-06-18T00:00:00Z",
                             }
@@ -1225,8 +1719,8 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
                 publisher_sync_mode="append",
             )
 
-        self.assertEqual(len(client.searches), 3)
-        self.assertEqual(summary.search_count, 3)
+        self.assertEqual(len(client.searches), 4)
+        self.assertEqual(summary.search_count, 4)
         self.assertEqual(summary.error_count, 0)
         self.assertEqual(summary.unmatched_count, 1)
 
@@ -2583,7 +3077,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             )
 
         self.assertEqual(summary.track_count, 1)
-        self.assertEqual(len(client.searches), 3)
+        self.assertEqual(len(client.searches), 4)
         self.assertIn('track:"House One"', client.searches[0][1])
         self.assertNotIn("Techno One", " ".join(search[1] for search in client.searches))
 
@@ -2613,7 +3107,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             )
 
         self.assertEqual(summary.track_count, 2)
-        self.assertEqual(len(client.searches), 6)
+        self.assertEqual(len(client.searches), 8)
 
     def test_main_rejects_missing_playlist_before_authorizing_spotify(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

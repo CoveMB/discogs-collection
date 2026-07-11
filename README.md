@@ -416,12 +416,34 @@ python3 scripts/publishers/spotify/publish_playlist.py \
   --publisher-sync-mode append
 ```
 
-For each uncached row, the script builds a structured Spotify search query from
-`Track Name`, `Artist Name`, and `Album Name`. It falls back to the existing
-`Spotify Search Query` column only when the structured fields are blank. A track
-is marked `matched` only when one Spotify result matches track, artist, and
-album after normalization. Multiple matching candidates are marked `ambiguous`,
-and rows with no matching candidate are marked `unmatched`.
+For each uncached row, the script starts with a structured Spotify query using
+`Track Name`, `Artist Name`, and `Album Name`. If that does not find a match, it
+tries the same structured query without the album, individual artist names from
+safe comma-separated artist lists, plain `artist title` text, and the existing
+`Spotify Search Query` value. The matcher treats Unicode punctuation and symbols
+as token separators before comparing track, artist, and album text, so curly
+apostrophes and long dashes behave like their ASCII forms. This normalization
+still requires all words to match. Only the explicit title fallbacks below may
+remove or add text. When a source title ends in `(Original Mix)`, the ladder also
+tries the structured and plain-text queries with that suffix removed. Spotify
+may store an explicit feature credit in its artist list instead of the track
+title. The ladder searches the base title for trailing `feat.` or `ft.` credits,
+standalone parenthesized or bracketed `feat.` credits, and a `feat.` credit at
+the end of a parenthesized mix name. It leaves `featuring` and malformed forms
+unchanged. The shorter title is accepted only when the base title matches,
+Spotify credits at least one non-feature source artist, and every named featured
+artist is also present. The matcher prefers a matching album but can accept one
+unique source-and-featured-artist match when Spotify uses a different album
+name. The matcher also handles cases where Spotify adds a leading `In` to a
+title that Discogs stores without it. It accepts that difference only when the
+Discogs title has at least two words, the remaining normalized title is
+identical, and both the artist and album match. It completes the search ladder
+before accepting this title variant, so an exact title can still win and
+multiple qualifying variants remain ambiguous. Exact titles stay ahead of these
+fallbacks. The Original Mix fallback
+requires a matching artist and prefers a matching album, but it can accept one
+unique track-and-artist result when Spotify uses a different album name. Rows
+with no matching candidate are marked `unmatched`.
 
 The Spotify match cache stores `matched`, `ambiguous`, and `unmatched` decisions.
 Later runs reuse those decisions instead of searching Spotify again. Search

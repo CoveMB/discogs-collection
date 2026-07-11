@@ -38,7 +38,10 @@ from publishers.spotify.match_cache import (  # noqa: E402
 from publishers.spotify.matching import (  # noqa: E402
     AMBIGUOUS,
     ERROR,
+    FEATURED_ARTIST_MATCH_REASON_PREFIX,
+    LEADING_IN_TITLE_MATCH_REASON_PREFIX,
     MATCHED,
+    ORIGINAL_MIX_MATCH_REASON_PREFIX,
     UNMATCHED,
     PlaylistTrack,
     TrackMatchDecision,
@@ -200,6 +203,7 @@ def search_spotify_track(
             track,
             tuple(candidates),
             search_queries=tuple(searched_queries),
+            allow_leading_in_title_variant=False,
         )
         if decision.status in {MATCHED, AMBIGUOUS}:
             return SpotifyTrackSearchResult(decision=decision, search_count=search_count)
@@ -466,7 +470,10 @@ def publish_spotify_playlists(
                             )
                             publish_decision = replace(
                                 publish_decision,
-                                reason=append_publish_reason(known_to_publisher),
+                                reason=publish_reason_with_match_details(
+                                    append_publish_reason(known_to_publisher),
+                                    decision,
+                                ),
                             )
                             decisions[decision_index] = publish_decision
                             append_candidates.append(
@@ -1095,6 +1102,7 @@ def build_publish_decision(
     else:
         status = INCLUDED if apply else WOULD_INCLUDE
         reason = "Spotify artist, album, and track will be included in replacement playlist"
+    reason = publish_reason_with_match_details(reason, decision)
     return PlaylistPublishDecision(
         playlist_name=playlist_name,
         target_playlist_name=target_playlist_name,
@@ -1107,6 +1115,29 @@ def build_publish_decision(
         review_candidates=decision.review_candidates,
         search_queries=decision.search_queries,
     )
+
+
+def publish_reason_with_match_details(
+    publish_reason: str,
+    decision: TrackMatchDecision,
+) -> str:
+    if decision.reason.startswith(
+        (FEATURED_ARTIST_MATCH_REASON_PREFIX, LEADING_IN_TITLE_MATCH_REASON_PREFIX)
+    ):
+        return "; ".join((publish_reason, decision.reason))
+    return publish_reason_with_original_mix_match_details(publish_reason, decision)
+
+
+def publish_reason_with_original_mix_match_details(
+    publish_reason: str,
+    decision: TrackMatchDecision,
+) -> str:
+    if not decision.reason.startswith(ORIGINAL_MIX_MATCH_REASON_PREFIX):
+        return publish_reason
+    details = [decision.reason]
+    if decision.search_queries:
+        details.append(f"search query: {decision.search_queries[-1]}")
+    return "; ".join((publish_reason, *details))
 
 
 def validate_replace_apply_decisions(
