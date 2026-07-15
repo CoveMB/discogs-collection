@@ -24,9 +24,34 @@ INLINE_ENCLOSED_FEATURED_ARTIST_PATTERN = re.compile(
     re.IGNORECASE,
 )
 FEATURED_ARTIST_MATCH_REASON_PREFIX = "track matched after moving source featured credit to Spotify artists"
+SPOTIFY_FEATURED_ARTIST_MATCH_REASON_PREFIX = (
+    "track matched after removing Spotify featured credit from track title"
+)
 ORIGINAL_MIX_SUFFIX_PATTERN = re.compile(r"\s*\(\s*original\s+mix\s*\)\s*$", re.IGNORECASE)
 ORIGINAL_MIX_MATCH_REASON_PREFIX = "track matched after removing source Original Mix annotation"
 LEADING_IN_TITLE_MATCH_REASON_PREFIX = "track title differed only by Spotify's leading 'in'"
+CONSTRAINED_TYPO_MATCH_REASON_PREFIX = "track title matched by constrained typo fallback"
+PROTECTED_TITLE_TOKENS = frozenset(
+    (
+        "acoustic",
+        "dub",
+        "edit",
+        "extended",
+        "instrumental",
+        "live",
+        "mix",
+        "original",
+        "radio",
+        "remaster",
+        "remastered",
+        "remix",
+        "version",
+    )
+)
+MINIMUM_TYPO_TOKEN_LENGTH = 5
+MAXIMUM_CONSTRAINED_TYPO_DISTANCE = 3
+MINIMUM_LONG_TITLE_LENGTH = 20
+MAXIMUM_LONG_TITLE_EDIT_PERCENTAGE = 10
 # Unicode categorizes these apostrophe-like characters as letters rather than punctuation.
 LETTERLIKE_APOSTROPHE_CHARACTERS = frozenset(("\u02bb", "\u02bc"))
 
@@ -205,6 +230,7 @@ def choose_best_track_match(
     candidates: tuple[SpotifyTrackCandidate, ...],
     search_queries: tuple[str, ...] = (),
     allow_leading_in_title_variant: bool = True,
+    allow_constrained_typo_fallback: bool = True,
 ) -> TrackMatchDecision:
     candidates = deduplicate_spotify_track_candidates(candidates)
     exact_matches = tuple(candidate for candidate in candidates if candidate_matches_track(track, candidate))
@@ -305,15 +331,17 @@ def choose_best_track_match(
             search_queries=search_queries,
         )
 
+    featured_credit_reason_prefix = one_sided_featured_credit_match_reason_prefix(track)
+    featured_credit_reason_tail = featured_credit_reason_prefix.removeprefix("track matched ")
     featured_credit_album_matches = tuple(
-        candidate for candidate in candidates if candidate_matches_relocated_featured_credit_track(track, candidate)
+        candidate for candidate in candidates if candidate_matches_one_sided_featured_credit_track(track, candidate)
     )
     if len(featured_credit_album_matches) == 1:
         return TrackMatchDecision(
             track=track,
             status=MATCHED,
             spotify_uri=featured_credit_album_matches[0].uri,
-            reason=f"{FEATURED_ARTIST_MATCH_REASON_PREFIX}; source artist, featured artist, and album matched",
+            reason=f"{featured_credit_reason_prefix}; source artist, featured artist, and album matched",
             candidate=featured_credit_album_matches[0],
             review_candidates=(featured_credit_album_matches[0],),
             search_queries=search_queries,
@@ -324,8 +352,8 @@ def choose_best_track_match(
             status=AMBIGUOUS,
             spotify_uri="",
             reason=(
-                f"{len(featured_credit_album_matches)} candidates matched after moving source featured credit "
-                "to Spotify artists and matching album"
+                f"{len(featured_credit_album_matches)} candidates matched {featured_credit_reason_tail} "
+                "and matching album"
             ),
             candidate=None,
             review_candidates=featured_credit_album_matches,
@@ -335,14 +363,14 @@ def choose_best_track_match(
     featured_credit_artist_matches = tuple(
         candidate
         for candidate in candidates
-        if candidate_matches_relocated_featured_credit_track_and_artist(track, candidate)
+        if candidate_matches_one_sided_featured_credit_track_and_artist(track, candidate)
     )
     if len(featured_credit_artist_matches) == 1:
         return TrackMatchDecision(
             track=track,
             status=MATCHED,
             spotify_uri=featured_credit_artist_matches[0].uri,
-            reason=f"{FEATURED_ARTIST_MATCH_REASON_PREFIX}; source and featured artists matched; album differed",
+            reason=f"{featured_credit_reason_prefix}; source and featured artists matched; album differed",
             candidate=featured_credit_artist_matches[0],
             review_candidates=(featured_credit_artist_matches[0],),
             search_queries=search_queries,
@@ -353,8 +381,8 @@ def choose_best_track_match(
             status=AMBIGUOUS,
             spotify_uri="",
             reason=(
-                f"{len(featured_credit_artist_matches)} candidates matched after moving source featured credit "
-                "to Spotify artists and matching source artist"
+                f"{len(featured_credit_artist_matches)} candidates matched {featured_credit_reason_tail} "
+                "and matching source artist"
             ),
             candidate=None,
             review_candidates=featured_credit_artist_matches,
@@ -389,6 +417,39 @@ def choose_best_track_match(
             ),
             candidate=None,
             review_candidates=leading_in_title_matches,
+            search_queries=search_queries,
+        )
+
+    constrained_typo_matches: tuple[tuple[SpotifyTrackCandidate, int], ...] = ()
+    if allow_constrained_typo_fallback:
+        constrained_typo_matches = tuple(
+            (candidate, distance)
+            for candidate in candidates
+            if (distance := constrained_title_typo_distance(track, candidate)) is not None
+        )
+    if len(constrained_typo_matches) == 1:
+        candidate, distance = constrained_typo_matches[0]
+        return TrackMatchDecision(
+            track=track,
+            status=MATCHED,
+            spotify_uri=candidate.uri,
+            reason=(
+                f"{CONSTRAINED_TYPO_MATCH_REASON_PREFIX} (distance {distance}); "
+                "artist set and album matched"
+            ),
+            candidate=candidate,
+            review_candidates=(candidate,),
+            search_queries=search_queries,
+        )
+    if len(constrained_typo_matches) > 1:
+        typo_candidates = tuple(candidate for candidate, _distance in constrained_typo_matches)
+        return TrackMatchDecision(
+            track=track,
+            status=AMBIGUOUS,
+            spotify_uri="",
+            reason=f"{len(typo_candidates)} candidates matched by constrained typo fallback",
+            candidate=None,
+            review_candidates=typo_candidates,
             search_queries=search_queries,
         )
     return TrackMatchDecision(
@@ -456,26 +517,34 @@ def candidate_matches_original_mix_track_and_artist(
     )
 
 
-def candidate_matches_relocated_featured_credit_track(
+def candidate_matches_one_sided_featured_credit_track(
     track: PlaylistTrack,
     candidate: SpotifyTrackCandidate,
 ) -> bool:
     return (
-        candidate_matches_relocated_featured_credit_track_and_artist(track, candidate)
+        candidate_matches_one_sided_featured_credit_track_and_artist(track, candidate)
         and normalize_music_text(track.album_name) == normalize_music_text(candidate.album_name)
     )
 
 
-def candidate_matches_relocated_featured_credit_track_and_artist(
+def candidate_matches_one_sided_featured_credit_track_and_artist(
     track: PlaylistTrack,
     candidate: SpotifyTrackCandidate,
 ) -> bool:
-    featured_credit = split_featured_artist_credit(track.track_name)
-    if not featured_credit:
+    source_featured_credit = split_featured_artist_credit(track.track_name)
+    spotify_featured_credit = split_featured_artist_credit(candidate.name)
+    if source_featured_credit is not None:
+        if spotify_featured_credit is not None:
+            return False
+        base_title, featured_artist_name = source_featured_credit
+        compared_title = candidate.name
+    elif spotify_featured_credit is not None:
+        base_title, featured_artist_name = spotify_featured_credit
+        compared_title = track.track_name
+    else:
         return False
-    base_title, featured_artist_name = featured_credit
     return (
-        normalize_music_text(base_title) == normalize_music_text(candidate.name)
+        normalize_music_text(base_title) == normalize_music_text(compared_title)
         and source_artist_matches_candidate_without_featured_credit(
             track.artist_name,
             featured_artist_name,
@@ -483,6 +552,12 @@ def candidate_matches_relocated_featured_credit_track_and_artist(
         )
         and featured_artist_credit_matches_candidate(featured_artist_name, candidate.artists)
     )
+
+
+def one_sided_featured_credit_match_reason_prefix(track: PlaylistTrack) -> str:
+    if split_featured_artist_credit(track.track_name) is not None:
+        return FEATURED_ARTIST_MATCH_REASON_PREFIX
+    return SPOTIFY_FEATURED_ARTIST_MATCH_REASON_PREFIX
 
 
 def candidate_matches_leading_in_title_variant(
@@ -505,6 +580,117 @@ def spotify_title_has_leading_in_variant(source_title: str, spotify_title: str) 
         len(source_title_tokens) >= 2
         and source_title_tokens[0] != "in"
         and spotify_title_tokens == ("in", *source_title_tokens)
+    )
+
+
+def constrained_title_typo_distance(
+    track: PlaylistTrack,
+    candidate: SpotifyTrackCandidate,
+) -> int | None:
+    source_album_key = normalize_music_text(track.album_name)
+    if not source_album_key or source_album_key != normalize_music_text(candidate.album_name):
+        return None
+    source_artist_set = normalized_source_artist_set(track.artist_name)
+    if (
+        not source_artist_set
+        or source_artist_set != normalized_candidate_artist_set(candidate.artists)
+    ):
+        return None
+    return tightly_constrained_title_distance(track.track_name, candidate.name)
+
+
+def tightly_constrained_title_distance(source_title: str, candidate_title: str) -> int | None:
+    source_key = normalize_music_text(source_title)
+    candidate_key = normalize_music_text(candidate_title)
+    if not source_key or not candidate_key or source_key == candidate_key:
+        return None
+
+    source_tokens = tuple(source_key.split())
+    candidate_tokens = tuple(candidate_key.split())
+    if len(source_tokens) != len(candidate_tokens):
+        return None
+    differing_tokens = tuple(
+        (source_token, candidate_token)
+        for source_token, candidate_token in zip(source_tokens, candidate_tokens, strict=True)
+        if source_token != candidate_token
+    )
+    if len(differing_tokens) != 1:
+        return None
+
+    source_token, candidate_token = differing_tokens[0]
+    if min(len(source_token), len(candidate_token)) < MINIMUM_TYPO_TOKEN_LENGTH:
+        return None
+    if source_token in PROTECTED_TITLE_TOKENS or candidate_token in PROTECTED_TITLE_TOKENS:
+        return None
+
+    distance = bounded_damerau_levenshtein_distance(
+        source_key,
+        candidate_key,
+        maximum_distance=MAXIMUM_CONSTRAINED_TYPO_DISTANCE,
+    )
+    if distance == 1:
+        return distance
+
+    maximum_title_length = max(len(source_key), len(candidate_key))
+    if (
+        maximum_title_length >= MINIMUM_LONG_TITLE_LENGTH
+        and distance <= MAXIMUM_CONSTRAINED_TYPO_DISTANCE
+        and distance * 100 <= maximum_title_length * MAXIMUM_LONG_TITLE_EDIT_PERCENTAGE
+    ):
+        return distance
+    return None
+
+
+def bounded_damerau_levenshtein_distance(
+    left: str,
+    right: str,
+    maximum_distance: int,
+) -> int:
+    if left == right:
+        return 0
+    if abs(len(left) - len(right)) > maximum_distance:
+        return maximum_distance + 1
+
+    previous_previous_row: list[int] | None = None
+    previous_row = list(range(len(right) + 1))
+    for left_index, left_character in enumerate(left, start=1):
+        current_row = [left_index]
+        for right_index, right_character in enumerate(right, start=1):
+            deletion_cost = previous_row[right_index] + 1
+            insertion_cost = current_row[right_index - 1] + 1
+            substitution_cost = previous_row[right_index - 1] + (left_character != right_character)
+            distance = min(deletion_cost, insertion_cost, substitution_cost)
+            if (
+                previous_previous_row is not None
+                and left_index > 1
+                and right_index > 1
+                and left_character == right[right_index - 2]
+                and left[left_index - 2] == right_character
+            ):
+                distance = min(distance, previous_previous_row[right_index - 2] + 1)
+            current_row.append(distance)
+        previous_previous_row, previous_row = previous_row, current_row
+    return previous_row[-1]
+
+
+def normalized_source_artist_set(artist_name: str) -> frozenset[str]:
+    clean_artist_name = quote_search_filter_value(artist_name)
+    if not clean_artist_name:
+        return frozenset()
+    split_names = split_source_artist_names(clean_artist_name)
+    artist_names = split_names or (clean_artist_name,)
+    return frozenset(
+        artist_key
+        for value in artist_names
+        if (artist_key := normalize_music_text(value))
+    )
+
+
+def normalized_candidate_artist_set(candidate_artists: tuple[str, ...]) -> frozenset[str]:
+    return frozenset(
+        artist_key
+        for artist_name in candidate_artists
+        if (artist_key := normalize_music_text(artist_name))
     )
 
 

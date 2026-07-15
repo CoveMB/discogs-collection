@@ -425,31 +425,46 @@ as token separators before comparing track, artist, and album text, so curly
 apostrophes and long dashes behave like their ASCII forms. This normalization
 still requires all words to match. Only the explicit title fallbacks below may
 remove or add text. When a source title ends in `(Original Mix)`, the ladder also
-tries the structured and plain-text queries with that suffix removed. Spotify
-may store an explicit feature credit in its artist list instead of the track
-title. The ladder searches the base title for trailing `feat.` or `ft.` credits,
-standalone parenthesized or bracketed `feat.` credits, and a `feat.` credit at
-the end of a parenthesized mix name. It leaves `featuring` and malformed forms
-unchanged. The shorter title is accepted only when the base title matches,
-Spotify credits at least one non-feature source artist, and every named featured
-artist is also present. The matcher prefers a matching album but can accept one
-unique source-and-featured-artist match when Spotify uses a different album
-name. The matcher also handles cases where Spotify adds a leading `In` to a
-title that Discogs stores without it. It accepts that difference only when the
-Discogs title has at least two words, the remaining normalized title is
-identical, and both the artist and album match. It completes the search ladder
-before accepting this title variant, so an exact title can still win and
-multiple qualifying variants remain ambiguous. Exact titles stay ahead of these
-fallbacks. The Original Mix fallback
-requires a matching artist and prefers a matching album, but it can accept one
-unique track-and-artist result when Spotify uses a different album name. Rows
-with no matching candidate are marked `unmatched`.
+tries the structured and plain-text queries with that suffix removed. Discogs
+and Spotify may put a feature credit in different places. The matcher can handle
+a supported feature marker that appears in the Discogs title but not the Spotify
+title, or in the Spotify title but not the Discogs title. When the marker is in
+the Discogs title, the ladder also searches for the base title. It recognizes
+trailing `feat.` or `ft.` credits, standalone parenthesized or bracketed `feat.`
+credits, and a `feat.` credit at the end of a parenthesized mix name. It leaves
+`featuring` and malformed forms unchanged. This one-sided title fallback
+requires the same base title, at least one non-feature Discogs artist in
+Spotify's artist list, and every artist named by the feature credit in that
+list. It does not infer a missing feature name. The matcher prefers a matching
+album but can accept one unique source-and-featured-artist match when Spotify
+uses a different album name. The matcher also handles cases where Spotify adds
+a leading `In` to a title that Discogs stores without it. It accepts that
+difference only when the Discogs title has at least two words, the remaining
+normalized title is identical, and both the artist and album match. It completes
+the search ladder before accepting this title variant, so an exact title can
+still win and multiple qualifying variants remain ambiguous. Exact titles stay
+ahead of these fallbacks. The Original Mix fallback requires a matching artist
+and prefers a matching album, but it can accept one unique track-and-artist
+result when Spotify uses a different album name.
+
+Rows that still have no match after the search ladder get one tightly
+constrained typo check. The source and Spotify album must match, and their
+album names must be nonempty. Their normalized artist sets must also be nonempty
+and contain the same names. The titles must have the same number of words with
+exactly one differing word of at least five characters. A one-edit spelling difference is
+allowed. Titles of at least 20 characters may differ by up to three edits when
+those edits affect no more than 10 percent of the normalized title. Version
+words such as `mix`, `remix`, `edit`, `live`, and `dub` cannot be the differing
+word. One qualifying candidate is matched; multiple candidates are reported as
+ambiguous. Numeric titles and broader title changes remain unmatched.
 
 The Spotify match cache stores `matched`, `ambiguous`, and `unmatched` decisions.
 Later runs reuse those decisions instead of searching Spotify again. Search
 errors are not cached, since they usually mean Spotify or the network failed
-temporarily. To recheck every row and replace cached decisions with fresh Spotify
-results without writing playlist changes to Spotify, run:
+temporarily. Typo-derived matches are version-sensitive, so a matcher update can
+recheck them without invalidating ordinary exact matches. To recheck every row
+and replace cached decisions with fresh Spotify results without writing playlist
+changes to Spotify, run:
 
 ```bash
 python3 scripts/publishers/spotify/publish_playlist.py \
@@ -467,6 +482,15 @@ playlist. In append mode it starts with the current Spotify playlist order and
 then adds the planned new tracks. In replace mode it shows the replacement
 playlist. Ambiguous, unmatched, and error rows are not added to the final planned
 state.
+
+For an unmatched row, the report ranks the returned Spotify candidates for
+diagnostic review instead of displaying the first search result. It prefers the
+candidate with the strongest exact title, artist-set, and album evidence, then
+uses title edit distance and stable text fields to break ties. The report labels
+this the best diagnostic candidate and lists the title edit distance, exact or
+partial artist evidence, and album evidence. This ranking only changes the
+report. It does not turn a candidate into a match. If every query returns no
+candidates, the report says so directly.
 
 If Spotify rate-limits a request, the client waits and retries. It honors
 `Retry-After` exactly when Spotify sends it, and uses a 60-second wait when the

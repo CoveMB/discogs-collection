@@ -10,6 +10,7 @@ from pathlib import Path
 
 from publishers.spotify.matching import (
     AMBIGUOUS,
+    CONSTRAINED_TYPO_MATCH_REASON_PREFIX,
     MATCHED,
     UNMATCHED,
     PlaylistTrack,
@@ -24,8 +25,9 @@ from shared.text import clean_cell
 
 MATCH_CACHE_SCHEMA_VERSION = 1
 MATCH_CACHE_RECORD_TYPE = "spotify_track_match_cache"
-MATCHER_VERSION = 8
+MATCHER_VERSION = 10
 CACHEABLE_MATCH_STATUSES = {MATCHED, AMBIGUOUS, UNMATCHED}
+CONSTRAINED_TYPO_MATCH_STRATEGY = "constrained_title_typo"
 
 
 @dataclass(frozen=True)
@@ -77,6 +79,12 @@ def cached_track_match(
         return None
     match_status = clean_cell(record.get("match_status"))
     if match_status in {"matched", "manual"}:
+        if (
+            match_status == MATCHED
+            and cache_record_is_version_sensitive(record)
+            and cache_record_matcher_version(record) != MATCHER_VERSION
+        ):
+            return None
         return cached_matched_track(track, cache_key, record, seen_at=seen_at)
     if match_status in {AMBIGUOUS, UNMATCHED}:
         if cache_record_matcher_version(record) != MATCHER_VERSION:
@@ -90,6 +98,10 @@ def cache_record_matcher_version(record: Mapping[str, object]) -> int:
         return int(str(record.get("matcher_version", "")).strip())
     except ValueError:
         return 0
+
+
+def cache_record_is_version_sensitive(record: Mapping[str, object]) -> bool:
+    return record.get("version_sensitive") is True
 
 
 def cached_matched_track(
@@ -214,6 +226,13 @@ def cache_track_match(
                 "matched_at": timestamp,
             }
         )
+        if decision.reason.startswith(CONSTRAINED_TYPO_MATCH_REASON_PREFIX):
+            record.update(
+                {
+                    "match_strategy": CONSTRAINED_TYPO_MATCH_STRATEGY,
+                    "version_sensitive": True,
+                }
+            )
     else:
         record.update(
             {

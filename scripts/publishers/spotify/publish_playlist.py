@@ -37,11 +37,13 @@ from publishers.spotify.match_cache import (  # noqa: E402
 )
 from publishers.spotify.matching import (  # noqa: E402
     AMBIGUOUS,
+    CONSTRAINED_TYPO_MATCH_REASON_PREFIX,
     ERROR,
     FEATURED_ARTIST_MATCH_REASON_PREFIX,
     LEADING_IN_TITLE_MATCH_REASON_PREFIX,
     MATCHED,
     ORIGINAL_MIX_MATCH_REASON_PREFIX,
+    SPOTIFY_FEATURED_ARTIST_MATCH_REASON_PREFIX,
     UNMATCHED,
     PlaylistTrack,
     TrackMatchDecision,
@@ -204,6 +206,7 @@ def search_spotify_track(
             tuple(candidates),
             search_queries=tuple(searched_queries),
             allow_leading_in_title_variant=False,
+            allow_constrained_typo_fallback=False,
         )
         if decision.status in {MATCHED, AMBIGUOUS}:
             return SpotifyTrackSearchResult(decision=decision, search_count=search_count)
@@ -1122,7 +1125,12 @@ def publish_reason_with_match_details(
     decision: TrackMatchDecision,
 ) -> str:
     if decision.reason.startswith(
-        (FEATURED_ARTIST_MATCH_REASON_PREFIX, LEADING_IN_TITLE_MATCH_REASON_PREFIX)
+        (
+            FEATURED_ARTIST_MATCH_REASON_PREFIX,
+            SPOTIFY_FEATURED_ARTIST_MATCH_REASON_PREFIX,
+            LEADING_IN_TITLE_MATCH_REASON_PREFIX,
+            CONSTRAINED_TYPO_MATCH_REASON_PREFIX,
+        )
     ):
         return "; ".join((publish_reason, decision.reason))
     return publish_reason_with_original_mix_match_details(publish_reason, decision)

@@ -1006,6 +1006,203 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertEqual(cache_payload["matches"]["111|1|alpha artist|alpha album|alpha one"]["match_status"], "matched")
         self.assertEqual(cache_payload["matches"]["111|1|alpha artist|alpha album|alpha one"]["spotify_uri"], "spotify:track:alpha")
 
+    def test_publish_applies_constrained_typo_fallback_only_after_search_ladder_finishes(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            write_playlist_master(
+                playlist_directory / "House" / "House.csv",
+                [playlist_row("111", "Alpha Album", "Alpha Signel", "Alpha Artist")],
+            )
+            report_path = directory / "reports" / "spotify-report.txt"
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            typo_candidate = SpotifyTrackCandidate(
+                uri="spotify:track:typo",
+                name="Alpha Signal",
+                artists=("Alpha Artist",),
+                album_name="Alpha Album",
+            )
+            exact_candidate = SpotifyTrackCandidate(
+                uri="spotify:track:exact",
+                name="Alpha Signel",
+                artists=("Alpha Artist",),
+                album_name="Alpha Album",
+            )
+            client = PublishingSpotifyClient(
+                {
+                    'track:"Alpha Signel" artist:"Alpha Artist" album:"Alpha Album"': (typo_candidate,),
+                    'track:"Alpha Signel" artist:"Alpha Artist"': (exact_candidate,),
+                }
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+            cache_payload = json.loads(match_cache_path.read_text(encoding="utf-8"))
+
+        cache_record = cache_payload["matches"]["111|1|alpha artist|alpha album|alpha signel"]
+        self.assertEqual(summary.search_count, 2)
+        self.assertEqual(summary.matched_count, 1)
+        self.assertEqual(cache_record["spotify_uri"], "spotify:track:exact")
+        self.assertEqual(cache_record["match_reason"], "track, artist, and album matched")
+        self.assertNotIn("version_sensitive", cache_record)
+
+    def test_publish_caches_and_reports_constrained_typo_match_as_version_sensitive(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            write_playlist_master(
+                playlist_directory / "House" / "House.csv",
+                [playlist_row("111", "Alpha Album", "Loosing Time", "Alpha Artist")],
+            )
+            report_path = directory / "reports" / "spotify-report.txt"
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            typo_candidate = SpotifyTrackCandidate(
+                uri="spotify:track:losing-time",
+                name="Losing Time",
+                artists=("Alpha Artist",),
+                album_name="Alpha Album",
+            )
+            client = PublishingSpotifyClient(
+                {
+                    'track:"Loosing Time" artist:"Alpha Artist" album:"Alpha Album"': (typo_candidate,),
+                }
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+            cache_payload = json.loads(match_cache_path.read_text(encoding="utf-8"))
+            report_text = report_path.read_text(encoding="utf-8")
+            second_client = PublishingSpotifyClient({})
+            second_summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=second_client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+
+        cache_record = cache_payload["matches"]["111|1|alpha artist|alpha album|loosing time"]
+        expected_reason = (
+            "track title matched by constrained typo fallback (distance 1); "
+            "artist set and album matched"
+        )
+        self.assertEqual(summary.search_count, 4)
+        self.assertEqual(summary.matched_count, 1)
+        self.assertEqual(cache_record["matcher_version"], 10)
+        self.assertEqual(cache_record["match_strategy"], "constrained_title_typo")
+        self.assertIs(cache_record["version_sensitive"], True)
+        self.assertEqual(cache_record["match_reason"], expected_reason)
+        self.assertIn(expected_reason, report_text)
+        self.assertEqual(second_summary.cache_hit_count, 1)
+        self.assertEqual(second_summary.search_count, 0)
+        self.assertEqual(second_client.searches, [])
+
+    def test_publish_researches_stale_version_sensitive_typo_match(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            write_playlist_master(
+                playlist_directory / "House" / "House.csv",
+                [playlist_row("111", "Alpha Album", "Loosing Time", "Alpha Artist")],
+            )
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            match_cache_path.parent.mkdir(parents=True)
+            match_cache_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "record_type": "spotify_track_match_cache",
+                        "matches": {
+                            "111|1|alpha artist|alpha album|loosing time": {
+                                "release_id": "111",
+                                "track_number": "1",
+                                "artist_name": "Alpha Artist",
+                                "album_name": "Alpha Album",
+                                "track_name": "Loosing Time",
+                                "search_query": 'track:"Loosing Time" artist:"Alpha Artist" album:"Alpha Album"',
+                                "match_status": "matched",
+                                "match_reason": (
+                                    "track title matched by constrained typo fallback (distance 1); "
+                                    "artist set and album matched"
+                                ),
+                                "matcher_version": 9,
+                                "match_strategy": "constrained_title_typo",
+                                "version_sensitive": True,
+                                "spotify_uri": "spotify:track:losing-time",
+                                "spotify_track_name": "Losing Time",
+                                "spotify_artist_names": ["Alpha Artist"],
+                                "spotify_album_name": "Alpha Album",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report_path = directory / "reports" / "spotify-report.txt"
+            typo_candidate = SpotifyTrackCandidate(
+                uri="spotify:track:losing-time",
+                name="Losing Time",
+                artists=("Alpha Artist",),
+                album_name="Alpha Album",
+            )
+            client = PublishingSpotifyClient(
+                {
+                    'track:"Loosing Time" artist:"Alpha Artist" album:"Alpha Album"': (typo_candidate,),
+                }
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+            cache_payload = json.loads(match_cache_path.read_text(encoding="utf-8"))
+
+        cache_record = cache_payload["matches"]["111|1|alpha artist|alpha album|loosing time"]
+        self.assertEqual(summary.cache_hit_count, 0)
+        self.assertEqual(summary.search_count, 4)
+        self.assertEqual(cache_record["matcher_version"], 10)
+
     def test_publish_ladder_matches_unique_title_and_artist_when_album_differs(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
@@ -1199,7 +1396,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertEqual(summary.search_count, 1)
         self.assertEqual(summary.matched_count, 1)
         self.assertEqual(summary.would_add_count, 1)
-        self.assertEqual(cache_record["matcher_version"], 8)
+        self.assertEqual(cache_record["matcher_version"], 10)
         self.assertEqual(cache_record["spotify_uri"], "spotify:track:swim")
         self.assertEqual(cache_record["spotify_artist_names"], ["Carl Gari", "Polygonia"])
         self.assertEqual(
@@ -1212,6 +1409,98 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             "source and featured artists matched; album differed",
             report_text,
         )
+
+    def test_publish_ladder_researches_stale_match_and_accepts_spotify_only_featured_credit(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            row = playlist_row(
+                "111",
+                "Source Album",
+                "Signal Path",
+                "Main Artist",
+            )
+            write_playlist_master(
+                playlist_directory / "Test" / "Test.csv",
+                [row],
+            )
+            cache_key = "111|1|main artist|source album|signal path"
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            match_cache_path.parent.mkdir(parents=True)
+            match_cache_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "record_type": "spotify_track_match_cache",
+                        "matches": {
+                            cache_key: {
+                                "release_id": "111",
+                                "track_number": "1",
+                                "artist_name": "Main Artist",
+                                "album_name": "Source Album",
+                                "track_name": "Signal Path",
+                                "search_query": (
+                                    'track:"Signal Path" artist:"Main Artist" album:"Source Album"'
+                                ),
+                                "spotify_uri": "",
+                                "spotify_url": "",
+                                "match_status": "unmatched",
+                                "match_reason": "no candidates matched track, artist, and album",
+                                "matcher_version": 8,
+                                "searched_at": "2026-07-10T00:00:00Z",
+                                "last_seen_at": "2026-07-10T00:00:00Z",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report_path = directory / "reports" / "spotify-report.txt"
+            candidate = SpotifyTrackCandidate(
+                uri="spotify:track:signal-path",
+                name="Signal Path feat. Guest One",
+                artists=("Main Artist", "Guest One"),
+                album_name="Spotify Album",
+            )
+            client = PublishingSpotifyClient(
+                {
+                    'track:"Signal Path" artist:"Main Artist" album:"Source Album"': (
+                        candidate,
+                    ),
+                }
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+            cache_payload = json.loads(match_cache_path.read_text(encoding="utf-8"))
+            report_text = report_path.read_text(encoding="utf-8")
+
+        cache_record = cache_payload["matches"][cache_key]
+        expected_reason = (
+            "track matched after removing Spotify featured credit from track title; "
+            "source and featured artists matched; album differed"
+        )
+        self.assertEqual(summary.cache_hit_count, 0)
+        self.assertEqual(summary.search_count, 1)
+        self.assertEqual(summary.matched_count, 1)
+        self.assertEqual(summary.would_add_count, 1)
+        self.assertEqual(cache_record["matcher_version"], 10)
+        self.assertEqual(cache_record["spotify_uri"], "spotify:track:signal-path")
+        self.assertEqual(cache_record["spotify_artist_names"], ["Main Artist", "Guest One"])
+        self.assertEqual(cache_record["match_reason"], expected_reason)
+        self.assertIn(expected_reason, report_text)
 
     def test_publish_ladder_uses_featured_credit_base_title_fallback(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1431,7 +1720,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertEqual(summary.matched_count, 1)
         self.assertEqual(summary.would_add_count, 1)
         self.assertEqual(cache_record["match_status"], "matched")
-        self.assertEqual(cache_record["matcher_version"], 8)
+        self.assertEqual(cache_record["matcher_version"], 10)
         self.assertEqual(
             cache_record["match_reason"],
             "track title differed only by Spotify's leading 'in'; artist and album matched",
@@ -1769,7 +2058,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertIn('    - track:"Alpha One" artist:"Alpha Artist" album:"Alpha Album"', report_text)
         self.assertIn('    - track:"Alpha One" artist:"Alpha Artist"', report_text)
         self.assertIn("Spotify returned 1 candidate(s).", report_text)
-        self.assertIn("Closest Spotify result: spotify:track:wrong | Alpha Artist | Wrong Track | Alpha Album", report_text)
+        self.assertIn("Best diagnostic candidate: spotify:track:wrong | Alpha Artist | Wrong Track | Alpha Album", report_text)
         self.assertIn("Track name: different", report_text)
 
     def test_publish_writes_partial_rate_limit_report_then_complete_report_on_rerun(self):
@@ -3050,7 +3339,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             self.assertIn("Discogs - Breakbeat | 222 | 1 | Beta Artist | Beta One | Beta Album", report_text)
             self.assertIn('Search query: track:"Beta One" artist:"Beta Artist" album:"Beta Album"', report_text)
             self.assertIn("Why: no candidates matched track, artist, and album", report_text)
-            self.assertIn("Closest Spotify result: spotify:track:beta-two | Beta Artist | Beta Two | Beta Album", report_text)
+            self.assertIn("Best diagnostic candidate: spotify:track:beta-two | Beta Artist | Beta Two | Beta Album", report_text)
             self.assertIn("Track name: different (Discogs: Beta One; Spotify: Beta Two)", report_text)
 
     def test_dry_run_only_reads_selected_playlist_tracks(self):

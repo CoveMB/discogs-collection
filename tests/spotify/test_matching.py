@@ -892,6 +892,283 @@ class SpotifyMatchingTests(unittest.TestCase):
             "2 candidates matched after moving source featured credit to Spotify artists and matching album",
         )
 
+    def test_accepts_featured_credit_present_only_in_spotify_title(self):
+        track = PlaylistTrack(
+            playlist_name="Discogs - Test",
+            release_id="111",
+            album_name="Test Album",
+            track_number="1",
+            track_name="Signal Path",
+            artist_name="Main Artist",
+            spotify_search_query="Main Artist Signal Path Test Album",
+        )
+        candidate = SpotifyTrackCandidate(
+            uri="spotify:track:signal-path",
+            name="Signal Path feat. Guest One",
+            artists=("Main Artist", "Guest One"),
+            album_name="Test Album",
+        )
+
+        decision = choose_best_track_match(track, (candidate,))
+
+        self.assertEqual(decision.status, "matched")
+        self.assertEqual(decision.spotify_uri, "spotify:track:signal-path")
+        self.assertEqual(
+            decision.reason,
+            "track matched after removing Spotify featured credit from track title; "
+            "source artist, featured artist, and album matched",
+        )
+
+    def test_accepts_supported_featured_credit_forms_present_only_on_spotify(self):
+        cases = (
+            ("Signal Path", "Signal Path ft. Guest One"),
+            ("Night Drive", "Night Drive (feat. Guest One)"),
+            ("Soft Pressure", "Soft Pressure [feat. Guest One]"),
+            ("Summer Exit (Interlude)", "Summer Exit (feat. Guest One) (Interlude)"),
+            (
+                "Magic Signal (Producer's 'Late Mix')",
+                "Magic Signal (Producer's 'Late Mix' feat. Guest One)",
+            ),
+        )
+        for source_title, spotify_title in cases:
+            with self.subTest(spotify_title=spotify_title):
+                track = PlaylistTrack(
+                    playlist_name="Discogs - Test",
+                    release_id="111",
+                    album_name="Test Album",
+                    track_number="1",
+                    track_name=source_title,
+                    artist_name="Main Artist",
+                    spotify_search_query=f"Main Artist {source_title} Test Album",
+                )
+                candidate = SpotifyTrackCandidate(
+                    uri="spotify:track:test",
+                    name=spotify_title,
+                    artists=("Main Artist", "Guest One"),
+                    album_name="Test Album",
+                )
+
+                decision = choose_best_track_match(track, (candidate,))
+
+                self.assertEqual(decision.status, "matched")
+                self.assertEqual(decision.spotify_uri, "spotify:track:test")
+
+    def test_rejects_unsupported_featured_credit_forms_present_only_on_spotify(self):
+        track = PlaylistTrack(
+            playlist_name="Discogs - Test",
+            release_id="111",
+            album_name="Test Album",
+            track_number="1",
+            track_name="Signal Path",
+            artist_name="Main Artist",
+            spotify_search_query="Main Artist Signal Path Test Album",
+        )
+        for spotify_title in (
+            "Signal Path featuring Guest One",
+            "Signal Path feat.",
+            "Signal Path (ft. Guest One)",
+            "Signal Path feat. Guest One (Original Mix)",
+        ):
+            with self.subTest(spotify_title=spotify_title):
+                candidate = SpotifyTrackCandidate(
+                    uri="spotify:track:test",
+                    name=spotify_title,
+                    artists=("Main Artist", "Guest One"),
+                    album_name="Test Album",
+                )
+
+                decision = choose_best_track_match(track, (candidate,))
+
+                self.assertEqual(decision.status, "unmatched")
+                self.assertEqual(decision.spotify_uri, "")
+
+    def test_one_sided_featured_credit_fallback_does_not_reconcile_credits_on_both_titles(self):
+        track = PlaylistTrack(
+            playlist_name="Discogs - Test",
+            release_id="111",
+            album_name="Test Album",
+            track_number="1",
+            track_name="Signal Path feat. Guest One",
+            artist_name="Main Artist",
+            spotify_search_query="Main Artist Signal Path feat. Guest One Test Album",
+        )
+        candidate = SpotifyTrackCandidate(
+            uri="spotify:track:test",
+            name="Signal Path ft. Guest One",
+            artists=("Main Artist", "Guest One"),
+            album_name="Test Album",
+        )
+
+        decision = choose_best_track_match(track, (candidate,))
+
+        self.assertEqual(decision.status, "unmatched")
+        self.assertEqual(decision.spotify_uri, "")
+
+    def test_accepts_spotify_only_multiple_featured_artists_when_all_are_credited(self):
+        track = PlaylistTrack(
+            playlist_name="Discogs - Test",
+            release_id="111",
+            album_name="Test Album",
+            track_number="1",
+            track_name="Where Are You Now",
+            artist_name="Main Artist",
+            spotify_search_query="Main Artist Where Are You Now Test Album",
+        )
+        for spotify_artists in (
+            ("Main Artist", "Guest One", "Guest Two"),
+            ("Main Artist", "Guest One & Guest Two"),
+        ):
+            with self.subTest(spotify_artists=spotify_artists):
+                candidate = SpotifyTrackCandidate(
+                    uri="spotify:track:test",
+                    name="Where Are You Now (feat. Guest One & Guest Two)",
+                    artists=spotify_artists,
+                    album_name="Test Album",
+                )
+
+                decision = choose_best_track_match(track, (candidate,))
+
+                self.assertEqual(decision.status, "matched")
+                self.assertEqual(decision.spotify_uri, "spotify:track:test")
+
+    def test_rejects_spotify_only_featured_credit_without_required_artists(self):
+        track = PlaylistTrack(
+            playlist_name="Discogs - Test",
+            release_id="111",
+            album_name="Test Album",
+            track_number="1",
+            track_name="Signal Path",
+            artist_name="Main Artist",
+            spotify_search_query="Main Artist Signal Path Test Album",
+        )
+
+        for artists in (
+            ("Main Artist",),
+            ("Main Artist", "Different Guest"),
+            ("Guest One",),
+        ):
+            with self.subTest(artists=artists):
+                candidate = SpotifyTrackCandidate(
+                    uri="spotify:track:signal-path",
+                    name="Signal Path feat. Guest One",
+                    artists=artists,
+                    album_name="Test Album",
+                )
+
+                decision = choose_best_track_match(track, (candidate,))
+
+                self.assertEqual(decision.status, "unmatched")
+                self.assertEqual(decision.spotify_uri, "")
+
+    def test_rejects_partial_spotify_only_multiple_featured_artist_credit(self):
+        track = PlaylistTrack(
+            playlist_name="Discogs - Test",
+            release_id="111",
+            album_name="Test Album",
+            track_number="1",
+            track_name="Where Are You Now",
+            artist_name="Main Artist",
+            spotify_search_query="Main Artist Where Are You Now Test Album",
+        )
+        candidate = SpotifyTrackCandidate(
+            uri="spotify:track:partial",
+            name="Where Are You Now (feat. Guest One & Guest Two)",
+            artists=("Main Artist", "Guest One"),
+            album_name="Test Album",
+        )
+
+        decision = choose_best_track_match(track, (candidate,))
+
+        self.assertEqual(decision.status, "unmatched")
+        self.assertEqual(decision.spotify_uri, "")
+
+    def test_accepts_spotify_only_featured_credit_when_album_differs(self):
+        track = PlaylistTrack(
+            playlist_name="Discogs - Test",
+            release_id="111",
+            album_name="Source Album",
+            track_number="1",
+            track_name="Signal Path",
+            artist_name="Main Artist",
+            spotify_search_query="Main Artist Signal Path Source Album",
+        )
+        candidate = SpotifyTrackCandidate(
+            uri="spotify:track:signal-path",
+            name="Signal Path feat. Guest One",
+            artists=("Main Artist", "Guest One"),
+            album_name="Spotify Album",
+        )
+
+        decision = choose_best_track_match(track, (candidate,))
+
+        self.assertEqual(decision.status, "matched")
+        self.assertEqual(decision.spotify_uri, "spotify:track:signal-path")
+        self.assertEqual(
+            decision.reason,
+            "track matched after removing Spotify featured credit from track title; "
+            "source and featured artists matched; album differed",
+        )
+
+    def test_prefers_exact_title_over_spotify_only_featured_credit_candidate(self):
+        track = PlaylistTrack(
+            playlist_name="Discogs - Test",
+            release_id="111",
+            album_name="Test Album",
+            track_number="1",
+            track_name="Signal Path",
+            artist_name="Main Artist",
+            spotify_search_query="Main Artist Signal Path Test Album",
+        )
+        candidates = (
+            SpotifyTrackCandidate(
+                uri="spotify:track:featured",
+                name="Signal Path feat. Guest One",
+                artists=("Main Artist", "Guest One"),
+                album_name="Test Album",
+            ),
+            SpotifyTrackCandidate(
+                uri="spotify:track:exact",
+                name="Signal Path",
+                artists=("Main Artist",),
+                album_name="Test Album",
+            ),
+        )
+
+        decision = choose_best_track_match(track, candidates)
+
+        self.assertEqual(decision.status, "matched")
+        self.assertEqual(decision.spotify_uri, "spotify:track:exact")
+        self.assertEqual(decision.reason, "track, artist, and album matched")
+
+    def test_marks_multiple_spotify_only_featured_credit_candidates_as_ambiguous(self):
+        track = PlaylistTrack(
+            playlist_name="Discogs - Test",
+            release_id="111",
+            album_name="Test Album",
+            track_number="1",
+            track_name="Signal Path",
+            artist_name="Main Artist",
+            spotify_search_query="Main Artist Signal Path Test Album",
+        )
+        candidates = tuple(
+            SpotifyTrackCandidate(
+                uri=f"spotify:track:signal-path-{index}",
+                name="Signal Path feat. Guest One",
+                artists=("Main Artist", "Guest One"),
+                album_name="Test Album",
+            )
+            for index in range(2)
+        )
+
+        decision = choose_best_track_match(track, candidates)
+
+        self.assertEqual(decision.status, "ambiguous")
+        self.assertEqual(decision.spotify_uri, "")
+        self.assertEqual(
+            decision.reason,
+            "2 candidates matched after removing Spotify featured credit from track title and matching album",
+        )
+
     def test_accepts_unannotated_candidate_for_source_original_mix_variations_when_album_differs(self):
         for suffix in (
             "(Original Mix)",
@@ -1079,6 +1356,234 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.status, "ambiguous")
         self.assertEqual(decision.spotify_uri, "")
         self.assertEqual(decision.reason, "2 candidates matched track, artist, and album")
+
+    def test_accepts_tightly_constrained_title_typos(self):
+        cases = (
+            ("Loosing Time", "Losing Time", 1),
+            ("Alpha Siganl", "Alpha Signal", 1),
+            ("Signals From An Unconncet Dimension", "Signals From An Unconnected Dimension", 3),
+            ("Reson", "Resin", 1),
+        )
+        for source_title, spotify_title, expected_distance in cases:
+            with self.subTest(source_title=source_title, spotify_title=spotify_title):
+                track = PlaylistTrack(
+                    playlist_name="Discogs - Test",
+                    release_id="111",
+                    album_name="Test Album",
+                    track_number="1",
+                    track_name=source_title,
+                    artist_name="Main Artist",
+                    spotify_search_query=f"Main Artist {source_title} Test Album",
+                )
+                candidate = SpotifyTrackCandidate(
+                    uri="spotify:track:test",
+                    name=spotify_title,
+                    artists=("Main Artist",),
+                    album_name="Test Album",
+                )
+
+                decision = choose_best_track_match(track, (candidate,))
+
+                self.assertEqual(decision.status, "matched")
+                self.assertEqual(decision.spotify_uri, "spotify:track:test")
+                self.assertEqual(
+                    decision.reason,
+                    "track title matched by constrained typo fallback "
+                    f"(distance {expected_distance}); artist set and album matched",
+                )
+
+    def test_constrained_typo_fallback_requires_exact_artist_set_and_album(self):
+        track = PlaylistTrack(
+            playlist_name="Discogs - Test",
+            release_id="111",
+            album_name="Test Album",
+            track_number="1",
+            track_name="Reson",
+            artist_name="Main Artist, Second Artist",
+            spotify_search_query="Main Artist, Second Artist Reson Test Album",
+        )
+        rejected_candidates = (
+            SpotifyTrackCandidate(
+                uri="spotify:track:missing-artist",
+                name="Resin",
+                artists=("Main Artist",),
+                album_name="Test Album",
+            ),
+            SpotifyTrackCandidate(
+                uri="spotify:track:extra-artist",
+                name="Resin",
+                artists=("Main Artist", "Second Artist", "Guest Artist"),
+                album_name="Test Album",
+            ),
+            SpotifyTrackCandidate(
+                uri="spotify:track:wrong-album",
+                name="Resin",
+                artists=("Second Artist", "Main Artist"),
+                album_name="Other Album",
+            ),
+        )
+
+        for candidate in rejected_candidates:
+            with self.subTest(uri=candidate.uri):
+                decision = choose_best_track_match(track, (candidate,))
+
+                self.assertEqual(decision.status, "unmatched")
+                self.assertEqual(decision.spotify_uri, "")
+
+        reordered_artist_candidate = SpotifyTrackCandidate(
+            uri="spotify:track:reordered-artists",
+            name="Resin",
+            artists=("Second Artist", "Main Artist"),
+            album_name="Test Album",
+        )
+
+        decision = choose_best_track_match(track, (reordered_artist_candidate,))
+
+        self.assertEqual(decision.status, "matched")
+        self.assertEqual(decision.spotify_uri, "spotify:track:reordered-artists")
+
+    def test_constrained_typo_fallback_rejects_broad_title_changes(self):
+        cases = (
+            ("Heat", "Beat"),
+            ("1", "White"),
+            ("Reson", "Rasin"),
+            ("Alpha Signal", "Alpha Sign"),
+            ("Alpha Signal", "Signal Alpha"),
+            ("Alpha Signal Original Mix", "Alpha Signal Original Edit"),
+            ("Alpha Signal", "Alpha Signel Extended"),
+        )
+        for source_title, spotify_title in cases:
+            with self.subTest(source_title=source_title, spotify_title=spotify_title):
+                track = PlaylistTrack(
+                    playlist_name="Discogs - Test",
+                    release_id="111",
+                    album_name="Test Album",
+                    track_number="1",
+                    track_name=source_title,
+                    artist_name="Main Artist",
+                    spotify_search_query=f"Main Artist {source_title} Test Album",
+                )
+                candidate = SpotifyTrackCandidate(
+                    uri="spotify:track:test",
+                    name=spotify_title,
+                    artists=("Main Artist",),
+                    album_name="Test Album",
+                )
+
+                decision = choose_best_track_match(track, (candidate,))
+
+                self.assertEqual(decision.status, "unmatched")
+                self.assertEqual(decision.spotify_uri, "")
+
+    def test_marks_multiple_constrained_typo_candidates_as_ambiguous(self):
+        track = PlaylistTrack(
+            playlist_name="Discogs - Test",
+            release_id="111",
+            album_name="Test Album",
+            track_number="1",
+            track_name="Reson",
+            artist_name="Main Artist",
+            spotify_search_query="Main Artist Reson Test Album",
+        )
+        candidates = (
+            SpotifyTrackCandidate(
+                uri="spotify:track:resin",
+                name="Resin",
+                artists=("Main Artist",),
+                album_name="Test Album",
+            ),
+            SpotifyTrackCandidate(
+                uri="spotify:track:reron",
+                name="Reron",
+                artists=("Main Artist",),
+                album_name="Test Album",
+            ),
+        )
+
+        decision = choose_best_track_match(track, candidates)
+
+        self.assertEqual(decision.status, "ambiguous")
+        self.assertEqual(decision.spotify_uri, "")
+        self.assertEqual(decision.reason, "2 candidates matched by constrained typo fallback")
+        self.assertEqual(decision.review_candidates, candidates)
+
+    def test_constrained_typo_fallback_requires_nonempty_artist_and_album(self):
+        cases = (
+            ("", "Test Album", ("Main Artist",)),
+            ("", "Test Album", ()),
+            ("Main Artist", "", ("Main Artist",)),
+            ("Main Artist", "Test Album", ()),
+        )
+        for source_artist, source_album, candidate_artists in cases:
+            with self.subTest(source_artist=source_artist, source_album=source_album):
+                track = PlaylistTrack(
+                    playlist_name="Discogs - Test",
+                    release_id="111",
+                    album_name=source_album,
+                    track_number="1",
+                    track_name="Loosing Time",
+                    artist_name=source_artist,
+                    spotify_search_query="Loosing Time",
+                )
+                candidate = SpotifyTrackCandidate(
+                    uri="spotify:track:losing-time",
+                    name="Losing Time",
+                    artists=candidate_artists,
+                    album_name=source_album,
+                )
+
+                decision = choose_best_track_match(track, (candidate,))
+
+                self.assertEqual(decision.status, "unmatched")
+                self.assertEqual(decision.spotify_uri, "")
+
+    def test_deduplicates_constrained_typo_candidates_by_spotify_uri(self):
+        track = PlaylistTrack(
+            playlist_name="Discogs - Test",
+            release_id="111",
+            album_name="Test Album",
+            track_number="1",
+            track_name="Loosing Time",
+            artist_name="Main Artist",
+            spotify_search_query="Main Artist Loosing Time Test Album",
+        )
+        candidate = SpotifyTrackCandidate(
+            uri="spotify:track:losing-time",
+            name="Losing Time",
+            artists=("Main Artist",),
+            album_name="Test Album",
+        )
+
+        decision = choose_best_track_match(track, (candidate, candidate))
+
+        self.assertEqual(decision.status, "matched")
+        self.assertEqual(decision.spotify_uri, "spotify:track:losing-time")
+
+    def test_can_disable_constrained_typo_fallback_while_search_ladder_continues(self):
+        track = PlaylistTrack(
+            playlist_name="Discogs - Test",
+            release_id="111",
+            album_name="Test Album",
+            track_number="1",
+            track_name="Loosing Time",
+            artist_name="Main Artist",
+            spotify_search_query="Main Artist Loosing Time Test Album",
+        )
+        candidate = SpotifyTrackCandidate(
+            uri="spotify:track:losing-time",
+            name="Losing Time",
+            artists=("Main Artist",),
+            album_name="Test Album",
+        )
+
+        decision = choose_best_track_match(
+            track,
+            (candidate,),
+            allow_constrained_typo_fallback=False,
+        )
+
+        self.assertEqual(decision.status, "unmatched")
+        self.assertEqual(decision.spotify_uri, "")
 
     def test_rejects_candidates_that_do_not_match_track_artist_and_album(self):
         track = PlaylistTrack(

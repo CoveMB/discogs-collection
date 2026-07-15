@@ -13,8 +13,11 @@ from publishers.spotify.matching import (
     PlaylistTrack,
     SpotifyTrackCandidate,
     TrackMatchDecision,
+    bounded_damerau_levenshtein_distance,
     build_spotify_track_search_query,
     normalize_music_text,
+    normalized_candidate_artist_set,
+    normalized_source_artist_set,
     source_artist_matches_candidate,
 )
 from publishers.spotify.publish_types import (
@@ -190,14 +193,7 @@ def format_publish_review_details(decision: PlaylistPublishDecision) -> list[str
         else:
             lines.append("  Matching Spotify candidates: none recorded")
         return lines
-    if not decision.review_candidates:
-        lines.append("  Spotify returned 0 candidates.")
-        return lines
-    closest_candidate = decision.review_candidates[0]
-    lines.append(f"  Spotify returned {len(decision.review_candidates)} candidate(s).")
-    lines.append(f"  Closest Spotify result: {format_spotify_candidate(closest_candidate)}")
-    lines.append("  Comparison:")
-    lines.extend(format_candidate_comparison(decision.track, closest_candidate))
+    append_unmatched_candidate_diagnostics(lines, decision.track, decision.review_candidates)
     return lines
 
 
@@ -302,15 +298,7 @@ def format_unmatched_track_details(decision: TrackMatchDecision) -> list[str]:
         f"  Search query: {format_search_query(decision.track)}",
         f"  Why: {display_report_value(decision.reason)}",
     ]
-    if not decision.review_candidates:
-        lines.append("  Spotify returned 0 candidates.")
-        return lines
-
-    closest_candidate = decision.review_candidates[0]
-    lines.append(f"  Spotify returned {len(decision.review_candidates)} candidate(s).")
-    lines.append(f"  Closest Spotify result: {format_spotify_candidate(closest_candidate)}")
-    lines.append("  Comparison:")
-    lines.extend(format_candidate_comparison(decision.track, closest_candidate))
+    append_unmatched_candidate_diagnostics(lines, decision.track, decision.review_candidates)
     return lines
 
 
@@ -345,32 +333,179 @@ def format_spotify_artists(candidate: SpotifyTrackCandidate) -> str:
     return display_report_value(", ".join(candidate.artists))
 
 
+def append_unmatched_candidate_diagnostics(
+    lines: list[str],
+    track: PlaylistTrack,
+    candidates: Sequence[SpotifyTrackCandidate],
+) -> None:
+    if not candidates:
+        lines.append("  Spotify returned 0 candidates.")
+        lines.append("  Diagnostic: no Spotify candidates were returned by any query.")
+        return
+
+    candidate = best_diagnostic_candidate(track, candidates)
+    lines.append(f"  Spotify returned {len(candidates)} candidate(s).")
+    lines.append(f"  Best diagnostic candidate: {format_spotify_candidate(candidate)}")
+    lines.append(f"  Diagnostic: {format_candidate_diagnostic_summary(track, candidate)}")
+    lines.append("  Comparison:")
+    lines.extend(format_candidate_comparison(track, candidate))
+
+
+def best_diagnostic_candidate(
+    track: PlaylistTrack,
+    candidates: Sequence[SpotifyTrackCandidate],
+) -> SpotifyTrackCandidate:
+    return min(candidates, key=lambda candidate: diagnostic_candidate_sort_key(track, candidate))
+
+
+def diagnostic_candidate_sort_key(
+    track: PlaylistTrack,
+    candidate: SpotifyTrackCandidate,
+) -> tuple[int, int, int, int, int, str, str, tuple[str, ...], str]:
+    title_matches = normalized_nonempty_values_match(track.track_name, candidate.name)
+    artist_set_matches = normalized_artist_sets_match(track.artist_name, candidate.artists)
+    album_matches = normalized_nonempty_values_match(track.album_name, candidate.album_name)
+    partial_artist_match = source_artist_matches_candidate(track.artist_name, candidate.artists)
+    exact_identity_field_count = sum((title_matches, artist_set_matches, album_matches))
+    return (
+        -exact_identity_field_count,
+        -int(artist_set_matches),
+        -int(album_matches),
+        -int(partial_artist_match),
+        candidate_title_edit_distance(track, candidate),
+        normalize_music_text(candidate.name),
+        normalize_music_text(candidate.album_name),
+        tuple(sorted(normalized_candidate_artist_set(candidate.artists))),
+        candidate.uri,
+    )
+
+
+def candidate_title_edit_distance(
+    track: PlaylistTrack,
+    candidate: SpotifyTrackCandidate,
+) -> int:
+    source_title = normalize_music_text(track.track_name)
+    candidate_title = normalize_music_text(candidate.name)
+    return bounded_damerau_levenshtein_distance(
+        source_title,
+        candidate_title,
+        maximum_distance=max(len(source_title), len(candidate_title)),
+    )
+
+
+def normalized_nonempty_values_match(left: str, right: str) -> bool:
+    left_key = normalize_music_text(left)
+    return bool(left_key) and left_key == normalize_music_text(right)
+
+
+def normalized_artist_sets_match(
+    source_artist_name: str,
+    candidate_artists: tuple[str, ...],
+) -> bool:
+    source_artist_set = normalized_source_artist_set(source_artist_name)
+    candidate_artist_set = normalized_candidate_artist_set(candidate_artists)
+    return bool(source_artist_set) and source_artist_set == candidate_artist_set
+
+
+def format_candidate_diagnostic_summary(
+    track: PlaylistTrack,
+    candidate: SpotifyTrackCandidate,
+) -> str:
+    title_evidence = format_title_diagnostic_evidence(track, candidate)
+    artist_evidence = format_artist_diagnostic_evidence(track, candidate)
+    album_evidence = format_album_diagnostic_evidence(track, candidate)
+    return f"{title_evidence}; {artist_evidence}; {album_evidence}."
+
+
+def format_title_diagnostic_evidence(
+    track: PlaylistTrack,
+    candidate: SpotifyTrackCandidate,
+) -> str:
+    source_title = normalize_music_text(track.track_name)
+    candidate_title = normalize_music_text(candidate.name)
+    if not source_title or not candidate_title:
+        return "title comparison unavailable"
+    if source_title == candidate_title:
+        return "title matches"
+    distance = candidate_title_edit_distance(track, candidate)
+    edit_label = "edit" if distance == 1 else "edits"
+    return f"title differs by {distance} {edit_label}"
+
+
+def format_artist_diagnostic_evidence(
+    track: PlaylistTrack,
+    candidate: SpotifyTrackCandidate,
+) -> str:
+    source_artist_set = normalized_source_artist_set(track.artist_name)
+    candidate_artist_set = normalized_candidate_artist_set(candidate.artists)
+    if not source_artist_set or not candidate_artist_set:
+        return "artist comparison unavailable"
+    if source_artist_set == candidate_artist_set:
+        return "artist set matches"
+    if source_artist_matches_candidate(track.artist_name, candidate.artists):
+        return "at least one source artist matches"
+    return "artist differs"
+
+
+def format_album_diagnostic_evidence(
+    track: PlaylistTrack,
+    candidate: SpotifyTrackCandidate,
+) -> str:
+    source_album = normalize_music_text(track.album_name)
+    candidate_album = normalize_music_text(candidate.album_name)
+    if not source_album or not candidate_album:
+        return "album comparison unavailable"
+    return "album matches" if source_album == candidate_album else "album differs"
+
+
 def format_candidate_comparison(track: PlaylistTrack, candidate: SpotifyTrackCandidate) -> list[str]:
+    artist_set_matches = normalized_artist_sets_match(track.artist_name, candidate.artists)
+    partial_artist_match = source_artist_matches_candidate(track.artist_name, candidate.artists)
+    artist_status = "matches exactly" if artist_set_matches else "partial match" if partial_artist_match else "different"
     return [
-        format_field_comparison(
+        format_field_comparison_status(
             "Track name",
             track.track_name,
             candidate.name,
-            normalize_music_text(track.track_name) == normalize_music_text(candidate.name),
+            "matches" if normalized_nonempty_values_match(track.track_name, candidate.name) else "different",
         ),
-        format_field_comparison(
+        f"    Title edit distance: {candidate_title_edit_distance(track, candidate)}",
+        format_field_comparison_status(
             "Artist",
             track.artist_name,
             ", ".join(candidate.artists),
-            source_artist_matches_candidate(track.artist_name, candidate.artists),
+            artist_status,
         ),
-        format_field_comparison(
+        format_field_comparison_status(
             "Album",
             track.album_name,
             candidate.album_name,
-            normalize_music_text(track.album_name) == normalize_music_text(candidate.album_name),
+            "matches" if normalized_nonempty_values_match(track.album_name, candidate.album_name) else "different",
         ),
     ]
 
 
-def format_field_comparison(label: str, discogs_value: str, spotify_value: str, matches: bool) -> str:
-    status = "matches" if matches else "different"
+def format_field_comparison_status(
+    label: str,
+    discogs_value: str,
+    spotify_value: str,
+    status: str,
+) -> str:
     return (
         f"    {label}: {status} "
         f"(Discogs: {display_report_value(discogs_value)}; Spotify: {display_report_value(spotify_value)})"
+    )
+
+
+def format_field_comparison(
+    label: str,
+    discogs_value: str,
+    spotify_value: str,
+    matches: bool,
+) -> str:
+    return format_field_comparison_status(
+        label,
+        discogs_value,
+        spotify_value,
+        "matches" if matches else "different",
     )
