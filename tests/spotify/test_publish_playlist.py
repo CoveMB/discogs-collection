@@ -13,6 +13,7 @@ SCRIPTS_DIRECTORY = PROJECT_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 
 from publishers.spotify.client import (
+    SpotifyAlbumLookupError,
     SpotifyApiError,
     SpotifyPlaylist,
     SpotifyPlaylistItem,
@@ -21,6 +22,7 @@ from publishers.spotify.client import (
 )
 from publishers.spotify.env import SpotifySettings
 from publishers.spotify.matching import PlaylistTrack, SpotifyTrackCandidate
+from publishers.spotify.release_matching import SpotifyAlbumCandidate, SpotifyAlbumTrack
 from publishers.spotify.authorization_flow import DEFAULT_AUTHORIZE_SCOPES
 from publishers.spotify.publish_playlist import dry_run_spotify_playlist_publish, publish_spotify_playlists
 from publishers.spotify.publish_state import record_spotify_publish_state_track, save_spotify_publish_state
@@ -183,6 +185,48 @@ class PublishingSpotifyClient(FakeSpotifyClient):
         return SpotifyPlaylistItem(uri=uri, name=uri.rsplit(":", 1)[-1], artists=(), album_name="")
 
 
+class StrictPositionPublishingSpotifyClient(PublishingSpotifyClient):
+    def add_playlist_items(self, access_token, playlist_id, uris, position=None):
+        current_item_count = len(self.playlist_items_by_id.get(playlist_id, ()))
+        if position is not None and position > current_item_count:
+            raise SpotifyApiError(
+                'Spotify playlist add items failed with status 400: '
+                '{"error": {"status": 400, "message": "Index out of bounds" } }'
+            )
+        return super().add_playlist_items(access_token, playlist_id, uris, position=position)
+
+
+class AlbumPublishingSpotifyClient(PublishingSpotifyClient):
+    def __init__(self, album_candidates, album_tracks_by_id, candidates_by_query=None):
+        super().__init__(candidates_by_query or {})
+        self.album_candidates = album_candidates
+        self.album_tracks_by_id = album_tracks_by_id
+        self.album_searches = []
+        self.album_track_requests = []
+
+    def search_albums(self, access_token, query, limit=10):
+        self.album_searches.append((access_token, query, limit))
+        return self.album_candidates
+
+    def get_album_tracks(self, access_token, album_id):
+        self.album_track_requests.append((access_token, album_id))
+        return self.album_tracks_by_id[album_id]
+
+
+class DeferredAlbumPublishingSpotifyClient(AlbumPublishingSpotifyClient):
+    def search_albums(self, access_token, query, limit=10):
+        self.album_searches.append((access_token, query, limit))
+        raise SpotifyRateLimitDeferredError(retry_after_seconds=9999, max_wait_seconds=480)
+
+
+class FailingAlbumPublishingSpotifyClient(AlbumPublishingSpotifyClient):
+    def search_albums(self, access_token, query, limit=10):
+        self.album_searches.append((access_token, query, limit))
+        raise SpotifyAlbumLookupError(
+            "Spotify album search failed with status 500: temporary failure"
+        )
+
+
 class DeferredSecondSearchPublishingClient(PublishingSpotifyClient):
     def search_tracks(self, access_token, query, limit=10):
         self.searches.append((access_token, query, limit))
@@ -290,11 +334,17 @@ def write_playlist_master(path: Path, rows: list[dict[str, str]]) -> None:
         writer.writerows(rows)
 
 
-def playlist_row(release_id: str, album_name: str, track_name: str, artist_name: str) -> dict[str, str]:
+def playlist_row(
+    release_id: str,
+    album_name: str,
+    track_name: str,
+    artist_name: str,
+    track_number: str = "1",
+) -> dict[str, str]:
     return {
         "Release Id": release_id,
         "Album Name": album_name,
-        "Track Number": "1",
+        "Track Number": track_number,
         "Track Name": track_name,
         "Artist Name": artist_name,
         "Spotify Search Query": f"{artist_name} {track_name} {album_name}",
@@ -375,6 +425,86 @@ def publish_summary_stub(**overrides):
 
 
 class SpotifyPublishPlaylistTests(unittest.TestCase):
+    def test_append_apply_orders_new_append_before_later_restored_track_position(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            rows = [
+                playlist_row("111", "Alpha Album", "Alpha One", "Alpha Artist"),
+                playlist_row("222", "Beta Album", "Beta One", "Beta Artist"),
+                playlist_row("333", "Gamma Album", "Gamma One", "Gamma Artist"),
+            ]
+            write_playlist_master(playlist_directory / "Deep Techno" / "Deep Techno.csv", rows)
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            publish_state_cache_path = directory / "collection" / "cache" / "spotify-publish-state.cache.json"
+            seed_known_publish_state(
+                publish_state_cache_path,
+                playlist_name="Discogs - Deep Techno",
+                row=rows[2],
+                source_position=3,
+            )
+            client = StrictPositionPublishingSpotifyClient(
+                {
+                    f'track:"{row["Track Name"]}" artist:"{row["Artist Name"]}" album:"{row["Album Name"]}"': (
+                        matching_candidate(row),
+                    )
+                    for row in rows
+                },
+                playlists=(
+                    SpotifyPlaylist(
+                        playlist_id="playlist-deep-techno",
+                        name="Discogs - Deep Techno",
+                        url="",
+                        owner_id="current-user",
+                        public=False,
+                    ),
+                ),
+                playlist_items_by_id={
+                    "playlist-deep-techno": (
+                        SpotifyPlaylistItem(
+                            uri="spotify:track:111",
+                            name="Alpha One",
+                            artists=("Alpha Artist",),
+                            album_name="Alpha Album",
+                        ),
+                    )
+                },
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=directory / "reports" / "spotify-report.txt",
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publish_state_cache_path=publish_state_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                publisher_sync_mode="append",
+                max_new_searches_per_run=0,
+            )
+
+        self.assertEqual(summary.already_present_count, 1)
+        self.assertEqual(summary.added_count, 2)
+        self.assertIn("restored at its source-order position", summary.decisions[2].reason)
+        self.assertEqual(
+            client.add_calls,
+            [
+                (
+                    "playlist-deep-techno",
+                    ("spotify:track:222", "spotify:track:333"),
+                    None,
+                ),
+            ],
+        )
+        self.assertEqual(
+            [item.name for item in client.playlist_items_by_id["playlist-deep-techno"]],
+            ["Alpha One", "Beta One", "Gamma One"],
+        )
+
     def test_append_plan_places_known_missing_track_before_next_source_anchor(self):
         from publishers.spotify import publish_playlist
 
@@ -732,6 +862,452 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             self.assertIn("Error: Spotify search failed with status 500: temporary failure", report_text)
             self.assertIn("temporary failure", report_text)
             self.assertIn("Discogs - Breakbeat | 222 | 1 | Beta Artist | Beta One | matched | spotify:track:beta", report_text)
+
+    def test_publish_defaults_to_validated_album_matching_before_track_search(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            source_rows = [
+                playlist_row("23288552", "Numbers and Colours", "1", "Example Artist, Collaborator", "1"),
+                playlist_row("23288552", "Numbers and Colours", "2", "Example Artist, Collaborator", "2"),
+                playlist_row("23288552", "Numbers and Colours", "3", "Example Artist, Collaborator", "3"),
+                playlist_row("23288552", "Numbers and Colours", "Silent Anchor", "Example Artist, Collaborator", "4"),
+                playlist_row("23288552", "Numbers and Colours", "Hidden Anchor", "Example Artist, Collaborator", "5"),
+                playlist_row("23288552", "Numbers and Colours", "Memory Of An Unconncet Era", "Example Artist", "6"),
+                playlist_row("23288552", "Numbers and Colours", "Eon", "Example Artist, Second Collaborator", "7"),
+                playlist_row("23288552", "Numbers and Colours", "Reson", "Example Artist", "8"),
+                playlist_row("23288552", "Numbers and Colours", "Ergo", "Example Artist", "9"),
+            ]
+            write_playlist_master(
+                playlist_directory / "Techno" / "Techno.csv",
+                source_rows,
+            )
+            spotify_names_and_artists = (
+                ("White", ("Example Artist", "Collaborator")),
+                ("Grey", ("Example Artist", "Collaborator")),
+                ("Black", ("Example Artist", "Collaborator")),
+                ("Silent Anchor", ("Example Artist", "Collaborator")),
+                ("Hidden Anchor", ("Example Artist", "Collaborator")),
+                ("Memory Of An Unconnected Era", ("Example Artist",)),
+                ("Eon", ("Example Artist", "Second Collaborator")),
+                ("Resin", ("Example Artist",)),
+                ("Ergo", ("Example Artist",)),
+            )
+            spotify_album_tracks = tuple(
+                SpotifyAlbumTrack(
+                    uri=f"spotify:track:album-track-{track_number}",
+                    name=track_name,
+                    artists=artists,
+                    disc_number=1,
+                    track_number=track_number,
+                    is_playable=True,
+                )
+                for track_number, (track_name, artists) in enumerate(spotify_names_and_artists, start=1)
+            )
+            client = AlbumPublishingSpotifyClient(
+                album_candidates=(
+                    SpotifyAlbumCandidate(
+                        album_id="numbers-and-colours",
+                        uri="spotify:album:numbers-and-colours",
+                        name="Numbers And Colours",
+                        artists=("Example Artist",),
+                        total_tracks=9,
+                    ),
+                ),
+                album_tracks_by_id={"numbers-and-colours": spotify_album_tracks},
+            )
+            report_path = directory / "reports" / "spotify-report.txt"
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+            cache_payload = json.loads(match_cache_path.read_text(encoding="utf-8"))
+            report_text = report_path.read_text(encoding="utf-8")
+
+        self.assertEqual(summary.search_count, 1)
+        self.assertEqual(summary.searched_row_count, 0)
+        self.assertEqual(summary.would_add_count, 9)
+        self.assertEqual(client.album_searches, [("access-token", 'album:"Numbers and Colours"', 10)])
+        self.assertEqual(client.album_track_requests, [("access-token", "numbers-and-colours")])
+        self.assertEqual(client.searches, [])
+        self.assertEqual(
+            [decision.spotify_uri for decision in summary.decisions],
+            [f"spotify:track:album-track-{track_number}" for track_number in range(1, 10)],
+        )
+        first_cache_record = cache_payload["matches"][
+            "23288552|1|example artist collaborator|numbers and colours|1"
+        ]
+        self.assertEqual(first_cache_record["match_strategy"], "validated_album_position")
+        self.assertEqual(first_cache_record["spotify_album_id"], "numbers-and-colours")
+        self.assertIn("Album matched tracks: 9", report_text)
+
+    def test_album_rate_limit_stops_without_track_search_fallback_storm(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            write_playlist_master(
+                playlist_directory / "Techno" / "Techno.csv",
+                [
+                    playlist_row("release-1", "Numbers and Colours", str(index), "Example Artist", str(index))
+                    for index in range(1, 4)
+                ],
+            )
+            client = DeferredAlbumPublishingSpotifyClient((), {})
+
+            with self.assertRaises(SpotifyRateLimitDeferredError):
+                publish_spotify_playlists(
+                    playlist_output_directory=playlist_directory,
+                    report_path=directory / "reports" / "spotify-report.txt",
+                    spotify_client=client,
+                    access_token="access-token",
+                    match_cache_path=directory / "collection" / "cache" / "spotify-track-matches.cache.json",
+                    publisher_config=PublisherConfig(
+                        default_publisher="spotify",
+                        playlist_prefix="Discogs - ",
+                        playlist_suffix="",
+                    ),
+                    apply=False,
+                    publisher_sync_mode="append",
+                )
+
+        self.assertEqual(len(client.album_searches), 1)
+        self.assertEqual(client.searches, [])
+
+    def test_album_lookup_only_falls_back_for_unresolved_tracks(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            source_rows = [
+                playlist_row("release-1", "Numbers and Colours", "1", "Example Artist, Collaborator", "1"),
+                playlist_row("release-1", "Numbers and Colours", "2", "Example Artist, Collaborator", "2"),
+                playlist_row("release-1", "Numbers and Colours", "3", "Example Artist, Collaborator", "3"),
+                playlist_row("release-1", "Numbers and Colours", "Anchor Four", "Example Artist, Collaborator", "4"),
+                playlist_row("release-1", "Numbers and Colours", "Anchor Five", "Example Artist, Collaborator", "5"),
+                playlist_row("release-1", "Numbers and Colours", "Anchor Six", "Example Artist", "6"),
+            ]
+            write_playlist_master(
+                playlist_directory / "Techno" / "Techno.csv",
+                source_rows,
+            )
+            fallback_candidate = SpotifyTrackCandidate(
+                uri="spotify:track:fallback-two",
+                name="2",
+                artists=("Example Artist", "Collaborator"),
+                album_name="Numbers and Colours",
+            )
+            spotify_album_tracks = (
+                SpotifyAlbumTrack("spotify:track:one", "White", ("Example Artist", "Collaborator"), 1, 1, True),
+                SpotifyAlbumTrack("spotify:track:two", "Grey", ("Different Artist",), 1, 2, True),
+                SpotifyAlbumTrack("spotify:track:three", "Black", ("Example Artist", "Collaborator"), 1, 3, True),
+                SpotifyAlbumTrack("spotify:track:four", "Anchor Four", ("Example Artist", "Collaborator"), 1, 4, True),
+                SpotifyAlbumTrack("spotify:track:five", "Anchor Five", ("Example Artist", "Collaborator"), 1, 5, True),
+                SpotifyAlbumTrack("spotify:track:six", "Anchor Six", ("Example Artist",), 1, 6, True),
+            )
+            client = AlbumPublishingSpotifyClient(
+                album_candidates=(
+                    SpotifyAlbumCandidate(
+                        album_id="album-1",
+                        uri="spotify:album:album-1",
+                        name="Numbers and Colours",
+                        artists=("Example Artist",),
+                        total_tracks=6,
+                    ),
+                ),
+                album_tracks_by_id={"album-1": spotify_album_tracks},
+                candidates_by_query={
+                    'track:"2" artist:"Example Artist, Collaborator" album:"Numbers and Colours"': (
+                        fallback_candidate,
+                    ),
+                },
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=directory / "reports" / "spotify-report.txt",
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=directory / "collection" / "cache" / "spotify-track-matches.cache.json",
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+
+        self.assertEqual(summary.search_count, 2)
+        self.assertEqual(summary.searched_row_count, 1)
+        self.assertEqual(summary.would_add_count, 6)
+        self.assertEqual(len(client.album_searches), 1)
+        self.assertEqual(len(client.searches), 1)
+        self.assertEqual(client.searches[0][1], 'track:"2" artist:"Example Artist, Collaborator" album:"Numbers and Colours"')
+        self.assertEqual(
+            [decision.match_source for decision in summary.decisions],
+            ["album", "search", "album", "album", "album", "album"],
+        )
+
+    def test_album_server_error_stops_without_track_search_fallback_storm(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            write_playlist_master(
+                playlist_directory / "Techno" / "Techno.csv",
+                [
+                    playlist_row("release-1", "Numbers and Colours", str(index), "Example Artist", str(index))
+                    for index in range(1, 4)
+                ],
+            )
+            report_path = directory / "reports" / "spotify-report.txt"
+            client = FailingAlbumPublishingSpotifyClient((), {})
+
+            with self.assertRaises(SpotifyAlbumLookupError):
+                publish_spotify_playlists(
+                    playlist_output_directory=playlist_directory,
+                    report_path=report_path,
+                    spotify_client=client,
+                    access_token="access-token",
+                    match_cache_path=directory / "collection" / "cache" / "spotify-track-matches.cache.json",
+                    publisher_config=PublisherConfig(
+                        default_publisher="spotify",
+                        playlist_prefix="Discogs - ",
+                        playlist_suffix="",
+                    ),
+                    apply=False,
+                    publisher_sync_mode="append",
+                )
+            report_text = report_path.read_text(encoding="utf-8")
+
+        self.assertEqual(len(client.album_searches), 1)
+        self.assertEqual(client.searches, [])
+        self.assertIn("aborted - Spotify API error", report_text)
+
+    def test_album_lookup_is_reused_across_selected_playlists(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            rows = [
+                playlist_row("release-1", "Numbers and Colours", "1", "Example Artist", "1"),
+                playlist_row("release-1", "Numbers and Colours", "Anchor Two", "Example Artist", "2"),
+                playlist_row("release-1", "Numbers and Colours", "Anchor Three", "Example Artist", "3"),
+            ]
+            write_playlist_master(playlist_directory / "House" / "House.csv", rows)
+            write_playlist_master(playlist_directory / "Techno" / "Techno.csv", rows)
+            client = AlbumPublishingSpotifyClient(
+                album_candidates=(
+                    SpotifyAlbumCandidate(
+                        album_id="album-1",
+                        uri="spotify:album:album-1",
+                        name="Numbers and Colours",
+                        artists=("Example Artist",),
+                        total_tracks=3,
+                    ),
+                ),
+                album_tracks_by_id={
+                    "album-1": (
+                        SpotifyAlbumTrack("spotify:track:one", "White", ("Example Artist",), 1, 1, True),
+                        SpotifyAlbumTrack("spotify:track:two", "Anchor Two", ("Example Artist",), 1, 2, True),
+                        SpotifyAlbumTrack("spotify:track:three", "Anchor Three", ("Example Artist",), 1, 3, True),
+                    )
+                },
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=directory / "reports" / "spotify-report.txt",
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=directory / "collection" / "cache" / "spotify-track-matches.cache.json",
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+
+        self.assertEqual(summary.search_count, 1)
+        self.assertEqual(summary.would_add_count, 6)
+        self.assertEqual(len(client.album_searches), 1)
+        self.assertEqual(len(client.album_track_requests), 1)
+        self.assertEqual(client.searches, [])
+
+    def test_album_matches_are_cached_before_search_budget_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            rows = [
+                playlist_row("release-1", "Numbers and Colours", "1", "Example Artist", "1"),
+                playlist_row("release-1", "Numbers and Colours", "Anchor Two", "Example Artist", "2"),
+                playlist_row("release-1", "Numbers and Colours", "Anchor Three", "Example Artist", "3"),
+            ]
+            write_playlist_master(playlist_directory / "Techno" / "Techno.csv", rows)
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            report_path = directory / "reports" / "spotify-report.txt"
+            album_candidate_value = SpotifyAlbumCandidate(
+                album_id="album-1",
+                uri="spotify:album:album-1",
+                name="Numbers and Colours",
+                artists=("Example Artist",),
+                total_tracks=3,
+            )
+            album_tracks = (
+                SpotifyAlbumTrack("spotify:track:one", "White", ("Example Artist",), 1, 1, True),
+                SpotifyAlbumTrack("spotify:track:two", "Anchor Two", ("Example Artist",), 1, 2, True),
+                SpotifyAlbumTrack("spotify:track:three", "Anchor Three", ("Example Artist",), 1, 3, True),
+            )
+            first_client = AlbumPublishingSpotifyClient(
+                album_candidates=(album_candidate_value,),
+                album_tracks_by_id={"album-1": album_tracks},
+            )
+
+            first_summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=first_client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+                max_new_searches_per_run=1,
+            )
+            cache_payload = json.loads(match_cache_path.read_text(encoding="utf-8"))
+            second_client = AlbumPublishingSpotifyClient((), {})
+            second_summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=second_client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+                max_new_searches_per_run=1,
+            )
+
+        self.assertEqual(first_summary.search_count, 1)
+        self.assertEqual(first_summary.track_count, 1)
+        self.assertEqual(len(cache_payload["matches"]), 3)
+        self.assertEqual(second_summary.search_count, 0)
+        self.assertEqual(second_summary.cache_hit_count, 3)
+        self.assertEqual(second_summary.track_count, 3)
+        self.assertEqual(second_client.album_searches, [])
+
+    def test_album_lookup_preserves_manual_match_and_can_replace_partial_negative_cache(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            rows = [
+                playlist_row("release-1", "Numbers and Colours", "1", "Example Artist", "1"),
+                playlist_row("release-1", "Numbers and Colours", "Anchor Two", "Example Artist", "2"),
+                playlist_row("release-1", "Numbers and Colours", "Anchor Three", "Example Artist", "3"),
+            ]
+            write_playlist_master(playlist_directory / "Techno" / "Techno.csv", rows)
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            match_cache_path.parent.mkdir(parents=True)
+            match_cache_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "record_type": "spotify_track_match_cache",
+                        "matches": {
+                            "release-1|1|example artist|numbers and colours|1": {
+                                "release_id": "release-1",
+                                "track_number": "1",
+                                "artist_name": "Example Artist",
+                                "album_name": "Numbers and Colours",
+                                "track_name": "1",
+                                "match_status": "manual",
+                                "match_reason": "manually selected Spotify match",
+                                "spotify_uri": "spotify:track:manual-one",
+                                "spotify_track_name": "Manual One",
+                                "spotify_artist_names": ["Example Artist"],
+                                "spotify_album_name": "Numbers and Colours",
+                            },
+                            "release-1|2|example artist|numbers and colours|anchor two": {
+                                "release_id": "release-1",
+                                "track_number": "2",
+                                "artist_name": "Example Artist",
+                                "album_name": "Numbers and Colours",
+                                "track_name": "Anchor Two",
+                                "match_status": "unmatched",
+                                "match_reason": "no Spotify track matched",
+                                "matcher_version": 11,
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            client = AlbumPublishingSpotifyClient(
+                album_candidates=(
+                    SpotifyAlbumCandidate(
+                        album_id="album-1",
+                        uri="spotify:album:album-1",
+                        name="Numbers and Colours",
+                        artists=("Example Artist",),
+                        total_tracks=3,
+                    ),
+                ),
+                album_tracks_by_id={
+                    "album-1": (
+                        SpotifyAlbumTrack("spotify:track:album-one", "White", ("Example Artist",), 1, 1, True),
+                        SpotifyAlbumTrack("spotify:track:album-two", "Anchor Two", ("Example Artist",), 1, 2, True),
+                        SpotifyAlbumTrack("spotify:track:album-three", "Anchor Three", ("Example Artist",), 1, 3, True),
+                    )
+                },
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=directory / "reports" / "spotify-report.txt",
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+            cache_payload = json.loads(match_cache_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(summary.search_count, 1)
+        self.assertEqual(
+            [decision.match_source for decision in summary.decisions],
+            ["cache", "album", "album"],
+        )
+        self.assertEqual(summary.decisions[0].spotify_uri, "spotify:track:manual-one")
+        self.assertEqual(cache_payload["matches"][
+            "release-1|1|example artist|numbers and colours|1"
+        ]["match_status"], "manual")
+        self.assertEqual(cache_payload["matches"][
+            "release-1|2|example artist|numbers and colours|anchor two"
+        ]["match_status"], "matched")
 
     def test_publish_dry_run_uses_match_cache_fetches_playlist_state_and_reports_final_append_plan(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1119,7 +1695,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         )
         self.assertEqual(summary.search_count, 4)
         self.assertEqual(summary.matched_count, 1)
-        self.assertEqual(cache_record["matcher_version"], 10)
+        self.assertEqual(cache_record["matcher_version"], 11)
         self.assertEqual(cache_record["match_strategy"], "constrained_title_typo")
         self.assertIs(cache_record["version_sensitive"], True)
         self.assertEqual(cache_record["match_reason"], expected_reason)
@@ -1201,7 +1777,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         cache_record = cache_payload["matches"]["111|1|alpha artist|alpha album|loosing time"]
         self.assertEqual(summary.cache_hit_count, 0)
         self.assertEqual(summary.search_count, 4)
-        self.assertEqual(cache_record["matcher_version"], 10)
+        self.assertEqual(cache_record["matcher_version"], 11)
 
     def test_publish_ladder_matches_unique_title_and_artist_when_album_differs(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1396,7 +1972,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertEqual(summary.search_count, 1)
         self.assertEqual(summary.matched_count, 1)
         self.assertEqual(summary.would_add_count, 1)
-        self.assertEqual(cache_record["matcher_version"], 10)
+        self.assertEqual(cache_record["matcher_version"], 11)
         self.assertEqual(cache_record["spotify_uri"], "spotify:track:swim")
         self.assertEqual(cache_record["spotify_artist_names"], ["Carl Gari", "Polygonia"])
         self.assertEqual(
@@ -1496,7 +2072,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertEqual(summary.search_count, 1)
         self.assertEqual(summary.matched_count, 1)
         self.assertEqual(summary.would_add_count, 1)
-        self.assertEqual(cache_record["matcher_version"], 10)
+        self.assertEqual(cache_record["matcher_version"], 11)
         self.assertEqual(cache_record["spotify_uri"], "spotify:track:signal-path")
         self.assertEqual(cache_record["spotify_artist_names"], ["Main Artist", "Guest One"])
         self.assertEqual(cache_record["match_reason"], expected_reason)
@@ -1720,7 +2296,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertEqual(summary.matched_count, 1)
         self.assertEqual(summary.would_add_count, 1)
         self.assertEqual(cache_record["match_status"], "matched")
-        self.assertEqual(cache_record["matcher_version"], 10)
+        self.assertEqual(cache_record["matcher_version"], 11)
         self.assertEqual(
             cache_record["match_reason"],
             "track title differed only by Spotify's leading 'in'; artist and album matched",

@@ -25,6 +25,7 @@ from publishers.spotify.publish_types import (
     ALREADY_PRESENT,
     DUPLICATE_IN_SOURCE,
     INCLUDED,
+    MATCH_SOURCE_ALBUM,
     MATCH_SOURCE_CACHE,
     MATCH_SOURCE_SEARCH,
     WOULD_ADD,
@@ -95,6 +96,7 @@ def write_publish_report(path: Path, summary: SpotifyPublishSummary) -> None:
                 f"- Cached matched tracks: {cached_matched_publish_decision_count(summary.decisions)}",
                 f"- Cached ambiguous tracks: {count_publish_decisions(summary.decisions, MATCH_SOURCE_CACHE, {AMBIGUOUS})}",
                 f"- Cached unmatched tracks: {count_publish_decisions(summary.decisions, MATCH_SOURCE_CACHE, {UNMATCHED})}",
+                f"- Album matched tracks: {album_matched_publish_decision_count(summary.decisions)}",
                 f"- Searched matched tracks: {searched_matched_publish_decision_count(summary.decisions)}",
                 f"- Searched ambiguous tracks: {count_publish_decisions(summary.decisions, MATCH_SOURCE_SEARCH, {AMBIGUOUS})}",
                 f"- Searched unmatched tracks: {count_publish_decisions(summary.decisions, MATCH_SOURCE_SEARCH, {UNMATCHED})}",
@@ -157,6 +159,10 @@ def count_publish_decisions(
 
 def cached_matched_publish_decision_count(decisions: Sequence[PlaylistPublishDecision]) -> int:
     return sum(1 for decision in decisions if decision.match_source == MATCH_SOURCE_CACHE and bool(decision.spotify_uri))
+
+
+def album_matched_publish_decision_count(decisions: Sequence[PlaylistPublishDecision]) -> int:
+    return sum(1 for decision in decisions if decision.match_source == MATCH_SOURCE_ALBUM and bool(decision.spotify_uri))
 
 
 def searched_matched_publish_decision_count(decisions: Sequence[PlaylistPublishDecision]) -> int:

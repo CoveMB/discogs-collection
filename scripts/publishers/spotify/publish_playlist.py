@@ -17,6 +17,7 @@ if str(SCRIPTS_DIRECTORY) not in sys.path:
 
 from publishers.spotify.authorization_flow import DEFAULT_AUTHORIZE_SCOPES, authorize_spotify_interactively  # noqa: E402
 from publishers.spotify.client import (  # noqa: E402
+    SpotifyAlbumLookupError,
     SpotifyApiError,
     SpotifyClient,
     SpotifyPlaylist,
@@ -33,6 +34,7 @@ from publishers.spotify.match_cache import (  # noqa: E402
     cached_track_match,
     load_spotify_track_match_cache,
     save_spotify_track_match_cache,
+    spotify_track_match_key,
     utc_timestamp,
 )
 from publishers.spotify.matching import (  # noqa: E402
@@ -93,6 +95,7 @@ from publishers.spotify.publish_types import (  # noqa: E402
     DEFAULT_MAX_NEW_SEARCHES_PER_RUN,
     DUPLICATE_IN_SOURCE,
     INCLUDED,
+    MATCH_SOURCE_ALBUM,
     MATCH_SOURCE_CACHE,
     MATCH_SOURCE_SEARCH,
     PUBLISHER_SYNC_MODES,
@@ -107,6 +110,13 @@ from publishers.spotify.publish_types import (  # noqa: E402
     SpotifyDryRunSummary,
     SpotifyPublishSummary,
     SpotifyTrackSearchResult,
+)
+from publishers.spotify.release_matching import (  # noqa: E402
+    ALBUM_EXACT_TRACK_MATCH_REASON,
+    ALBUM_POSITION_MATCH_REASON,
+    SpotifyAlbumLookupClient,
+    release_is_eligible_for_album_lookup,
+    resolve_release_with_album,
 )
 from publishers.spotify.session import get_spotify_access_token  # noqa: E402
 from shared.cli import EXPECTED_CLI_ERRORS, print_cli_error, print_cli_summary  # noqa: E402
@@ -347,6 +357,19 @@ def publish_spotify_playlists(
         )
         for playlist_master_path in selected_master_paths
     }
+    release_tracks_by_id = group_unique_tracks_by_release_id(tracks_by_master_path)
+    album_lookup_client = (
+        spotify_client
+        if isinstance(spotify_client, SpotifyAlbumLookupClient)
+        else None
+    )
+    attempted_album_release_ids: set[str] = set()
+    album_decisions_by_track_key: dict[str, TrackMatchDecision] = {}
+    preexisting_matched_cache_keys = (
+        set()
+        if refresh_match_cache
+        else existing_matched_cache_keys(release_tracks_by_id, match_cache)
+    )
     total_tracks = sum(len(tracks) for tracks in tracks_by_master_path.values())
     search_count = 0
     searched_row_count = 0
@@ -381,10 +404,53 @@ def publish_spotify_playlists(
             }
             existing_incomplete_spotify_uris = incomplete_spotify_playlist_item_uris(existing_items)
             for source_position, track in enumerate(playlist_tracks, start=1):
+                track_cache_key = spotify_track_match_key(track)
                 cached_match = None
                 if not refresh_match_cache:
                     cached_match = cached_track_match(track, match_cache, seen_at=timestamp)
-                if cached_match is None and new_search_budget_reached(search_count, max_new_searches_per_run):
+                album_decision = album_decisions_by_track_key.get(track_cache_key)
+                cached_match_is_authoritative = (
+                    cached_match is not None
+                    and track_cache_key in preexisting_matched_cache_keys
+                )
+                if (
+                    not cached_match_is_authoritative
+                    and album_decision is None
+                    and album_lookup_client is not None
+                    and bool(track.release_id)
+                    and track.release_id not in attempted_album_release_ids
+                    and not new_search_budget_reached(search_count, max_new_searches_per_run)
+                ):
+                    release_tracks = release_tracks_by_id.get(track.release_id)
+                    if release_tracks and release_is_eligible_for_album_lookup(release_tracks):
+                        attempted_album_release_ids.add(track.release_id)
+                        if refresh_match_cache or release_has_uncached_track(
+                            release_tracks,
+                            match_cache,
+                        ):
+                            album_result = resolve_release_with_album(
+                                source_tracks=release_tracks,
+                                spotify_client=album_lookup_client,
+                                access_token=access_token,
+                                search_limit=search_limit,
+                            )
+                            search_count += album_result.search_count
+                            for resolved_decision in album_result.decisions:
+                                resolved_key = spotify_track_match_key(resolved_decision.track)
+                                if resolved_key not in preexisting_matched_cache_keys:
+                                    album_decisions_by_track_key[resolved_key] = resolved_decision
+                                    cache_track_match(
+                                        match_cache,
+                                        resolved_decision,
+                                        matched_at=timestamp,
+                                    )
+                            album_decision = album_decisions_by_track_key.get(track_cache_key)
+                if (
+                    not cached_match_is_authoritative
+                    and album_decision is None
+                    and cached_match is None
+                    and new_search_budget_reached(search_count, max_new_searches_per_run)
+                ):
                     if publisher_sync_mode == APPEND_SYNC_MODE:
                         final_items, playlist_contexts, spotify_playlists = finalize_append_playlist(
                             spotify_client=write_client,
@@ -429,10 +495,19 @@ def publish_spotify_playlists(
                 try:
                     processed_track_count += 1
                     if cached_match:
-                        decision = cached_match.decision
-                        match_source = MATCH_SOURCE_CACHE
+                        if album_decision is not None and not cached_match_is_authoritative:
+                            decision = album_decision
+                            match_source = MATCH_SOURCE_ALBUM
+                            track_search_count = 0
+                        else:
+                            decision = cached_match.decision
+                            match_source = MATCH_SOURCE_CACHE
+                            track_search_count = 0
+                            cache_hit_count += 1
+                    elif album_decision is not None:
+                        decision = album_decision
+                        match_source = MATCH_SOURCE_ALBUM
                         track_search_count = 0
-                        cache_hit_count += 1
                     else:
                         search_result = search_spotify_track(
                             track=track,
@@ -494,7 +569,7 @@ def publish_spotify_playlists(
                             final_items.append(final_playlist_item_from_decision(len(final_items) + 1, publish_decision))
                     elif identity_key and publish_decision.status in {ALREADY_PRESENT, DUPLICATE_IN_SOURCE}:
                         seen_source_identity_keys.add(identity_key)
-                    if match_source == MATCH_SOURCE_SEARCH:
+                    if match_source in {MATCH_SOURCE_ALBUM, MATCH_SOURCE_SEARCH}:
                         cache_track_match(match_cache, decision, matched_at=timestamp)
                     if publisher_sync_mode == APPEND_SYNC_MODE and apply and len(append_candidates) >= 100:
                         final_items, playlist_contexts, spotify_playlists = finalize_append_playlist(
@@ -629,6 +704,24 @@ def publish_spotify_playlists(
             ),
         )
         raise
+    except SpotifyAlbumLookupError as error:
+        save_spotify_track_match_cache(match_cache_path, match_cache)
+        write_publish_summary(
+            decisions=tuple(decisions),
+            final_items=tuple(reindex_final_items(final_items)),
+            playlist_contexts=tuple(playlist_contexts),
+            report_path=report_path,
+            apply=apply,
+            publisher_sync_mode=publisher_sync_mode,
+            cache_hit_count=cache_hit_count,
+            search_count=search_count,
+            searched_row_count=searched_row_count,
+            run_status=(
+                f"aborted - Spotify API error after {len(decisions)} of {total_tracks} tracks: "
+                f"{str(error).splitlines()[0]}"
+            ),
+        )
+        raise
     finally:
         if progress:
             progress.finish()
@@ -682,6 +775,64 @@ def publish_spotify_playlists(
 
 def has_new_search_budget(max_new_searches_per_run: int) -> bool:
     return max_new_searches_per_run != UNLIMITED_NEW_SEARCHES_PER_RUN
+
+
+def group_unique_tracks_by_release_id(
+    tracks_by_master_path: Mapping[Path, Sequence[PlaylistTrack]],
+) -> dict[str, tuple[PlaylistTrack, ...]]:
+    grouped_tracks: dict[str, list[PlaylistTrack]] = {}
+    seen_track_keys_by_release_id: dict[str, set[str]] = {}
+    for playlist_tracks in tracks_by_master_path.values():
+        for track in playlist_tracks:
+            release_id = track.release_id.strip()
+            if not release_id:
+                continue
+            track_key = spotify_track_match_key(track)
+            seen_track_keys = seen_track_keys_by_release_id.setdefault(release_id, set())
+            if track_key in seen_track_keys:
+                continue
+            seen_track_keys.add(track_key)
+            grouped_tracks.setdefault(release_id, []).append(track)
+    return {
+        release_id: order_release_tracks(tracks)
+        for release_id, tracks in grouped_tracks.items()
+    }
+
+
+def order_release_tracks(tracks: Sequence[PlaylistTrack]) -> tuple[PlaylistTrack, ...]:
+    numbered_tracks: list[tuple[int, PlaylistTrack]] = []
+    for track in tracks:
+        try:
+            track_number = int(track.track_number.strip())
+        except ValueError:
+            return tuple(tracks)
+        numbered_tracks.append((track_number, track))
+    if len({track_number for track_number, _ in numbered_tracks}) != len(numbered_tracks):
+        return tuple(tracks)
+    return tuple(track for _, track in sorted(numbered_tracks, key=lambda item: item[0]))
+
+
+def existing_matched_cache_keys(
+    release_tracks_by_id: Mapping[str, Sequence[PlaylistTrack]],
+    match_cache: Mapping[str, Mapping[str, object]],
+) -> set[str]:
+    matched_keys: set[str] = set()
+    for release_tracks in release_tracks_by_id.values():
+        for track in release_tracks:
+            cached_match = cached_track_match(track, match_cache)
+            if cached_match and cached_match.decision.status == MATCHED:
+                matched_keys.add(cached_match.cache_key)
+    return matched_keys
+
+
+def release_has_uncached_track(
+    release_tracks: Sequence[PlaylistTrack],
+    match_cache: Mapping[str, Mapping[str, object]],
+) -> bool:
+    return any(
+        cached_track_match(track, match_cache) is None
+        for track in release_tracks
+    )
 
 
 def new_search_budget_reached(search_count: int, max_new_searches_per_run: int) -> bool:
@@ -865,20 +1016,9 @@ def build_append_playlist_plan(
             known_to_publisher=candidate.known_to_publisher,
             final_item=item.final_item,
         )
-    known_operations = tuple(
-        operation
-        for operation in operations_by_identity.values()
-        if operation.known_to_publisher
-    )
-    new_operations = tuple(
-        sorted(
-            (operation for operation in operations_by_identity.values() if not operation.known_to_publisher),
-            key=lambda operation: operation.source_position,
-        )
-    )
     return AppendPlaylistPlan(
         final_items=final_items,
-        write_operations=known_operations + new_operations,
+        write_operations=tuple(operations_by_identity.values()),
     )
 
 
@@ -1130,6 +1270,8 @@ def publish_reason_with_match_details(
             SPOTIFY_FEATURED_ARTIST_MATCH_REASON_PREFIX,
             LEADING_IN_TITLE_MATCH_REASON_PREFIX,
             CONSTRAINED_TYPO_MATCH_REASON_PREFIX,
+            ALBUM_EXACT_TRACK_MATCH_REASON,
+            ALBUM_POSITION_MATCH_REASON,
         )
     ):
         return "; ".join((publish_reason, decision.reason))
@@ -1850,13 +1992,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reauthorize", action="store_true", help="Force a fresh Spotify login before running the publisher.")
     parser.add_argument("--access-token", help=argparse.SUPPRESS)
     parser.add_argument("--playlists", nargs="+", help="Playlist names, folder names, folder paths, or master CSV paths to publish. Omit to process every playlist.")
-    parser.add_argument("--search-limit", type=int, default=10, help="Spotify search result limit per track. Defaults to 10.")
+    parser.add_argument("--search-limit", type=int, default=10, help="Spotify search result limit per album or track query. Defaults to 10.")
     parser.add_argument(
         "--max-new-searches-per-run",
         type=int,
         default=DEFAULT_MAX_NEW_SEARCHES_PER_RUN,
         help=(
-            "Maximum uncached Spotify track searches per run. "
+            "Maximum uncached Spotify searches per run. "
             "Defaults to 500. Use 0 to search without a per-run cap."
         ),
     )

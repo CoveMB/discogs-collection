@@ -73,6 +73,7 @@ class SpotifyTrackCandidate:
     name: str
     artists: tuple[str, ...]
     album_name: str
+    album_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,7 @@ class TrackMatchDecision:
     candidate: SpotifyTrackCandidate | None = None
     review_candidates: tuple[SpotifyTrackCandidate, ...] = ()
     search_queries: tuple[str, ...] = ()
+    match_strategy: str = ""
 
 
 def build_spotify_track_search_query(track: PlaylistTrack) -> str:

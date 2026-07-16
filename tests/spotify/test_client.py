@@ -10,6 +10,8 @@ sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 
 from publishers.spotify.client import (
     HttpResponse,
+    SpotifyAlbumCandidate,
+    SpotifyAlbumTrack,
     SpotifyPlaylist,
     SpotifyPlaylistItem,
     SpotifyApiError,
@@ -64,6 +66,108 @@ class SpotifyClientTests(unittest.TestCase):
                 ),
             ),
         )
+
+    def test_search_albums_sends_album_query_and_parses_candidates(self):
+        captured_requests = []
+
+        def transport(request):
+            captured_requests.append(request)
+            return HttpResponse(
+                status=200,
+                headers={},
+                body=(
+                    '{"albums":{"items":[{"id":"album-1","uri":"spotify:album:album-1",'
+                    '"name":"Numbers and Colours","artists":[{"name":"Example Artist"}],'
+                    '"total_tracks":6}]}}'
+                ),
+            )
+
+        client = SpotifyClient(transport=transport)
+
+        candidates = client.search_albums(
+            access_token="access-token",
+            query='album:"Numbers and Colours"',
+            limit=10,
+        )
+
+        self.assertEqual(
+            captured_requests[0].url,
+            (
+                "https://api.spotify.com/v1/search?"
+                "q=album%3A%22Numbers+and+Colours%22&type=album&limit=10"
+            ),
+        )
+        self.assertEqual(
+            candidates,
+            (
+                SpotifyAlbumCandidate(
+                    album_id="album-1",
+                    uri="spotify:album:album-1",
+                    name="Numbers and Colours",
+                    artists=("Example Artist",),
+                    total_tracks=6,
+                ),
+            ),
+        )
+
+    def test_get_album_tracks_reads_order_and_playability_across_pages(self):
+        captured_requests = []
+        responses = [
+            HttpResponse(
+                status=200,
+                headers={},
+                body=(
+                    '{"items":[{"uri":"spotify:track:one","name":"White",'
+                    '"artists":[{"name":"Example Artist"}],"disc_number":1,'
+                    '"track_number":1,"is_playable":true}],"next":"next-page"}'
+                ),
+            ),
+            HttpResponse(
+                status=200,
+                headers={},
+                body=(
+                    '{"items":[{"uri":"spotify:track:two","name":"Grey",'
+                    '"artists":[{"name":"Example Artist"}],"disc_number":1,'
+                    '"track_number":2,"is_playable":false}],"next":null}'
+                ),
+            ),
+        ]
+
+        def transport(request):
+            captured_requests.append(request)
+            return responses.pop(0)
+
+        client = SpotifyClient(transport=transport)
+
+        tracks = client.get_album_tracks(
+            access_token="access-token",
+            album_id="album/one",
+        )
+
+        self.assertEqual(
+            tracks,
+            (
+                SpotifyAlbumTrack(
+                    uri="spotify:track:one",
+                    name="White",
+                    artists=("Example Artist",),
+                    disc_number=1,
+                    track_number=1,
+                    is_playable=True,
+                ),
+                SpotifyAlbumTrack(
+                    uri="spotify:track:two",
+                    name="Grey",
+                    artists=("Example Artist",),
+                    disc_number=1,
+                    track_number=2,
+                    is_playable=False,
+                ),
+            ),
+        )
+        self.assertIn("/albums/album%2Fone/tracks?", captured_requests[0].url)
+        self.assertIn("offset=0", captured_requests[0].url)
+        self.assertIn("offset=50", captured_requests[1].url)
 
     def test_lists_current_user_playlists_across_pages(self):
         captured_requests = []

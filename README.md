@@ -364,13 +364,16 @@ newly seen track, so the first source-aware run may still append that track.
 
 Append publishing is incremental. The publisher reads the playlist CSVs in
 source order and checks the local Spotify match cache before searching Spotify.
-For uncached rows, it searches up to 500 new tracks per run by default. Cache
-hits do not count against that limit. As matched tracks are found, the publisher
-writes source-aware append batches of up to 100 new URIs, saves the match cache
-and publish-state cache, and rewrites the report. When the search budget is
-reached, the run exits successfully with a partial run status. Later runs start
-from the CSVs again, reuse cached matches, fetch the current Spotify playlist
-contents, and skip tracks that are already present.
+For uncached rows, it makes up to 500 new Spotify searches per run by default.
+Album searches and track searches count against that limit. Fetching the tracks
+from an album does not count as a search. Cache hits do not count either. As
+matched tracks are found, the publisher writes source-aware append batches of up
+to 100 new URIs, saves the match cache and publish-state cache, and rewrites the
+report. When the search budget is reached, the run exits successfully with a
+partial run status. Album matches found by the last allowed search are saved
+before it exits. Later runs start from the CSVs again, reuse cached matches,
+fetch the current Spotify playlist contents, and skip tracks that are already
+present.
 
 To change the per-run search budget:
 
@@ -416,10 +419,43 @@ python3 scripts/publishers/spotify/publish_playlist.py \
   --publisher-sync-mode append
 ```
 
-For each uncached row, the script starts with a structured Spotify query using
-`Track Name`, `Artist Name`, and `Album Name`. If that does not find a match, it
-tries the same structured query without the album, individual artist names from
-safe comma-separated artist lists, plain `artist title` text, and the existing
+The default matcher starts at the release level. It groups uncached rows by
+`Release Id` across the selected playlists and reuses one album lookup wherever
+that release appears. Releases with at least three tracks and one consistent,
+nonempty album name are eligible. Single tracks, two-track releases, missing
+release IDs, and inconsistent album names go straight to the track search
+ladder.
+
+An eligible release gets one exact-name album search. The publisher ignores
+results whose normalized album name differs from the source. It fetches track
+lists when one to three exact-name candidates remain. More than three exact-name
+candidates are treated as too broad, so the publisher skips the album fetch and
+uses track search instead.
+
+The publisher validates each fetched album as a sequence before using its
+positions. It requires at least two exact title and full artist-set matches in
+the same order. These matches are sequence anchors. A gap can align by position
+only when both sides contain the same number of tracks, the gap has at most
+three tracks, every paired row has the same nonempty full artist set, and the
+Spotify track is available. This covers releases where Discogs uses titles such
+as `1`, `2`, and `3` while Spotify uses names for the same first three tracks.
+It also covers a misspelling inside a gap when the surrounding anchors and
+artists agree. Conflicting anchor order, an added or missing track, an artist
+mismatch, or a larger gap leaves those rows unresolved. If more than one Spotify
+edition passes validation, the publisher does not choose between them.
+
+Safely resolved album rows are cached immediately. Existing matched and manual
+cache entries remain authoritative. For a partially cached release, a validated
+album may replace an earlier ambiguous or unmatched decision while it resolves
+the uncached rows. Any remaining rows use the existing track search ladder, so
+an album mismatch does not block the release. An album API failure stops the run
+instead of starting many fallback searches. Rate-limit stops use the same
+saved-cache and partial-report behavior described below.
+
+The track search ladder starts with a structured Spotify query using `Track
+Name`, `Artist Name`, and `Album Name`. If that does not find a match, it tries
+the same structured query without the album, individual artist names from safe
+comma-separated artist lists, plain `artist title` text, and the existing
 `Spotify Search Query` value. The matcher treats Unicode punctuation and symbols
 as token separators before comparing track, artist, and album text, so curly
 apostrophes and long dashes behave like their ASCII forms. This normalization
@@ -461,10 +497,11 @@ ambiguous. Numeric titles and broader title changes remain unmatched.
 The Spotify match cache stores `matched`, `ambiguous`, and `unmatched` decisions.
 Later runs reuse those decisions instead of searching Spotify again. Search
 errors are not cached, since they usually mean Spotify or the network failed
-temporarily. Typo-derived matches are version-sensitive, so a matcher update can
-recheck them without invalidating ordinary exact matches. To recheck every row
-and replace cached decisions with fresh Spotify results without writing playlist
-changes to Spotify, run:
+temporarily. Typo-derived matches and position-derived album matches are
+version-sensitive, so a matcher update can recheck them without invalidating
+ordinary exact matches. Album cache records keep the Spotify album ID and the
+match strategy for audit. To recheck every row and replace cached decisions with
+fresh Spotify results without writing playlist changes to Spotify, run:
 
 ```bash
 python3 scripts/publishers/spotify/publish_playlist.py \
@@ -476,7 +513,8 @@ If you omit `--publishing-dry-run`, the publisher also creates or updates
 Spotify playlists according to the selected sync mode.
 
 The report includes run status, summary counts, playlist checks, per-row publish
-decisions, review sections, and the final planned playlist state. The final-state
+decisions, review sections, and the final planned playlist state. The summary
+separates album matches from cache hits and track-search matches. The final-state
 section lists position, status, artist, track, album, and Spotify URI for each
 playlist. In append mode it starts with the current Spotify playlist order and
 then adds the planned new tracks. In replace mode it shows the replacement
@@ -1522,7 +1560,7 @@ release_ids
     Force a fresh Spotify login before running the publisher.
 
 --search-limit COUNT
-    Spotify search result limit per track. Defaults to 10.
+    Spotify search result limit per album or track query. Defaults to 10.
 
 --max-new-searches-per-run COUNT
     Maximum uncached Spotify searches per publisher run. Defaults to 500. Use 0

@@ -411,7 +411,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--match-cache", type=Path, default=DEFAULT_MATCH_CACHE_PATH, help="Spotify track match cache path.")
     parser.add_argument("--reauthorize", action="store_true", help="Force a fresh Spotify login before running the publisher.")
     parser.add_argument("--access-token", help=argparse.SUPPRESS)
-    parser.add_argument("--search-limit", type=int, default=10, help="Spotify search result limit per track. Defaults to 10.")
+    parser.add_argument("--search-limit", type=int, default=10, help="Spotify search result limit per album or track query. Defaults to 10.")
     parser.add_argument(
         "--max-new-searches-per-run",
         type=int,

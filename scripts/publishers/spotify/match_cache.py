@@ -19,13 +19,14 @@ from publishers.spotify.matching import (
     build_spotify_track_search_query,
     normalize_music_text,
 )
+from publishers.spotify.release_matching import ALBUM_POSITION_MATCH_STRATEGY
 from shared.files import write_json_file
 from shared.text import clean_cell
 
 
 MATCH_CACHE_SCHEMA_VERSION = 1
 MATCH_CACHE_RECORD_TYPE = "spotify_track_match_cache"
-MATCHER_VERSION = 10
+MATCHER_VERSION = 11
 CACHEABLE_MATCH_STATUSES = {MATCHED, AMBIGUOUS, UNMATCHED}
 CONSTRAINED_TYPO_MATCH_STRATEGY = "constrained_title_typo"
 
@@ -125,6 +126,7 @@ def cached_matched_track(
             candidate=candidate,
             review_candidates=(candidate,),
             search_queries=search_queries_from_cache_record(record),
+            match_strategy=clean_cell(record.get("match_strategy")),
         ),
     )
 
@@ -173,6 +175,7 @@ def spotify_candidate_from_cache_record(
         name=clean_cell(record.get("spotify_track_name")) or (default_track.track_name if default_track else ""),
         artists=artist_names or ((default_track.artist_name,) if default_track else ()),
         album_name=clean_cell(record.get("spotify_album_name")) or (default_track.album_name if default_track else ""),
+        album_id=clean_cell(record.get("spotify_album_id")),
     )
 
 
@@ -226,10 +229,19 @@ def cache_track_match(
                 "matched_at": timestamp,
             }
         )
-        if decision.reason.startswith(CONSTRAINED_TYPO_MATCH_REASON_PREFIX):
+        match_strategy = decision.match_strategy
+        if not match_strategy and decision.reason.startswith(CONSTRAINED_TYPO_MATCH_REASON_PREFIX):
+            match_strategy = CONSTRAINED_TYPO_MATCH_STRATEGY
+        if match_strategy:
+            record["match_strategy"] = match_strategy
+        if candidate and candidate.album_id:
+            record["spotify_album_id"] = candidate.album_id
+        if match_strategy in {
+            CONSTRAINED_TYPO_MATCH_STRATEGY,
+            ALBUM_POSITION_MATCH_STRATEGY,
+        }:
             record.update(
                 {
-                    "match_strategy": CONSTRAINED_TYPO_MATCH_STRATEGY,
                     "version_sensitive": True,
                 }
             )
@@ -246,13 +258,16 @@ def cache_track_match(
 
 
 def spotify_candidate_cache_record(candidate: SpotifyTrackCandidate) -> dict[str, object]:
-    return {
+    record = {
         "spotify_uri": candidate.uri,
         "spotify_url": spotify_url_from_uri(candidate.uri),
         "spotify_track_name": candidate.name,
         "spotify_artist_names": list(candidate.artists),
         "spotify_album_name": candidate.album_name,
     }
+    if candidate.album_id:
+        record["spotify_album_id"] = candidate.album_id
+    return record
 
 
 def clean_string_sequence(value: object) -> tuple[str, ...]:

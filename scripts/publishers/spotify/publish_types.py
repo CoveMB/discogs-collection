@@ -21,6 +21,7 @@ WOULD_INCLUDE = "would_include"
 INCLUDED = "included"
 DUPLICATE_IN_SOURCE = "duplicate_in_source"
 MATCH_SOURCE_CACHE = "cache"
+MATCH_SOURCE_ALBUM = "album"
 MATCH_SOURCE_SEARCH = "search"
 
 InfoLog = Callable[[str], None]

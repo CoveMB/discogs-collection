@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from publishers.spotify.matching import SpotifyTrackCandidate
+from publishers.spotify.release_matching import SpotifyAlbumCandidate, SpotifyAlbumTrack
 from shared.debug_log import DebugLog
 from shared.text import clean_cell
 
@@ -78,6 +79,10 @@ Transport = Callable[[HttpRequest], HttpResponse]
 
 
 class SpotifyApiError(RuntimeError):
+    pass
+
+
+class SpotifyAlbumLookupError(SpotifyApiError):
     pass
 
 
@@ -188,6 +193,68 @@ class SpotifyClient:
         if response.status != 200:
             raise SpotifyApiError(f"Spotify search failed with status {response.status}: {response.body}")
         return parse_search_track_candidates(response.body)
+
+    def search_albums(
+        self,
+        access_token: str,
+        query: str,
+        limit: int = 10,
+    ) -> tuple[SpotifyAlbumCandidate, ...]:
+        if limit < 1 or limit > 10:
+            raise ValueError("Spotify search limit must be between 1 and 10")
+        params = urllib.parse.urlencode(
+            {
+                "q": query,
+                "type": "album",
+                "limit": str(limit),
+            }
+        )
+        request = HttpRequest(
+            method="GET",
+            url=f"{SPOTIFY_API_ROOT}/search?{params}",
+            headers=spotify_json_headers(access_token),
+        )
+        response = self.request_with_rate_limit_retries(
+            request,
+            operation_name="spotify_album_search",
+        )
+        if response.status != 200:
+            raise SpotifyAlbumLookupError(
+                f"Spotify album search failed with status {response.status}: {response.body}"
+            )
+        return parse_search_album_candidates(response.body)
+
+    def get_album_tracks(
+        self,
+        access_token: str,
+        album_id: str,
+    ) -> tuple[SpotifyAlbumTrack, ...]:
+        album_tracks: list[SpotifyAlbumTrack] = []
+        limit = 50
+        offset = 0
+        while True:
+            params = urllib.parse.urlencode({"limit": str(limit), "offset": str(offset)})
+            request = HttpRequest(
+                method="GET",
+                url=(
+                    f"{SPOTIFY_API_ROOT}/albums/"
+                    f"{urllib.parse.quote(album_id, safe='')}/tracks?{params}"
+                ),
+                headers=spotify_json_headers(access_token),
+            )
+            response = self.request_with_rate_limit_retries(
+                request,
+                operation_name="spotify_album_tracks",
+            )
+            if response.status != 200:
+                raise SpotifyAlbumLookupError(
+                    f"Spotify album tracks failed with status {response.status}: {response.body}"
+                )
+            payload = json.loads(response.body or "{}")
+            album_tracks.extend(parse_album_track_page(payload))
+            if not isinstance(payload, dict) or not payload.get("next"):
+                return tuple(album_tracks)
+            offset += limit
 
     def list_current_user_playlists(self, access_token: str) -> tuple[SpotifyPlaylist, ...]:
         playlists: list[SpotifyPlaylist] = []
@@ -398,6 +465,7 @@ def parse_search_track_candidates(body: str) -> tuple[SpotifyTrackCandidate, ...
         album = item.get("album", {})
         artists = item.get("artists", [])
         album_name = clean_cell(album.get("name")) if isinstance(album, dict) else ""
+        album_id = clean_cell(album.get("id")) if isinstance(album, dict) else ""
         artist_names = tuple(
             clean_cell(artist.get("name"))
             for artist in artists
@@ -410,9 +478,80 @@ def parse_search_track_candidates(body: str) -> tuple[SpotifyTrackCandidate, ...
                     name=name,
                     artists=artist_names,
                     album_name=album_name,
+                    album_id=album_id,
                 )
             )
     return tuple(candidates)
+
+
+def parse_search_album_candidates(body: str) -> tuple[SpotifyAlbumCandidate, ...]:
+    payload = json.loads(body or "{}")
+    albums = payload.get("albums", {}) if isinstance(payload, dict) else {}
+    items = albums.get("items", []) if isinstance(albums, dict) else []
+    candidates: list[SpotifyAlbumCandidate] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        album_id = clean_cell(item.get("id"))
+        name = clean_cell(item.get("name"))
+        artists = item.get("artists", [])
+        artist_names = tuple(
+            clean_cell(artist.get("name"))
+            for artist in artists
+            if isinstance(artist, dict) and clean_cell(artist.get("name"))
+        )
+        if album_id and name:
+            candidates.append(
+                SpotifyAlbumCandidate(
+                    album_id=album_id,
+                    uri=clean_cell(item.get("uri")),
+                    name=name,
+                    artists=artist_names,
+                    total_tracks=non_negative_int(item.get("total_tracks")),
+                )
+            )
+    return tuple(candidates)
+
+
+def parse_album_track_page(payload: object) -> tuple[SpotifyAlbumTrack, ...]:
+    items = payload.get("items", []) if isinstance(payload, dict) else []
+    tracks: list[SpotifyAlbumTrack] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        uri = clean_cell(item.get("uri"))
+        name = clean_cell(item.get("name"))
+        artists = item.get("artists", [])
+        artist_names = tuple(
+            clean_cell(artist.get("name"))
+            for artist in artists
+            if isinstance(artist, dict) and clean_cell(artist.get("name"))
+        )
+        if not uri or not name:
+            continue
+        is_playable_value = item.get("is_playable")
+        tracks.append(
+            SpotifyAlbumTrack(
+                uri=uri,
+                name=name,
+                artists=artist_names,
+                disc_number=non_negative_int(item.get("disc_number")),
+                track_number=non_negative_int(item.get("track_number")),
+                is_playable=(
+                    is_playable_value
+                    if isinstance(is_playable_value, bool)
+                    else None
+                ),
+            )
+        )
+    return tuple(tracks)
+
+
+def non_negative_int(value: object) -> int:
+    try:
+        return max(0, int(str(value).strip()))
+    except (TypeError, ValueError):
+        return 0
 
 
 def spotify_json_headers(access_token: str) -> dict[str, str]:
