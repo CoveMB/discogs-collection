@@ -29,6 +29,18 @@ SPOTIFY_FEATURED_ARTIST_MATCH_REASON_PREFIX = (
 )
 ORIGINAL_MIX_SUFFIX_PATTERN = re.compile(r"\s*\(\s*original\s+mix\s*\)\s*$", re.IGNORECASE)
 ORIGINAL_MIX_MATCH_REASON_PREFIX = "track matched after removing source Original Mix annotation"
+SPOTIFY_ORIGINAL_ANNOTATION_MATCH_REASON = (
+    "track matched after removing Spotify Original annotation; artist set and album matched"
+)
+SPOTIFY_ORIGINAL_ANNOTATION_MATCH_STRATEGY = "spotify_original_annotation"
+TRAILING_DASHED_SPOTIFY_ORIGINAL_PATTERN = re.compile(
+    r"\s*[-\u2013\u2014]\s*(?:original(?:\s+mix)?|orginal\s+mix)\s*$",
+    re.IGNORECASE,
+)
+TRAILING_ENCLOSED_SPOTIFY_ORIGINAL_PATTERN = re.compile(
+    r"\s*[\(\[]\s*(?:original(?:\s+mix)?|orginal\s+mix)\s*[\)\]]\s*$",
+    re.IGNORECASE,
+)
 LEADING_IN_TITLE_MATCH_REASON_PREFIX = "track title differed only by Spotify's leading 'in'"
 CONSTRAINED_TYPO_MATCH_REASON_PREFIX = "track title matched by constrained typo fallback"
 ALPHANUMERIC_SPACING_MATCH_REASON = "track and album matched after normalizing letter-number spacing"
@@ -231,6 +243,18 @@ def title_without_original_mix_suffix(track_name: str) -> str:
     return base_title or clean_track_name
 
 
+def title_without_spotify_original_annotation(track_name: str) -> str:
+    clean_track_name = track_name.strip()
+    for pattern in (
+        TRAILING_DASHED_SPOTIFY_ORIGINAL_PATTERN,
+        TRAILING_ENCLOSED_SPOTIFY_ORIGINAL_PATTERN,
+    ):
+        base_title = pattern.sub("", clean_track_name).strip()
+        if base_title != clean_track_name:
+            return base_title or clean_track_name
+    return clean_track_name
+
+
 def split_version_substitute_title(track_name: str) -> tuple[str, str] | None:
     clean_track_name = track_name.strip()
     for pattern in (TRAILING_ENCLOSED_VERSION_PATTERN, TRAILING_DASHED_VERSION_PATTERN):
@@ -369,6 +393,37 @@ def choose_best_track_match(
             ),
             candidate=None,
             review_candidates=original_mix_artist_matches,
+            search_queries=search_queries,
+        )
+
+    spotify_original_annotation_matches = tuple(
+        candidate
+        for candidate in candidates
+        if candidate_matches_spotify_original_annotation(track, candidate)
+    )
+    if len(spotify_original_annotation_matches) == 1:
+        candidate = spotify_original_annotation_matches[0]
+        return TrackMatchDecision(
+            track=track,
+            status=MATCHED,
+            spotify_uri=candidate.uri,
+            reason=SPOTIFY_ORIGINAL_ANNOTATION_MATCH_REASON,
+            candidate=candidate,
+            review_candidates=(candidate,),
+            search_queries=search_queries,
+            match_strategy=SPOTIFY_ORIGINAL_ANNOTATION_MATCH_STRATEGY,
+        )
+    if len(spotify_original_annotation_matches) > 1:
+        return TrackMatchDecision(
+            track=track,
+            status=AMBIGUOUS,
+            spotify_uri="",
+            reason=(
+                f"{len(spotify_original_annotation_matches)} candidates matched after removing "
+                "Spotify Original annotation"
+            ),
+            candidate=None,
+            review_candidates=spotify_original_annotation_matches,
             search_queries=search_queries,
         )
 
@@ -619,6 +674,24 @@ def candidate_matches_original_mix_track_and_artist(
         base_track_name != source_track_name
         and normalize_music_text(base_track_name) == normalize_music_text(candidate.name)
         and source_artist_matches_candidate(track.artist_name, candidate.artists)
+    )
+
+
+def candidate_matches_spotify_original_annotation(
+    track: PlaylistTrack,
+    candidate: SpotifyTrackCandidate,
+) -> bool:
+    candidate_title = candidate.name.strip()
+    base_candidate_title = title_without_spotify_original_annotation(candidate_title)
+    source_artist_set = normalized_source_artist_set(track.artist_name)
+    source_album = normalize_music_text(track.album_name)
+    return bool(
+        base_candidate_title != candidate_title
+        and normalize_music_text(track.track_name) == normalize_music_text(base_candidate_title)
+        and source_artist_set
+        and source_artist_set == normalized_candidate_artist_set(candidate.artists)
+        and source_album
+        and source_album == normalize_music_text(candidate.album_name)
     )
 
 

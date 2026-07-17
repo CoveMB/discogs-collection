@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,6 +15,7 @@ from publishers.spotify.matching import (
     MATCHED,
     UNMATCHED,
     PlaylistTrack,
+    SPOTIFY_ORIGINAL_ANNOTATION_MATCH_STRATEGY,
     SpotifyTrackCandidate,
     TrackMatchDecision,
     VERSION_SUBSTITUTE_MATCH_STRATEGY,
@@ -26,6 +27,9 @@ from publishers.spotify.release_matching import (
     ALBUM_ALPHANUMERIC_SPACING_MATCH_STRATEGY,
     ALBUM_EXACT_TRACK_MATCH_STRATEGY,
     ALBUM_POSITION_MATCH_STRATEGY,
+    TRACK_CANDIDATE_ALBUM_ALPHANUMERIC_MATCH_STRATEGY,
+    TRACK_CANDIDATE_ALBUM_EXACT_MATCH_STRATEGY,
+    TRACK_CANDIDATE_ALBUM_POSITION_MATCH_STRATEGY,
 )
 from shared.files import write_json_file
 from shared.text import clean_cell
@@ -33,9 +37,11 @@ from shared.text import clean_cell
 
 MATCH_CACHE_SCHEMA_VERSION = 1
 MATCH_CACHE_RECORD_TYPE = "spotify_track_match_cache"
-MATCHER_VERSION = 12
+MATCHER_VERSION = 13
 CACHEABLE_MATCH_STATUSES = {MATCHED, AMBIGUOUS, UNMATCHED}
 CONSTRAINED_TYPO_MATCH_STRATEGY = "constrained_title_typo"
+ALBUM_RECOVERY_ATTEMPT_MATCHER_VERSION_FIELD = "album_recovery_attempt_matcher_version"
+ALBUM_RECOVERY_ATTEMPT_ALBUM_IDS_FIELD = "album_recovery_attempt_album_ids"
 
 
 @dataclass(frozen=True)
@@ -213,6 +219,76 @@ def review_candidates_from_cache_record(record: Mapping[str, object]) -> tuple[S
     return tuple(candidates)
 
 
+def album_lookup_candidates_from_cache_record(
+    record: Mapping[str, object],
+) -> tuple[SpotifyTrackCandidate, ...]:
+    match_status = clean_cell(record.get("match_status"))
+    if match_status == MATCHED:
+        candidate = spotify_candidate_from_cache_record(record)
+        return (candidate,) if candidate else ()
+    if match_status in {AMBIGUOUS, UNMATCHED}:
+        return review_candidates_from_cache_record(record)
+    return ()
+
+
+def canonical_album_recovery_candidate_ids(
+    album_ids: Sequence[str],
+) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                clean_album_id
+                for album_id in album_ids
+                if (clean_album_id := clean_cell(album_id))
+            }
+        )
+    )
+
+
+def cache_record_has_current_album_recovery_attempt(
+    record: Mapping[str, object],
+    album_ids: Sequence[str],
+) -> bool:
+    if clean_cell(record.get("match_status")) not in {AMBIGUOUS, UNMATCHED}:
+        return False
+    if cache_record_matcher_version(record) != MATCHER_VERSION:
+        return False
+    try:
+        attempt_matcher_version = int(
+            str(record.get(ALBUM_RECOVERY_ATTEMPT_MATCHER_VERSION_FIELD, "")).strip()
+        )
+    except ValueError:
+        return False
+    raw_album_ids = record.get(ALBUM_RECOVERY_ATTEMPT_ALBUM_IDS_FIELD)
+    if not isinstance(raw_album_ids, list) or not all(
+        isinstance(album_id, str) and album_id.strip()
+        for album_id in raw_album_ids
+    ):
+        return False
+    stored_album_ids = tuple(album_id.strip() for album_id in raw_album_ids)
+    expected_album_ids = canonical_album_recovery_candidate_ids(album_ids)
+    return bool(
+        expected_album_ids
+        and attempt_matcher_version == MATCHER_VERSION
+        and stored_album_ids == expected_album_ids
+    )
+
+
+def record_album_recovery_attempt(
+    record: dict[str, object],
+    album_ids: Sequence[str],
+) -> None:
+    if clean_cell(record.get("match_status")) not in {AMBIGUOUS, UNMATCHED}:
+        return
+    if cache_record_matcher_version(record) != MATCHER_VERSION:
+        return
+    canonical_album_ids = canonical_album_recovery_candidate_ids(album_ids)
+    if not canonical_album_ids:
+        return
+    record[ALBUM_RECOVERY_ATTEMPT_MATCHER_VERSION_FIELD] = MATCHER_VERSION
+    record[ALBUM_RECOVERY_ATTEMPT_ALBUM_IDS_FIELD] = list(canonical_album_ids)
+
+
 def cache_track_match(
     matches: dict[str, dict[str, object]],
     decision: TrackMatchDecision,
@@ -261,6 +337,10 @@ def cache_track_match(
             ALBUM_ALPHANUMERIC_SPACING_MATCH_STRATEGY,
             CONSTRAINED_TYPO_MATCH_STRATEGY,
             ALBUM_POSITION_MATCH_STRATEGY,
+            SPOTIFY_ORIGINAL_ANNOTATION_MATCH_STRATEGY,
+            TRACK_CANDIDATE_ALBUM_ALPHANUMERIC_MATCH_STRATEGY,
+            TRACK_CANDIDATE_ALBUM_EXACT_MATCH_STRATEGY,
+            TRACK_CANDIDATE_ALBUM_POSITION_MATCH_STRATEGY,
             VERSION_SUBSTITUTE_MATCH_STRATEGY,
         }:
             record.update(

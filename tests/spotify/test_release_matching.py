@@ -7,7 +7,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DIRECTORY = PROJECT_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 
-from publishers.spotify.matching import PlaylistTrack
+from publishers.spotify.matching import PlaylistTrack, SpotifyTrackCandidate
 from publishers.spotify.match_cache import (
     MATCHER_VERSION,
     cache_track_match,
@@ -18,8 +18,10 @@ from publishers.spotify.release_matching import (
     ALBUM_ALPHANUMERIC_SPACING_MATCH_STRATEGY,
     ALBUM_EXACT_TRACK_MATCH_STRATEGY,
     ALBUM_POSITION_MATCH_STRATEGY,
+    TRACK_CANDIDATE_ALBUM_EXACT_MATCH_STRATEGY,
     SpotifyAlbumCandidate,
     SpotifyAlbumTrack,
+    analyze_album_sequence,
     build_spotify_album_search_query,
     choose_validated_album_match,
     match_release_tracks_to_album,
@@ -292,6 +294,7 @@ class SpotifyReleaseMatchingTests(unittest.TestCase):
 
         self.assertEqual(result.search_count, 1)
         self.assertEqual(len(result.decisions), 6)
+        self.assertFalse(result.used_fallback_track_candidates)
         self.assertEqual(client.searches, [("access-token", 'album:"Numbers and Colours"', 10)])
         self.assertEqual(client.album_track_requests, [("access-token", "album-1")])
 
@@ -390,7 +393,7 @@ class SpotifyReleaseMatchingTests(unittest.TestCase):
             tracks_by_album_id={},
         )
         too_many_client = FakeAlbumLookupClient(
-            candidates=tuple(album_candidate(f"album-{index}") for index in range(1, 5)),
+            candidates=tuple(album_candidate(f"album-{index}") for index in range(1, 7)),
             tracks_by_album_id={},
         )
         no_anchors_tracks = tuple(
@@ -424,15 +427,34 @@ class SpotifyReleaseMatchingTests(unittest.TestCase):
         )
         self.assertEqual(
             too_many.diagnostic,
-            "Spotify returned 4 album candidates with a matching title; the safe maximum is 3",
+            "Spotify returned 6 album candidates with a matching title; the safe maximum is 5",
         )
         self.assertEqual(
             no_anchors.diagnostic,
-            "matching-title Spotify albums did not provide two ordered title-and-artist anchors",
+            (
+                "matching-title Spotify albums failed sequence validation: "
+                "album-1 (Numbers and Colours): source/Spotify tracks 6/6; "
+                "exact title-and-artist anchors 0; title anchors 0; "
+                "artist-only source tracks 5; anchor order valid; unequal gaps 0; "
+                "oversized gaps 1; positional artist mismatches 0; unusable Spotify tracks 0"
+            ),
         )
+        self.assertEqual(len(no_anchors.validation_diagnostics), 1)
+        validation_diagnostic = no_anchors.validation_diagnostics[0]
+        self.assertEqual(validation_diagnostic.album_id, "album-1")
+        self.assertEqual(validation_diagnostic.source_track_count, 6)
+        self.assertEqual(validation_diagnostic.spotify_track_count, 6)
+        self.assertEqual(validation_diagnostic.exact_anchor_count, 0)
+        self.assertEqual(validation_diagnostic.title_anchor_count, 0)
+        self.assertEqual(validation_diagnostic.artist_only_source_track_count, 5)
+        self.assertTrue(validation_diagnostic.anchor_order_is_valid)
+        self.assertEqual(validation_diagnostic.unequal_gap_count, 0)
+        self.assertEqual(validation_diagnostic.oversized_gap_count, 1)
+        self.assertEqual(validation_diagnostic.positional_artist_mismatch_count, 0)
+        self.assertEqual(validation_diagnostic.unusable_spotify_track_count, 0)
 
-    def test_more_than_three_exact_album_candidates_falls_back_without_fetching(self) -> None:
-        candidates = tuple(album_candidate(f"album-{index}") for index in range(1, 5))
+    def test_more_than_five_exact_album_candidates_falls_back_without_fetching(self) -> None:
+        candidates = tuple(album_candidate(f"album-{index}") for index in range(1, 7))
         client = FakeAlbumLookupClient(candidates=candidates, tracks_by_album_id={})
 
         result = resolve_release_with_album(
@@ -445,6 +467,67 @@ class SpotifyReleaseMatchingTests(unittest.TestCase):
         self.assertEqual(result.search_count, 1)
         self.assertEqual(result.decisions, ())
         self.assertEqual(client.album_track_requests, [])
+
+    def test_five_exact_album_candidates_are_fetched_and_one_valid_edition_is_selected(self) -> None:
+        candidates = tuple(album_candidate(f"album-{index}") for index in range(1, 6))
+        invalid_tracks = tuple(
+            album_track(index, f"Different {index}", ("Other Artist",))
+            for index in range(1, 7)
+        )
+        client = FakeAlbumLookupClient(
+            candidates=candidates,
+            tracks_by_album_id={
+                "album-1": self.spotify_tracks,
+                **{
+                    f"album-{index}": invalid_tracks
+                    for index in range(2, 6)
+                },
+            },
+        )
+
+        result = resolve_release_with_album(
+            source_tracks=self.source_tracks,
+            spotify_client=client,
+            access_token="access-token",
+            search_limit=10,
+        )
+
+        self.assertEqual(len(result.decisions), 6)
+        self.assertEqual(result.diagnostic, "")
+        self.assertFalse(result.used_fallback_track_candidates)
+        self.assertEqual(
+            client.album_track_requests,
+            [("access-token", f"album-{index}") for index in range(1, 6)],
+        )
+
+    def test_album_sequence_diagnostic_records_order_gap_artist_and_playability_failures(self) -> None:
+        source_tracks = (
+            source_track(1, "Anchor One"),
+            source_track(2, "Middle"),
+            source_track(3, "Anchor Three"),
+            source_track(4, "Anchor Four"),
+        )
+        spotify_tracks = (
+            album_track(1, "Anchor Three"),
+            album_track(2, "Middle Different", ("Other Artist",)),
+            album_track(3, "Anchor One"),
+            album_track(4, "Anchor Four", is_playable=False),
+            album_track(5, "Extra"),
+        )
+
+        diagnostic = analyze_album_sequence(
+            source_tracks=source_tracks,
+            album=album_candidate(),
+            spotify_tracks=spotify_tracks,
+        )
+
+        self.assertEqual(diagnostic.exact_anchor_count, 2)
+        self.assertEqual(diagnostic.title_anchor_count, 2)
+        self.assertFalse(diagnostic.anchor_order_is_valid)
+        self.assertEqual(diagnostic.unequal_gap_count, 0)
+        self.assertEqual(diagnostic.oversized_gap_count, 0)
+        self.assertEqual(diagnostic.positional_artist_mismatch_count, 0)
+        self.assertEqual(diagnostic.unusable_spotify_track_count, 1)
 
     def test_duplicate_search_results_for_one_album_are_fetched_once(self) -> None:
         candidate = album_candidate()
@@ -462,6 +545,82 @@ class SpotifyReleaseMatchingTests(unittest.TestCase):
 
         self.assertEqual(len(result.decisions), 6)
         self.assertEqual(client.album_track_requests, [("access-token", "album-1")])
+
+    def test_release_lookup_uses_exact_album_id_from_track_candidates_when_album_search_misses(self) -> None:
+        recovered_album_id = "recovered-album"
+        client = FakeAlbumLookupClient(
+            candidates=(album_candidate(album_name="Different Album"),),
+            tracks_by_album_id={recovered_album_id: self.spotify_tracks},
+        )
+        track_candidates = (
+            SpotifyTrackCandidate(
+                uri="spotify:track:recovered-one",
+                name="White",
+                artists=("Example Artist", "Collaborator"),
+                album_name="Numbers and Colours",
+                album_id=recovered_album_id,
+            ),
+            SpotifyTrackCandidate(
+                uri="spotify:track:recovered-two",
+                name="Grey",
+                artists=("Example Artist", "Collaborator"),
+                album_name="Numbers and Colours",
+                album_id=recovered_album_id,
+            ),
+        )
+
+        result = resolve_release_with_album(
+            source_tracks=self.source_tracks,
+            spotify_client=client,
+            access_token="access-token",
+            search_limit=10,
+            fallback_track_candidates=track_candidates,
+        )
+
+        self.assertEqual(len(result.decisions), 6)
+        self.assertEqual(result.diagnostic, "")
+        self.assertEqual(
+            client.album_track_requests,
+            [("access-token", recovered_album_id)],
+        )
+        self.assertTrue(
+            all(
+                "album recovered from cached track-search candidates" in decision.reason
+                for decision in result.decisions
+            )
+        )
+        self.assertEqual(
+            result.decisions[-1].match_strategy,
+            TRACK_CANDIDATE_ALBUM_EXACT_MATCH_STRATEGY,
+        )
+
+    def test_release_lookup_ignores_track_candidate_album_id_when_album_name_differs(self) -> None:
+        client = FakeAlbumLookupClient(
+            candidates=(album_candidate(album_name="Different Album"),),
+            tracks_by_album_id={},
+        )
+        track_candidate = SpotifyTrackCandidate(
+            uri="spotify:track:wrong-album",
+            name="Final Anchor",
+            artists=("Example Artist",),
+            album_name="Different Album",
+            album_id="wrong-album",
+        )
+
+        result = resolve_release_with_album(
+            source_tracks=self.source_tracks,
+            spotify_client=client,
+            access_token="access-token",
+            fallback_track_candidates=(track_candidate,),
+        )
+
+        self.assertEqual(result.decisions, ())
+        self.assertFalse(result.used_fallback_track_candidates)
+        self.assertEqual(
+            result.diagnostic,
+            "Spotify returned no album candidate with a matching title",
+        )
+        self.assertEqual(client.album_track_requests, [])
 
 
 if __name__ == "__main__":

@@ -1328,6 +1328,164 @@ class SpotifyMatchingTests(unittest.TestCase):
             "2 candidates matched after removing source Original Mix annotation and matching artist",
         )
 
+    def test_accepts_spotify_original_annotations_for_unannotated_source_title(self):
+        for candidate_title in (
+            "Skull Shrine - Original",
+            "Skull Shrine - Original Mix",
+            "Skull Shrine (Original Mix)",
+            "Skull Shrine [ORIGINAL MIX]",
+            "Skull Shrine - Orginal Mix",
+        ):
+            with self.subTest(candidate_title=candidate_title):
+                track = PlaylistTrack(
+                    playlist_name="Discogs - Deep Techno",
+                    release_id="37196016",
+                    album_name="A Thousand Faces",
+                    track_number="1",
+                    track_name="Skull Shrine",
+                    artist_name="Feral",
+                    spotify_search_query="Feral Skull Shrine A Thousand Faces",
+                )
+                candidate = SpotifyTrackCandidate(
+                    uri="spotify:track:skull-shrine",
+                    name=candidate_title,
+                    artists=("Feral",),
+                    album_name="A Thousand Faces",
+                )
+
+                decision = choose_best_track_match(track, (candidate,))
+
+                self.assertEqual(decision.status, "matched")
+                self.assertEqual(decision.spotify_uri, "spotify:track:skull-shrine")
+                self.assertEqual(
+                    decision.reason,
+                    "track matched after removing Spotify Original annotation; artist set and album matched",
+                )
+                self.assertEqual(decision.match_strategy, "spotify_original_annotation")
+
+    def test_spotify_original_annotation_requires_exact_artist_set_and_album(self):
+        track = PlaylistTrack(
+            playlist_name="Discogs - Deep Techno",
+            release_id="37196016",
+            album_name="A Thousand Faces",
+            track_number="1",
+            track_name="Skull Shrine",
+            artist_name="Feral",
+            spotify_search_query="Feral Skull Shrine A Thousand Faces",
+        )
+        candidates = (
+            SpotifyTrackCandidate(
+                uri="spotify:track:wrong-artist",
+                name="Skull Shrine - Original Mix",
+                artists=("Other Artist",),
+                album_name="A Thousand Faces",
+            ),
+            SpotifyTrackCandidate(
+                uri="spotify:track:extra-artist",
+                name="Skull Shrine - Original Mix",
+                artists=("Feral", "Guest Artist"),
+                album_name="A Thousand Faces",
+            ),
+            SpotifyTrackCandidate(
+                uri="spotify:track:wrong-album",
+                name="Skull Shrine - Original Mix",
+                artists=("Feral",),
+                album_name="Different Album",
+            ),
+        )
+
+        decision = choose_best_track_match(track, candidates)
+
+        self.assertEqual(decision.status, "unmatched")
+        self.assertEqual(decision.spotify_uri, "")
+
+    def test_prefers_exact_title_over_spotify_original_annotation_fallback(self):
+        track = PlaylistTrack(
+            playlist_name="Discogs - Deep Techno",
+            release_id="37196016",
+            album_name="A Thousand Faces",
+            track_number="1",
+            track_name="Skull Shrine",
+            artist_name="Feral",
+            spotify_search_query="Feral Skull Shrine A Thousand Faces",
+        )
+        candidates = (
+            SpotifyTrackCandidate(
+                uri="spotify:track:annotated",
+                name="Skull Shrine - Original Mix",
+                artists=("Feral",),
+                album_name="A Thousand Faces",
+            ),
+            SpotifyTrackCandidate(
+                uri="spotify:track:exact",
+                name="Skull Shrine",
+                artists=("Feral",),
+                album_name="A Thousand Faces",
+            ),
+        )
+
+        decision = choose_best_track_match(track, candidates)
+
+        self.assertEqual(decision.spotify_uri, "spotify:track:exact")
+        self.assertEqual(decision.reason, "track, artist, and album matched")
+
+    def test_marks_multiple_spotify_original_annotation_candidates_as_ambiguous(self):
+        track = PlaylistTrack(
+            playlist_name="Discogs - Deep Techno",
+            release_id="37196016",
+            album_name="A Thousand Faces",
+            track_number="1",
+            track_name="Skull Shrine",
+            artist_name="Feral",
+            spotify_search_query="Feral Skull Shrine A Thousand Faces",
+        )
+        candidates = tuple(
+            SpotifyTrackCandidate(
+                uri=f"spotify:track:annotated-{index}",
+                name="Skull Shrine - Original Mix",
+                artists=("Feral",),
+                album_name="A Thousand Faces",
+            )
+            for index in range(2)
+        )
+
+        decision = choose_best_track_match(track, candidates)
+
+        self.assertEqual(decision.status, "ambiguous")
+        self.assertEqual(decision.spotify_uri, "")
+        self.assertEqual(
+            decision.reason,
+            "2 candidates matched after removing Spotify Original annotation",
+        )
+
+    def test_rejects_other_spotify_version_annotations_for_unannotated_source(self):
+        track = PlaylistTrack(
+            playlist_name="Discogs - Deep Techno",
+            release_id="37196016",
+            album_name="A Thousand Faces",
+            track_number="1",
+            track_name="Skull Shrine",
+            artist_name="Feral",
+            spotify_search_query="Feral Skull Shrine A Thousand Faces",
+        )
+        for candidate_title in (
+            "Skull Shrine - Remix",
+            "Skull Shrine - Original Edit",
+            "Skull Shrine - Extended Mix",
+        ):
+            with self.subTest(candidate_title=candidate_title):
+                candidate = SpotifyTrackCandidate(
+                    uri="spotify:track:other-version",
+                    name=candidate_title,
+                    artists=("Feral",),
+                    album_name="A Thousand Faces",
+                )
+
+                decision = choose_best_track_match(track, (candidate,))
+
+                self.assertEqual(decision.status, "unmatched")
+                self.assertEqual(decision.spotify_uri, "")
+
     def test_rejects_unannotated_candidate_for_other_parenthetical_text(self):
         for source_title in ("Alpha One (Club Mix)", "Poison Shyness (Anti-Social)"):
             with self.subTest(source_title=source_title):

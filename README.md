@@ -431,8 +431,8 @@ results whose normalized album name differs from the source. Spaces between a
 letter and a number do not affect this comparison, so `Chroma000` and
 `CHROMA 000` share an album key. The same narrow spacing rule applies to title
 anchors inside a validated album. Other word differences still fail. The
-publisher fetches track lists when one to three matching candidates remain.
-More than three matching candidates are treated as too broad, so the publisher
+publisher fetches track lists when one to five matching candidates remain.
+More than five matching candidates are treated as too broad, so the publisher
 skips the album fetch and uses track search instead.
 
 The publisher validates each fetched album as a sequence before using its
@@ -454,6 +454,12 @@ the uncached rows. Any remaining rows use the existing track search ladder, so
 an album mismatch does not block the release. An album API failure stops the run
 instead of starting many fallback searches. Rate-limit stops use the same
 saved-cache and partial-report behavior described below.
+
+When an earlier track search cached a Spotify album ID with the same normalized
+album name, a later run can use that ID if the normal album search still misses
+the album. The publisher fetches at most five distinct cached album IDs and runs
+the same sequence validation. Cached track candidates are ignored with
+`--refresh-match-cache`, which always requests fresh Spotify search results.
 
 The track search ladder starts with a structured Spotify query using `Track
 Name`, `Artist Name`, and `Album Name`. If that does not find a match, it tries
@@ -490,6 +496,13 @@ ahead of these fallbacks. The Original Mix fallback requires a matching artist
 and prefers a matching album, but it can accept one unique track-and-artist
 result when Spotify uses a different album name.
 
+Spotify sometimes adds `Original` or `Original Mix` to a title that Discogs
+stores without an annotation. The matcher removes a trailing dashed,
+parenthesized, or bracketed Spotify annotation for comparison. It also accepts
+the observed `Orginal Mix` spelling. This rule requires an exact base title,
+the same complete artist set, the same nonempty album name, and one unique
+candidate. Other version labels are not removed by this rule.
+
 Rows that still have no match after the search ladder get one tightly
 constrained typo check. The source and Spotify album must match, and their
 album names must be nonempty. Their normalized artist sets must also be nonempty
@@ -519,7 +532,9 @@ The Spotify match cache stores `matched`, `ambiguous`, and `unmatched` decisions
 Later runs reuse those decisions instead of searching Spotify again. Search
 errors are not cached, since they usually mean Spotify or the network failed
 temporarily. Typo-derived matches, position-derived album matches,
-letter-number spacing matches, and version substitutes are version-sensitive.
+letter-number spacing matches, Spotify Original annotation matches, albums
+recovered from cached track candidates, and version substitutes are
+version-sensitive.
 A matcher update can recheck them without invalidating ordinary exact matches.
 Album cache records keep the Spotify album ID and the match strategy for audit.
 To recheck every row and replace cached decisions with fresh Spotify results
@@ -553,8 +568,58 @@ candidates when they exist. This ranking only changes the report. It does not
 turn a candidate into a match. If an eligible release used album lookup before
 an unmatched track search, the row's reason says whether no matching album title
 was returned, too many editions were returned, sequence validation failed, or a
-validated album resolved only part of the release. If every query returns no
-candidates, the report says so directly.
+validated album resolved only part of the release. Failed sequence validation
+also records the source and Spotify track counts, title and artist anchor counts,
+anchor order, unequal or oversized gaps, positional artist mismatches, and
+unusable Spotify tracks. If every query returns no candidates, the report says
+so directly.
+
+## Import manual Spotify matches
+
+Use a manual override when the report identifies the correct Spotify track but
+the automatic rules cannot select it safely. The importer validates source rows
+against the generated playlist masters. Preview mode does not change the cache
+or call Spotify:
+
+```bash
+python3 scripts/publishers/spotify/manual_matches.py \
+  --overrides /path/to/manual-matches.json
+```
+
+The override file uses this format:
+
+```json
+{
+  "schema_version": 1,
+  "record_type": "spotify_manual_match_overrides",
+  "matches": [
+    {
+      "release_id": "123456",
+      "track_number": "1",
+      "artist_name": "Source Artist",
+      "album_name": "Source Album",
+      "track_name": "Source Track",
+      "spotify_uri": "spotify:track:example",
+      "spotify_track_name": "Spotify Track",
+      "spotify_artist_names": ["Spotify Artist"],
+      "spotify_album_name": "Spotify Album",
+      "spotify_album_id": "optional-album-id"
+    }
+  ]
+}
+```
+
+After reviewing the preview, write the manual matches to the local cache:
+
+```bash
+python3 scripts/publishers/spotify/manual_matches.py \
+  --overrides /path/to/manual-matches.json \
+  --apply
+```
+
+An applied manual match remains authoritative across matcher updates. The
+importer refuses to replace a different matched or manual Spotify URI unless
+you also pass `--replace-existing`.
 
 If Spotify rate-limits a request, the client waits and retries. It honors
 `Retry-After` exactly when Spotify sends it, and uses a 60-second wait when the

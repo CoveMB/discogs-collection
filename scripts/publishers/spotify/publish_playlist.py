@@ -30,9 +30,13 @@ from publishers.spotify.client import (  # noqa: E402
 )
 from publishers.spotify.env import DEFAULT_ENV_PATH, DEFAULT_TOKEN_CACHE_PATH, load_spotify_settings  # noqa: E402
 from publishers.spotify.match_cache import (  # noqa: E402
+    album_lookup_candidates_from_cache_record,
+    cache_record_has_current_album_recovery_attempt,
     cache_track_match,
     cached_track_match,
+    canonical_album_recovery_candidate_ids,
     load_spotify_track_match_cache,
+    record_album_recovery_attempt,
     save_spotify_track_match_cache,
     spotify_track_match_key,
     utc_timestamp,
@@ -46,6 +50,7 @@ from publishers.spotify.matching import (  # noqa: E402
     LEADING_IN_TITLE_MATCH_REASON_PREFIX,
     MATCHED,
     ORIGINAL_MIX_MATCH_REASON_PREFIX,
+    SPOTIFY_ORIGINAL_ANNOTATION_MATCH_STRATEGY,
     SPOTIFY_FEATURED_ARTIST_MATCH_REASON_PREFIX,
     UNMATCHED,
     VERSION_SUBSTITUTE_MATCH_STRATEGY,
@@ -109,6 +114,7 @@ from publishers.spotify.release_matching import (  # noqa: E402
     ALBUM_EXACT_TRACK_MATCH_REASON,
     ALBUM_POSITION_MATCH_REASON,
     SpotifyAlbumLookupClient,
+    album_candidates_from_track_candidates,
     release_is_eligible_for_album_lookup,
     resolve_release_with_album,
 )
@@ -356,19 +362,51 @@ def publish_spotify_playlists(
                     release_tracks = release_tracks_by_id.get(track.release_id)
                     if release_tracks and release_is_eligible_for_album_lookup(release_tracks):
                         attempted_album_release_ids.add(track.release_id)
-                        if refresh_match_cache or release_has_uncached_track(
+                        cached_album_candidates = (
+                            ()
+                            if refresh_match_cache
+                            else cached_review_candidates_for_release(
+                                release_tracks,
+                                match_cache,
+                            )
+                        )
+                        cached_album_ids = album_recovery_candidate_ids(
                             release_tracks,
-                            match_cache,
+                            cached_album_candidates,
+                        )
+                        album_recovery_attempt_is_current = (
+                            not refresh_match_cache
+                            and release_has_current_album_recovery_attempt(
+                                release_tracks,
+                                match_cache,
+                                cached_album_ids,
+                            )
+                        )
+                        if (
+                            refresh_match_cache
+                            or release_has_uncached_track(release_tracks, match_cache)
+                            or (cached_album_ids and not album_recovery_attempt_is_current)
                         ):
                             album_result = resolve_release_with_album(
                                 source_tracks=release_tracks,
                                 spotify_client=album_lookup_client,
                                 access_token=access_token,
                                 search_limit=search_limit,
+                                fallback_track_candidates=(
+                                    ()
+                                    if refresh_match_cache or album_recovery_attempt_is_current
+                                    else cached_album_candidates
+                                ),
                             )
                             search_count += album_result.search_count
                             if album_result.diagnostic:
                                 album_lookup_diagnostics_by_release_id[track.release_id] = album_result.diagnostic
+                            if album_result.used_fallback_track_candidates:
+                                record_album_recovery_attempt_for_release(
+                                    release_tracks,
+                                    match_cache,
+                                    cached_album_ids,
+                                )
                             for resolved_decision in album_result.decisions:
                                 resolved_key = spotify_track_match_key(resolved_decision.track)
                                 if resolved_key not in preexisting_matched_cache_keys:
@@ -738,6 +776,60 @@ def group_unique_tracks_by_release_id(
         release_id: order_release_tracks(tracks)
         for release_id, tracks in grouped_tracks.items()
     }
+
+
+def cached_review_candidates_for_release(
+    release_tracks: Sequence[PlaylistTrack],
+    match_cache: Mapping[str, Mapping[str, object]],
+) -> tuple[SpotifyTrackCandidate, ...]:
+    candidates_by_uri: dict[str, SpotifyTrackCandidate] = {}
+    for track in release_tracks:
+        record = match_cache.get(spotify_track_match_key(track))
+        if record is None:
+            continue
+        for candidate in album_lookup_candidates_from_cache_record(record):
+            candidates_by_uri.setdefault(candidate.uri, candidate)
+    return tuple(candidates_by_uri.values())
+
+
+def album_recovery_candidate_ids(
+    release_tracks: Sequence[PlaylistTrack],
+    cached_candidates: Sequence[SpotifyTrackCandidate],
+) -> tuple[str, ...]:
+    return canonical_album_recovery_candidate_ids(
+        tuple(
+            candidate.album_id
+            for candidate in album_candidates_from_track_candidates(
+                source_tracks=release_tracks,
+                track_candidates=cached_candidates,
+            )
+        )
+    )
+
+
+def release_has_current_album_recovery_attempt(
+    release_tracks: Sequence[PlaylistTrack],
+    match_cache: Mapping[str, Mapping[str, object]],
+    album_ids: Sequence[str],
+) -> bool:
+    if not album_ids:
+        return False
+    return any(
+        cache_record_has_current_album_recovery_attempt(record, album_ids)
+        for track in release_tracks
+        if (record := match_cache.get(spotify_track_match_key(track))) is not None
+    )
+
+
+def record_album_recovery_attempt_for_release(
+    release_tracks: Sequence[PlaylistTrack],
+    match_cache: dict[str, dict[str, object]],
+    album_ids: Sequence[str],
+) -> None:
+    for track in release_tracks:
+        record = match_cache.get(spotify_track_match_key(track))
+        if record is not None:
+            record_album_recovery_attempt(record, album_ids)
 
 
 def order_release_tracks(tracks: Sequence[PlaylistTrack]) -> tuple[PlaylistTrack, ...]:
@@ -1207,6 +1299,7 @@ def publish_reason_with_match_details(
 ) -> str:
     if decision.match_strategy in {
         ALPHANUMERIC_SPACING_MATCH_STRATEGY,
+        SPOTIFY_ORIGINAL_ANNOTATION_MATCH_STRATEGY,
         VERSION_SUBSTITUTE_MATCH_STRATEGY,
     } or decision.reason.startswith(
         (

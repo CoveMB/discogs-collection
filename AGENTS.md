@@ -9,7 +9,10 @@ TuneMyMusic-style master CSV files per playlist, and creates split CSVs for
 playlist import batches. The optional Spotify publisher starts from those
 playlist CSVs, can publish matched tracks to Spotify, and still supports
 explicit dry-run previews. Optional Spotify tooling can also dedupe
-repo-managed publisher playlists by exact Spotify track URI. A separate
+repo-managed publisher playlists by exact Spotify track URI. A manual-match
+importer validates override rows against generated playlist masters, previews
+by default without calling Spotify or writing the match cache, writes only in
+explicit apply mode, and stores authoritative manual cache records. A separate
 release-ID playlist script can create an isolated on-the-fly playlist from
 explicit Discogs `release_id` values without adding those releases to the
 collection master.
