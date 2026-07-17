@@ -38,6 +38,7 @@ from publishers.spotify.match_cache import (  # noqa: E402
     utc_timestamp,
 )
 from publishers.spotify.matching import (  # noqa: E402
+    ALPHANUMERIC_SPACING_MATCH_STRATEGY,
     AMBIGUOUS,
     CONSTRAINED_TYPO_MATCH_REASON_PREFIX,
     ERROR,
@@ -47,6 +48,7 @@ from publishers.spotify.matching import (  # noqa: E402
     ORIGINAL_MIX_MATCH_REASON_PREFIX,
     SPOTIFY_FEATURED_ARTIST_MATCH_REASON_PREFIX,
     UNMATCHED,
+    VERSION_SUBSTITUTE_MATCH_STRATEGY,
     PlaylistTrack,
     TrackMatchDecision,
     SpotifyTrackCandidate,
@@ -57,28 +59,21 @@ from publishers.spotify.matching import (  # noqa: E402
 )
 from publishers.spotify.publish_reports import (  # noqa: E402
     build_publish_summary,
-    build_summary,
     cached_matched_publish_decision_count,
     count_publish_decisions,
     display_report_value,
     flatten_report_details,
-    format_ambiguous_track_details,
     format_artist_names,
     format_candidate_comparison,
     format_field_comparison,
     format_final_playlist_item,
-    format_match_decision,
     format_publish_decision,
     format_publish_decisions,
     format_publish_review_details,
-    format_search_error_details,
-    format_search_query,
     format_spotify_artists,
     format_spotify_candidate,
     format_track_context,
-    format_unmatched_track_details,
     searched_matched_publish_decision_count,
-    write_dry_run_report,
     write_publish_report,
 )
 from publishers.spotify.publish_state import (  # noqa: E402
@@ -107,7 +102,6 @@ from publishers.spotify.publish_types import (  # noqa: E402
     InfoLog,
     PlaylistPublishContext,
     PlaylistPublishDecision,
-    SpotifyDryRunSummary,
     SpotifyPublishSummary,
     SpotifyTrackSearchResult,
 )
@@ -216,7 +210,9 @@ def search_spotify_track(
             tuple(candidates),
             search_queries=tuple(searched_queries),
             allow_leading_in_title_variant=False,
+            allow_alphanumeric_spacing_fallback=False,
             allow_constrained_typo_fallback=False,
+            allow_version_substitute=False,
         )
         if decision.status in {MATCHED, AMBIGUOUS}:
             return SpotifyTrackSearchResult(decision=decision, search_count=search_count)
@@ -234,71 +230,6 @@ def search_spotify_track(
 
 def is_query_specific_spotify_search_error(error: SpotifyApiError) -> bool:
     return "Query exceeds maximum length of 250 characters" in str(error)
-
-
-def dry_run_spotify_playlist_publish(
-    playlist_output_directory: Path,
-    report_path: Path,
-    spotify_client: SpotifyTrackSearchClient,
-    access_token: str,
-    search_limit: int = 10,
-    progress: ProgressReporter | None = None,
-    playlist_selectors: Sequence[str] | None = None,
-    playlist_master_paths: Sequence[Path] | None = None,
-    playlist_names_by_master_path: Mapping[Path, str] | None = None,
-    debug_log: DebugLog | None = None,
-) -> SpotifyDryRunSummary:
-    if playlist_selectors is not None and playlist_master_paths is not None:
-        raise ValueError("playlist_selectors and playlist_master_paths cannot both be provided")
-    if playlist_master_paths is not None:
-        selected_master_paths = tuple(playlist_master_paths)
-    else:
-        selected_master_paths = resolve_playlist_master_paths(
-            playlist_output_directory,
-            playlist_selectors,
-            allow_all_selector=False,
-        )
-    if debug_log:
-        debug_log(f"dry_run_playlist_masters count={len(selected_master_paths)}")
-    playlist_tracks = read_playlist_tracks_from_master_paths(
-        selected_master_paths,
-        playlist_names_by_master_path=playlist_names_by_master_path,
-    )
-    if debug_log:
-        debug_log(f"loaded_playlist_tracks count={len(playlist_tracks)}")
-    decisions: list[TrackMatchDecision] = []
-    if progress:
-        progress.start(len(playlist_tracks))
-    try:
-        for row_number, track in enumerate(playlist_tracks, start=1):
-            try:
-                if debug_log:
-                    debug_log(f"track_search_start index={row_number} total={len(playlist_tracks)}")
-                try:
-                    search_result = search_spotify_track(
-                        track=track,
-                        spotify_client=spotify_client,
-                        access_token=access_token,
-                        search_limit=search_limit,
-                    )
-                    decision = search_result.decision
-                except SpotifyRateLimitDeferredError:
-                    if debug_log:
-                        debug_log(f"track_search_deferred index={row_number}")
-                    raise
-                decisions.append(decision)
-                if debug_log:
-                    debug_log(f"track_search_done index={row_number} status={decision.status}")
-            finally:
-                if progress:
-                    progress.update(row_number)
-    finally:
-        if progress:
-            progress.finish()
-
-    summary = build_summary(tuple(decisions), report_path)
-    write_dry_run_report(report_path, summary)
-    return summary
 
 
 def publish_spotify_playlists(
@@ -365,6 +296,7 @@ def publish_spotify_playlists(
     )
     attempted_album_release_ids: set[str] = set()
     album_decisions_by_track_key: dict[str, TrackMatchDecision] = {}
+    album_lookup_diagnostics_by_release_id: dict[str, str] = {}
     preexisting_matched_cache_keys = (
         set()
         if refresh_match_cache
@@ -435,6 +367,8 @@ def publish_spotify_playlists(
                                 search_limit=search_limit,
                             )
                             search_count += album_result.search_count
+                            if album_result.diagnostic:
+                                album_lookup_diagnostics_by_release_id[track.release_id] = album_result.diagnostic
                             for resolved_decision in album_result.decisions:
                                 resolved_key = spotify_track_match_key(resolved_decision.track)
                                 if resolved_key not in preexisting_matched_cache_keys:
@@ -521,6 +455,13 @@ def publish_spotify_playlists(
                         search_count += track_search_count
                         if track_search_count:
                             searched_row_count += 1
+                    if decision.status == UNMATCHED and match_source == MATCH_SOURCE_SEARCH:
+                        album_lookup_diagnostic = album_lookup_diagnostics_by_release_id.get(track.release_id, "")
+                        if album_lookup_diagnostic:
+                            decision = replace(
+                                decision,
+                                reason=f"{decision.reason}; album lookup: {album_lookup_diagnostic}",
+                            )
                     publish_decision = build_publish_decision(
                         playlist_name=playlist_name,
                         target_playlist_name=target_playlist_name,
@@ -1264,7 +1205,10 @@ def publish_reason_with_match_details(
     publish_reason: str,
     decision: TrackMatchDecision,
 ) -> str:
-    if decision.reason.startswith(
+    if decision.match_strategy in {
+        ALPHANUMERIC_SPACING_MATCH_STRATEGY,
+        VERSION_SUBSTITUTE_MATCH_STRATEGY,
+    } or decision.reason.startswith(
         (
             FEATURED_ARTIST_MATCH_REASON_PREFIX,
             SPOTIFY_FEATURED_ARTIST_MATCH_REASON_PREFIX,

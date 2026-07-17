@@ -8,11 +8,9 @@ from pathlib import Path
 from publishers.spotify.matching import (
     AMBIGUOUS,
     ERROR,
-    MATCHED,
     UNMATCHED,
     PlaylistTrack,
     SpotifyTrackCandidate,
-    TrackMatchDecision,
     bounded_damerau_levenshtein_distance,
     build_spotify_track_search_query,
     normalize_music_text,
@@ -33,7 +31,6 @@ from publishers.spotify.publish_types import (
     FinalPlaylistItem,
     PlaylistPublishContext,
     PlaylistPublishDecision,
-    SpotifyDryRunSummary,
     SpotifyPublishSummary,
 )
 from shared.reports import format_report_section, format_report_title, write_text_report
@@ -215,66 +212,6 @@ def format_artist_names(artist_names: Sequence[str]) -> str:
     return display_report_value(", ".join(artist_names))
 
 
-def build_summary(decisions: tuple[TrackMatchDecision, ...], report_path: Path) -> SpotifyDryRunSummary:
-    playlist_names = {decision.track.playlist_name for decision in decisions}
-    return SpotifyDryRunSummary(
-        playlist_count=len(playlist_names),
-        track_count=len(decisions),
-        matched_count=sum(1 for decision in decisions if decision.status == MATCHED),
-        ambiguous_count=sum(1 for decision in decisions if decision.status == AMBIGUOUS),
-        unmatched_count=sum(1 for decision in decisions if decision.status == UNMATCHED),
-        error_count=sum(1 for decision in decisions if decision.status == ERROR),
-        report_path=report_path,
-        decisions=decisions,
-    )
-
-
-def write_dry_run_report(path: Path, summary: SpotifyDryRunSummary) -> None:
-    lines = format_report_title("Spotify playlist dry-run report")
-    lines.extend(
-        format_report_section(
-            "Summary",
-            [
-                f"- Playlists: {summary.playlist_count}",
-                f"- Tracks: {summary.track_count}",
-                f"- Matched tracks: {summary.matched_count}",
-                f"- Ambiguous tracks: {summary.ambiguous_count}",
-                f"- Unmatched tracks: {summary.unmatched_count}",
-                f"- Search errors: {summary.error_count}",
-            ],
-        )
-    )
-    lines.extend(
-        format_report_section(
-            "Ambiguous tracks needing review",
-            flatten_report_details(format_ambiguous_track_details(decision) for decision in summary.decisions if decision.status == AMBIGUOUS),
-        )
-    )
-    lines.extend(
-        format_report_section(
-            "Unmatched tracks needing review",
-            flatten_report_details(format_unmatched_track_details(decision) for decision in summary.decisions if decision.status == UNMATCHED),
-        )
-    )
-    lines.extend(
-        format_report_section(
-            "Search errors",
-            flatten_report_details(format_search_error_details(decision) for decision in summary.decisions if decision.status == ERROR),
-        )
-    )
-    lines.extend(format_report_section("Track match decisions", [format_match_decision(decision) for decision in summary.decisions] or ["- None"]))
-    write_text_report(path, lines)
-
-
-def format_match_decision(decision: TrackMatchDecision) -> str:
-    track = decision.track
-    return (
-        f"- {track.playlist_name} | {track.release_id} | {track.track_number} | "
-        f"{track.artist_name} | {track.track_name} | {decision.status} | "
-        f"{decision.spotify_uri or 'no Spotify URI'} | {display_report_value(decision.reason)}"
-    )
-
-
 def flatten_report_details(detail_groups: Iterable[list[str]]) -> list[str]:
     lines: list[str] = []
     for detail_group in detail_groups:
@@ -284,48 +221,12 @@ def flatten_report_details(detail_groups: Iterable[list[str]]) -> list[str]:
     return lines or ["- None"]
 
 
-def format_ambiguous_track_details(decision: TrackMatchDecision) -> list[str]:
-    lines = [
-        f"- {format_track_context(decision.track)}",
-        f"  Search query: {format_search_query(decision.track)}",
-        f"  Why: {display_report_value(decision.reason)}",
-    ]
-    if decision.review_candidates:
-        lines.append("  Matching Spotify candidates:")
-        lines.extend(f"    - {format_spotify_candidate(candidate)}" for candidate in decision.review_candidates)
-    else:
-        lines.append("  Matching Spotify candidates: none recorded")
-    return lines
-
-
-def format_unmatched_track_details(decision: TrackMatchDecision) -> list[str]:
-    lines = [
-        f"- {format_track_context(decision.track)}",
-        f"  Search query: {format_search_query(decision.track)}",
-        f"  Why: {display_report_value(decision.reason)}",
-    ]
-    append_unmatched_candidate_diagnostics(lines, decision.track, decision.review_candidates)
-    return lines
-
-
-def format_search_error_details(decision: TrackMatchDecision) -> list[str]:
-    return [
-        f"- {format_track_context(decision.track)}",
-        f"  Search query: {format_search_query(decision.track)}",
-        f"  Error: {display_report_value(decision.reason)}",
-    ]
-
-
 def format_track_context(track: PlaylistTrack) -> str:
     return (
         f"{display_report_value(track.playlist_name)} | {display_report_value(track.release_id)} | "
         f"{display_report_value(track.track_number)} | {display_report_value(track.artist_name)} | "
         f"{display_report_value(track.track_name)} | {display_report_value(track.album_name)}"
     )
-
-
-def format_search_query(track: PlaylistTrack) -> str:
-    return display_report_value(build_spotify_track_search_query(track))
 
 
 def format_spotify_candidate(candidate: SpotifyTrackCandidate) -> str:
@@ -349,19 +250,35 @@ def append_unmatched_candidate_diagnostics(
         lines.append("  Diagnostic: no Spotify candidates were returned by any query.")
         return
 
-    candidate = best_diagnostic_candidate(track, candidates)
+    ranked_candidates = rank_diagnostic_candidates(track, candidates)
+    candidate = ranked_candidates[0]
     lines.append(f"  Spotify returned {len(candidates)} candidate(s).")
     lines.append(f"  Best diagnostic candidate: {format_spotify_candidate(candidate)}")
     lines.append(f"  Diagnostic: {format_candidate_diagnostic_summary(track, candidate)}")
     lines.append("  Comparison:")
     lines.extend(format_candidate_comparison(track, candidate))
+    other_candidates = ranked_candidates[1:3]
+    if other_candidates:
+        lines.append("  Other diagnostic candidates:")
+        for other_candidate in other_candidates:
+            lines.append(f"    - {format_spotify_candidate(other_candidate)}")
+            lines.append(
+                f"      Evidence: {format_candidate_diagnostic_summary(track, other_candidate)}"
+            )
 
 
 def best_diagnostic_candidate(
     track: PlaylistTrack,
     candidates: Sequence[SpotifyTrackCandidate],
 ) -> SpotifyTrackCandidate:
-    return min(candidates, key=lambda candidate: diagnostic_candidate_sort_key(track, candidate))
+    return rank_diagnostic_candidates(track, candidates)[0]
+
+
+def rank_diagnostic_candidates(
+    track: PlaylistTrack,
+    candidates: Sequence[SpotifyTrackCandidate],
+) -> tuple[SpotifyTrackCandidate, ...]:
+    return tuple(sorted(candidates, key=lambda candidate: diagnostic_candidate_sort_key(track, candidate)))
 
 
 def diagnostic_candidate_sort_key(

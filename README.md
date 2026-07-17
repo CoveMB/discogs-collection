@@ -427,10 +427,13 @@ release IDs, and inconsistent album names go straight to the track search
 ladder.
 
 An eligible release gets one exact-name album search. The publisher ignores
-results whose normalized album name differs from the source. It fetches track
-lists when one to three exact-name candidates remain. More than three exact-name
-candidates are treated as too broad, so the publisher skips the album fetch and
-uses track search instead.
+results whose normalized album name differs from the source. Spaces between a
+letter and a number do not affect this comparison, so `Chroma000` and
+`CHROMA 000` share an album key. The same narrow spacing rule applies to title
+anchors inside a validated album. Other word differences still fail. The
+publisher fetches track lists when one to three matching candidates remain.
+More than three matching candidates are treated as too broad, so the publisher
+skips the album fetch and uses track search instead.
 
 The publisher validates each fetched album as a sequence before using its
 positions. It requires at least two exact title and full artist-set matches in
@@ -460,8 +463,12 @@ comma-separated artist lists, plain `artist title` text, and the existing
 as token separators before comparing track, artist, and album text, so curly
 apostrophes and long dashes behave like their ASCII forms. This normalization
 still requires all words to match. Only the explicit title fallbacks below may
-remove or add text. When a source title ends in `(Original Mix)`, the ladder also
-tries the structured and plain-text queries with that suffix removed. Discogs
+remove or add text. A separate letter-number spacing rule can match titles such
+as `Chroma001 Helium` and `CHROMA 001 HELIUM`. The albums must also match under
+that rule, and every Discogs artist must appear in Spotify's artist list. One
+qualifying candidate is matched; multiple candidates remain ambiguous. When a
+source title ends in `(Original Mix)`, the ladder also tries the structured and
+plain-text queries with that suffix removed. Discogs
 and Spotify may put a feature credit in different places. The matcher can handle
 a supported feature marker that appears in the Discogs title but not the Spotify
 title, or in the Spotify title but not the Discogs title. When the marker is in
@@ -494,14 +501,29 @@ words such as `mix`, `remix`, `edit`, `live`, and `dub` cannot be the differing
 word. One qualifying candidate is matched; multiple candidates are reported as
 ambiguous. Numeric titles and broader title changes remain unmatched.
 
+If no ordinary title match is found after the full search ladder, the matcher
+can use one version substitute. It recognizes trailing `Remastered`, `Remaster`,
+`Live`, `Edit`, and `Radio Edit` labels when they are enclosed in parentheses or
+brackets, or separated from the base title by a dash. Case and punctuation-only
+differences, such as `(LIVE)` and `(Live)`, are ordinary matches and do not use
+the substitute rule. A substitute requires the same normalized base title and
+every Discogs artist in Spotify's artist list. Only one side may have the
+version label, so a `Live` source is not replaced by a `Remastered` candidate.
+The album may differ because Spotify may list the substitute on another release.
+One candidate is accepted. Multiple candidates remain ambiguous. Source titles
+with a recognized version label also get base-title search queries, but the
+matcher finishes the ordinary search ladder before accepting a substitute. An
+exact candidate returned by a later query therefore wins.
+
 The Spotify match cache stores `matched`, `ambiguous`, and `unmatched` decisions.
 Later runs reuse those decisions instead of searching Spotify again. Search
 errors are not cached, since they usually mean Spotify or the network failed
-temporarily. Typo-derived matches and position-derived album matches are
-version-sensitive, so a matcher update can recheck them without invalidating
-ordinary exact matches. Album cache records keep the Spotify album ID and the
-match strategy for audit. To recheck every row and replace cached decisions with
-fresh Spotify results without writing playlist changes to Spotify, run:
+temporarily. Typo-derived matches, position-derived album matches,
+letter-number spacing matches, and version substitutes are version-sensitive.
+A matcher update can recheck them without invalidating ordinary exact matches.
+Album cache records keep the Spotify album ID and the match strategy for audit.
+To recheck every row and replace cached decisions with fresh Spotify results
+without writing playlist changes to Spotify, run:
 
 ```bash
 python3 scripts/publishers/spotify/publish_playlist.py \
@@ -526,8 +548,12 @@ diagnostic review instead of displaying the first search result. It prefers the
 candidate with the strongest exact title, artist-set, and album evidence, then
 uses title edit distance and stable text fields to break ties. The report labels
 this the best diagnostic candidate and lists the title edit distance, exact or
-partial artist evidence, and album evidence. This ranking only changes the
-report. It does not turn a candidate into a match. If every query returns no
+partial artist evidence, and album evidence. It also shows the next two ranked
+candidates when they exist. This ranking only changes the report. It does not
+turn a candidate into a match. If an eligible release used album lookup before
+an unmatched track search, the row's reason says whether no matching album title
+was returned, too many editions were returned, sequence validation failed, or a
+validated album resolved only part of the release. If every query returns no
 candidates, the report says so directly.
 
 If Spotify rate-limits a request, the client waits and retries. It honors

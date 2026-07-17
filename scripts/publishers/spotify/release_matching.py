@@ -12,6 +12,8 @@ from publishers.spotify.matching import (
     PlaylistTrack,
     SpotifyTrackCandidate,
     TrackMatchDecision,
+    music_values_match_only_after_alphanumeric_spacing,
+    normalize_alphanumeric_spacing,
     normalize_music_text,
     normalized_candidate_artist_set,
     normalized_source_artist_set,
@@ -23,8 +25,14 @@ MINIMUM_RELEASE_TRACKS_FOR_ALBUM_LOOKUP = 3
 MAXIMUM_EXACT_ALBUM_CANDIDATES_TO_FETCH = 3
 MAXIMUM_POSITIONAL_GAP_TRACKS = 3
 ALBUM_EXACT_TRACK_MATCH_STRATEGY = "exact_track_in_validated_album"
+ALBUM_ALPHANUMERIC_SPACING_MATCH_STRATEGY = (
+    "exact_track_in_alphanumeric_spacing_validated_album"
+)
 ALBUM_POSITION_MATCH_STRATEGY = "validated_album_position"
 ALBUM_EXACT_TRACK_MATCH_REASON = "track matched exactly within a validated Spotify album"
+ALBUM_ALPHANUMERIC_SPACING_MATCH_REASON = (
+    f"{ALBUM_EXACT_TRACK_MATCH_REASON} after normalizing letter-number spacing"
+)
 ALBUM_POSITION_MATCH_REASON = "track matched by position within a validated Spotify album sequence"
 
 
@@ -51,6 +59,7 @@ class SpotifyAlbumTrack:
 class SpotifyReleaseAlbumMatchResult:
     decisions: tuple[TrackMatchDecision, ...]
     search_count: int
+    diagnostic: str = ""
 
 
 @runtime_checkable
@@ -97,7 +106,11 @@ def resolve_release_with_album(
 ) -> SpotifyReleaseAlbumMatchResult:
     source_tracks = tuple(source_tracks)
     if not release_is_eligible_for_album_lookup(source_tracks):
-        return SpotifyReleaseAlbumMatchResult(decisions=(), search_count=0)
+        return SpotifyReleaseAlbumMatchResult(
+            decisions=(),
+            search_count=0,
+            diagnostic="release did not meet album lookup requirements",
+        )
 
     album_search_query = build_spotify_album_search_query(source_tracks[0].album_name)
     candidates = spotify_client.search_albums(
@@ -105,20 +118,30 @@ def resolve_release_with_album(
         query=album_search_query,
         limit=search_limit,
     )
-    normalized_source_album_name = normalize_music_text(source_tracks[0].album_name)
+    normalized_source_album_name = normalize_alphanumeric_spacing(source_tracks[0].album_name)
     exact_album_candidates_by_id: dict[str, SpotifyAlbumCandidate] = {}
     for candidate in candidates:
         if (
             candidate.album_id
-            and normalize_music_text(candidate.name) == normalized_source_album_name
+            and normalize_alphanumeric_spacing(candidate.name) == normalized_source_album_name
         ):
             exact_album_candidates_by_id.setdefault(candidate.album_id, candidate)
     exact_album_candidates = tuple(exact_album_candidates_by_id.values())
-    if (
-        not exact_album_candidates
-        or len(exact_album_candidates) > MAXIMUM_EXACT_ALBUM_CANDIDATES_TO_FETCH
-    ):
-        return SpotifyReleaseAlbumMatchResult(decisions=(), search_count=1)
+    if not exact_album_candidates:
+        return SpotifyReleaseAlbumMatchResult(
+            decisions=(),
+            search_count=1,
+            diagnostic="Spotify returned no album candidate with a matching title",
+        )
+    if len(exact_album_candidates) > MAXIMUM_EXACT_ALBUM_CANDIDATES_TO_FETCH:
+        return SpotifyReleaseAlbumMatchResult(
+            decisions=(),
+            search_count=1,
+            diagnostic=(
+                f"Spotify returned {len(exact_album_candidates)} album candidates with a matching title; "
+                f"the safe maximum is {MAXIMUM_EXACT_ALBUM_CANDIDATES_TO_FETCH}"
+            ),
+        )
 
     candidate_matches: list[tuple[TrackMatchDecision, ...]] = []
     for album in exact_album_candidates:
@@ -134,9 +157,22 @@ def resolve_release_with_album(
                 album_search_query=album_search_query,
             )
         )
+    validated_matches = tuple(decisions for decisions in candidate_matches if decisions)
+    decisions = choose_validated_album_match(tuple(candidate_matches))
+    if not validated_matches:
+        diagnostic = "matching-title Spotify albums did not provide two ordered title-and-artist anchors"
+    elif len(validated_matches) > 1:
+        diagnostic = (
+            f"{len(validated_matches)} Spotify album editions passed sequence validation, so none was selected"
+        )
+    elif len(decisions) < len(source_tracks):
+        diagnostic = f"validated Spotify album resolved {len(decisions)} of {len(source_tracks)} release tracks"
+    else:
+        diagnostic = ""
     return SpotifyReleaseAlbumMatchResult(
-        decisions=choose_validated_album_match(tuple(candidate_matches)),
+        decisions=decisions,
         search_count=1,
+        diagnostic=diagnostic,
     )
 
 
@@ -159,11 +195,34 @@ def match_release_tracks_to_album(
     if len(exact_anchors) < 2 or not anchors_are_monotonic(exact_anchors):
         return ()
 
+    album_match_depends_on_alphanumeric_spacing = (
+        music_values_match_only_after_alphanumeric_spacing(
+            source_tracks[0].album_name,
+            album.name,
+        )
+        or any(
+            music_values_match_only_after_alphanumeric_spacing(
+                source_tracks[source_index].track_name,
+                spotify_tracks[spotify_index].name,
+            )
+            for source_index, spotify_index in exact_anchors
+        )
+    )
+    exact_match_strategy = (
+        ALBUM_ALPHANUMERIC_SPACING_MATCH_STRATEGY
+        if album_match_depends_on_alphanumeric_spacing
+        else ALBUM_EXACT_TRACK_MATCH_STRATEGY
+    )
+    exact_match_reason = (
+        ALBUM_ALPHANUMERIC_SPACING_MATCH_REASON
+        if album_match_depends_on_alphanumeric_spacing
+        else ALBUM_EXACT_TRACK_MATCH_REASON
+    )
     matched_indices: dict[int, tuple[int, str, str]] = {
         source_index: (
             spotify_index,
-            ALBUM_EXACT_TRACK_MATCH_STRATEGY,
-            ALBUM_EXACT_TRACK_MATCH_REASON,
+            exact_match_strategy,
+            exact_match_reason,
         )
         for source_index, spotify_index in exact_anchors
     }
@@ -262,10 +321,10 @@ def spotify_album_track_is_usable(track: SpotifyAlbumTrack) -> bool:
 
 
 def normalized_titles_are_equal(source_title: str, spotify_title: str) -> bool:
-    normalized_source_title = normalize_music_text(source_title)
+    normalized_source_title = normalize_alphanumeric_spacing(source_title)
     return bool(
         normalized_source_title
-        and normalized_source_title == normalize_music_text(spotify_title)
+        and normalized_source_title == normalize_alphanumeric_spacing(spotify_title)
     )
 
 

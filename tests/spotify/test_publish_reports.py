@@ -8,15 +8,17 @@ SCRIPTS_DIRECTORY = PROJECT_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 
 from publishers.spotify.matching import (
+    ERROR,
     UNMATCHED,
     PlaylistTrack,
     SpotifyTrackCandidate,
-    TrackMatchDecision,
 )
 from publishers.spotify.publish_reports import (
     best_diagnostic_candidate,
-    format_unmatched_track_details,
+    format_publish_review_details,
+    rank_diagnostic_candidates,
 )
+from publishers.spotify.publish_types import MATCH_SOURCE_SEARCH, PlaylistPublishDecision
 
 
 class PublishReportDiagnosticTests(unittest.TestCase):
@@ -61,11 +63,8 @@ class PublishReportDiagnosticTests(unittest.TestCase):
             artist_name="DJ Deep",
             album_name="Midnight Funk Association",
         )
-        decision = TrackMatchDecision(
-            track=track,
-            status=UNMATCHED,
-            spotify_uri="",
-            reason="no candidates matched track, artist, and album",
+        decision = unmatched_publish_decision(
+            track,
             review_candidates=(
                 spotify_candidate(
                     uri="spotify:track:first",
@@ -82,7 +81,7 @@ class PublishReportDiagnosticTests(unittest.TestCase):
             ),
         )
 
-        details = format_unmatched_track_details(decision)
+        details = format_publish_review_details(decision)
 
         self.assertIn(
             "  Best diagnostic candidate: spotify:track:resin | DJ Deep | Resin | Midnight Funk Association",
@@ -98,17 +97,67 @@ class PublishReportDiagnosticTests(unittest.TestCase):
             details,
         )
 
+    def test_unmatched_diagnostic_lists_the_next_two_ranked_candidates(self):
+        track = playlist_track(
+            track_name="Reson",
+            artist_name="DJ Deep",
+            album_name="Midnight Funk Association",
+        )
+        candidates = (
+            spotify_candidate(
+                uri="spotify:track:wrong",
+                name="Resonate",
+                artists=("Other Artist",),
+                album_name="Other Album",
+            ),
+            spotify_candidate(
+                uri="spotify:track:third",
+                name="Reason",
+                artists=("DJ Deep",),
+                album_name="Other Album",
+            ),
+            spotify_candidate(
+                uri="spotify:track:best",
+                name="Resin",
+                artists=("DJ Deep",),
+                album_name="Midnight Funk Association",
+            ),
+            spotify_candidate(
+                uri="spotify:track:second",
+                name="Resonance",
+                artists=("DJ Deep",),
+                album_name="Midnight Funk Association",
+            ),
+        )
+        decision = unmatched_publish_decision(track, review_candidates=candidates)
+
+        ranked = rank_diagnostic_candidates(track, candidates)
+        details = format_publish_review_details(decision)
+
+        self.assertEqual(tuple(candidate.uri for candidate in ranked[:3]), (
+            "spotify:track:best",
+            "spotify:track:second",
+            "spotify:track:third",
+        ))
+        self.assertIn("  Other diagnostic candidates:", details)
+        self.assertIn(
+            "    - spotify:track:second | DJ Deep | Resonance | Midnight Funk Association",
+            details,
+        )
+        self.assertIn(
+            "    - spotify:track:third | DJ Deep | Reason | Other Album",
+            details,
+        )
+        self.assertNotIn("spotify:track:wrong | Other Artist", "\n".join(details))
+
     def test_unmatched_diagnostic_distinguishes_partial_artist_match(self):
         track = playlist_track(
             track_name="Alpha",
             artist_name="Alpha Artist, Guest Artist",
             album_name="Alpha Album",
         )
-        decision = TrackMatchDecision(
-            track=track,
-            status=UNMATCHED,
-            spotify_uri="",
-            reason="no candidates matched track, artist, and album",
+        decision = unmatched_publish_decision(
+            track,
             review_candidates=(
                 spotify_candidate(
                     uri="spotify:track:alpha",
@@ -119,7 +168,7 @@ class PublishReportDiagnosticTests(unittest.TestCase):
             ),
         )
 
-        details = format_unmatched_track_details(decision)
+        details = format_publish_review_details(decision)
 
         self.assertIn(
             "  Diagnostic: title matches; at least one source artist matches; album matches.",
@@ -131,20 +180,38 @@ class PublishReportDiagnosticTests(unittest.TestCase):
         )
 
     def test_unmatched_diagnostic_explains_when_no_candidates_were_returned(self):
-        decision = TrackMatchDecision(
-            track=playlist_track(),
-            status=UNMATCHED,
-            spotify_uri="",
+        decision = unmatched_publish_decision(
+            playlist_track(),
             reason="Spotify returned no candidates",
         )
 
-        details = format_unmatched_track_details(decision)
+        details = format_publish_review_details(decision)
 
         self.assertIn("  Spotify returned 0 candidates.", details)
         self.assertIn(
             "  Diagnostic: no Spotify candidates were returned by any query.",
             details,
         )
+
+    def test_publish_error_detail_keeps_multiline_error_readable(self):
+        track = playlist_track()
+        decision = PlaylistPublishDecision(
+            playlist_name=track.playlist_name,
+            target_playlist_name=track.playlist_name,
+            track=track,
+            status=ERROR,
+            spotify_uri="",
+            reason='Spotify search failed with status 429: {\n  "error": "Too many requests"\n}',
+            match_source=MATCH_SOURCE_SEARCH,
+        )
+
+        details = format_publish_review_details(decision)
+
+        self.assertIn(
+            '  Why: Spotify search failed with status 429: { "error": "Too many requests" }',
+            details,
+        )
+        self.assertNotIn('Why: Spotify search failed with status 429: {\n', "\n".join(details))
 
 
 def playlist_track(
@@ -160,6 +227,23 @@ def playlist_track(
         track_name=track_name,
         artist_name=artist_name,
         spotify_search_query="",
+    )
+
+
+def unmatched_publish_decision(
+    track: PlaylistTrack,
+    review_candidates: tuple[SpotifyTrackCandidate, ...] = (),
+    reason: str = "no candidates matched track, artist, and album",
+) -> PlaylistPublishDecision:
+    return PlaylistPublishDecision(
+        playlist_name=track.playlist_name,
+        target_playlist_name=track.playlist_name,
+        track=track,
+        status=UNMATCHED,
+        spotify_uri="",
+        reason=reason,
+        match_source=MATCH_SOURCE_SEARCH,
+        review_candidates=review_candidates,
     )
 
 

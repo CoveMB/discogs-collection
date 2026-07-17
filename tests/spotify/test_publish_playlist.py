@@ -24,9 +24,8 @@ from publishers.spotify.env import SpotifySettings
 from publishers.spotify.matching import PlaylistTrack, SpotifyTrackCandidate
 from publishers.spotify.release_matching import SpotifyAlbumCandidate, SpotifyAlbumTrack
 from publishers.spotify.authorization_flow import DEFAULT_AUTHORIZE_SCOPES
-from publishers.spotify.publish_playlist import dry_run_spotify_playlist_publish, publish_spotify_playlists
+from publishers.spotify.publish_playlist import publish_spotify_playlists
 from publishers.spotify.publish_state import record_spotify_publish_state_track, save_spotify_publish_state
-from discogs_playlist_exporter import safe_playlist_filename
 from shared.progress import ProgressReporter
 from shared.publisher_config import PublisherConfig
 from shared.tunemymusic import TUNEMYMUSIC_COLUMNS
@@ -46,34 +45,6 @@ class FakeSpotifyClient:
     def search_tracks(self, access_token, query, limit=10):
         self.searches.append((access_token, query, limit))
         return self.candidates_by_query.get(query, ())
-
-
-class FlakySpotifyClient:
-    def search_tracks(self, access_token, query, limit=10):
-        if "Alpha One" in query:
-            raise SpotifyApiError("Spotify search failed with status 500: temporary failure")
-        return (
-            SpotifyTrackCandidate(
-                uri="spotify:track:beta",
-                name="Beta One",
-                artists=("Beta Artist",),
-                album_name="Beta Album",
-            ),
-        )
-
-
-class DeferredRateLimitSpotifyClient:
-    def __init__(self):
-        self.searches = []
-
-    def search_tracks(self, access_token, query, limit=10):
-        self.searches.append((access_token, query, limit))
-        raise SpotifyRateLimitDeferredError(retry_after_seconds=9999, max_wait_seconds=480)
-
-
-class MultilineErrorSpotifyClient:
-    def search_tracks(self, access_token, query, limit=10):
-        raise SpotifyApiError('Spotify search failed with status 429: {\n  "error": "Too many requests"\n}')
 
 
 class QueryLengthThenMatchSpotifyClient:
@@ -706,7 +677,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertIn("3 | added | Beta Artist | Beta One | Beta Album | spotify:track:222", report_text)
         self.assertIn("newly seen and will be appended", report_text)
 
-    def test_dry_run_reports_row_progress_while_searching_spotify_tracks(self):
+    def test_publish_dry_run_reports_row_progress_while_searching_spotify_tracks(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
             playlist_directory = directory / "collection" / "playlists"
@@ -717,17 +688,25 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
                     playlist_row("222", "Beta Album", "Beta One", "Beta Artist"),
                 ],
             )
-            report_path = directory / "reports" / "spotify-dry-run.txt"
-            client = FakeSpotifyClient({})
+            report_path = directory / "reports" / "spotify-report.txt"
+            client = PublishingSpotifyClient({})
             progress_stream = TerminalStream()
             progress = ProgressReporter(stream=progress_stream, label="Searching Spotify tracks")
 
-            dry_run_spotify_playlist_publish(
+            publish_spotify_playlists(
                 playlist_output_directory=playlist_directory,
                 report_path=report_path,
                 spotify_client=client,
                 access_token="access-token",
                 progress=progress,
+                match_cache_path=directory / "collection" / "cache" / "spotify-track-matches.cache.json",
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
             )
 
             progress_text = progress_stream.getvalue()
@@ -737,131 +716,6 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             self.assertIn("2/2", progress_text)
             self.assertIn("100%", progress_text)
             self.assertTrue(progress_text.endswith("\n"))
-
-    def test_dry_run_reads_playlist_csvs_matches_tracks_and_writes_review_report(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            directory = Path(temporary_directory)
-            playlist_directory = directory / "collection" / "playlists"
-            write_playlist_master(
-                playlist_directory / "Discogs - Breakbeat" / "Discogs - Breakbeat.csv",
-                [playlist_row("111", "Alpha Album", "Alpha One", "Alpha Artist")],
-            )
-            report_path = directory / "reports" / "spotify-dry-run.txt"
-            client = FakeSpotifyClient(
-                {
-                    'track:"Alpha One" artist:"Alpha Artist" album:"Alpha Album"': (
-                        SpotifyTrackCandidate(
-                            uri="spotify:track:alpha",
-                            name="Alpha One",
-                            artists=("Alpha Artist",),
-                            album_name="Alpha Album",
-                        ),
-                    )
-                }
-            )
-
-            summary = dry_run_spotify_playlist_publish(
-                playlist_output_directory=playlist_directory,
-                report_path=report_path,
-                spotify_client=client,
-                access_token="access-token",
-            )
-
-            self.assertEqual(summary.playlist_count, 1)
-            self.assertEqual(summary.track_count, 1)
-            self.assertEqual(summary.matched_count, 1)
-            self.assertEqual(summary.unmatched_count, 0)
-            self.assertEqual(summary.ambiguous_count, 0)
-            self.assertEqual(
-                client.searches,
-                [('access-token', 'track:"Alpha One" artist:"Alpha Artist" album:"Alpha Album"', 10)],
-            )
-            report_text = report_path.read_text(encoding="utf-8")
-            self.assertIn("Spotify playlist dry-run report", report_text)
-            self.assertIn("Matched tracks: 1", report_text)
-            self.assertIn("Discogs - Breakbeat | 111 | 1 | Alpha Artist | Alpha One | matched | spotify:track:alpha", report_text)
-
-    def test_dry_run_matches_typographic_apostrophe_and_reports_match(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            directory = Path(temporary_directory)
-            playlist_directory = directory / "collection" / "playlists"
-            row = playlist_row(
-                "36500992",
-                "The Poet And The Muse",
-                "Marcel’s Walk",
-                "Mathys Lenne",
-            )
-            row["Track Number"] = "7"
-            write_playlist_master(
-                playlist_directory / "Discogs - Deep Techno" / "Discogs - Deep Techno.csv",
-                [row],
-            )
-            report_path = directory / "reports" / "spotify-dry-run.txt"
-            client = FakeSpotifyClient(
-                {
-                    (
-                        'track:"Marcel’s Walk" artist:"Mathys Lenne" '
-                        'album:"The Poet And The Muse"'
-                    ): (
-                        SpotifyTrackCandidate(
-                            uri="spotify:track:marcels-walk",
-                            name="Marcel's Walk",
-                            artists=("Mathys Lenne",),
-                            album_name="The Poet And The Muse",
-                        ),
-                    )
-                }
-            )
-
-            summary = dry_run_spotify_playlist_publish(
-                playlist_output_directory=playlist_directory,
-                report_path=report_path,
-                spotify_client=client,
-                access_token="access-token",
-            )
-            report_text = report_path.read_text(encoding="utf-8")
-
-        self.assertEqual(summary.matched_count, 1)
-        self.assertEqual(summary.unmatched_count, 0)
-        self.assertIn(
-            "Discogs - Deep Techno | 36500992 | 7 | Mathys Lenne | "
-            "Marcel’s Walk | matched | spotify:track:marcels-walk",
-            report_text,
-        )
-        self.assertNotIn("Track name: different", report_text)
-
-    def test_dry_run_records_search_errors_and_still_writes_report(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            directory = Path(temporary_directory)
-            playlist_directory = directory / "collection" / "playlists"
-            write_playlist_master(
-                playlist_directory / "Discogs - Breakbeat" / "Discogs - Breakbeat.csv",
-                [
-                    playlist_row("111", "Alpha Album", "Alpha One", "Alpha Artist"),
-                    playlist_row("222", "Beta Album", "Beta One", "Beta Artist"),
-                ],
-            )
-            report_path = directory / "reports" / "spotify-dry-run.txt"
-
-            summary = dry_run_spotify_playlist_publish(
-                playlist_output_directory=playlist_directory,
-                report_path=report_path,
-                spotify_client=FlakySpotifyClient(),
-                access_token="access-token",
-            )
-
-            self.assertEqual(summary.track_count, 2)
-            self.assertEqual(summary.matched_count, 1)
-            self.assertEqual(summary.error_count, 1)
-            report_text = report_path.read_text(encoding="utf-8")
-            self.assertIn("Search errors: 1", report_text)
-            self.assertIn("Discogs - Breakbeat | 111 | 1 | Alpha Artist | Alpha One | error | no Spotify URI", report_text)
-            self.assertIn("Search errors", report_text)
-            self.assertLess(report_text.index("Search errors\n-------------"), report_text.index("Track match decisions\n---------------------"))
-            self.assertIn('Search query: track:"Alpha One" artist:"Alpha Artist" album:"Alpha Album"', report_text)
-            self.assertIn("Error: Spotify search failed with status 500: temporary failure", report_text)
-            self.assertIn("temporary failure", report_text)
-            self.assertIn("Discogs - Breakbeat | 222 | 1 | Beta Artist | Beta One | matched | spotify:track:beta", report_text)
 
     def test_publish_defaults_to_validated_album_matching_before_track_search(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1059,6 +913,48 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             ["album", "search", "album", "album", "album", "album"],
         )
 
+    def test_unmatched_track_reason_includes_album_lookup_diagnostic(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            write_playlist_master(
+                playlist_directory / "Techno" / "Techno.csv",
+                [
+                    playlist_row("release-1", "Missing Album", f"Track {index}", "Example Artist", str(index))
+                    for index in range(1, 4)
+                ],
+            )
+            client = AlbumPublishingSpotifyClient(
+                album_candidates=(),
+                album_tracks_by_id={},
+                candidates_by_query={},
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=directory / "reports" / "spotify-report.txt",
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=directory / "collection" / "cache" / "spotify-track-matches.cache.json",
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+
+        self.assertEqual(summary.unmatched_count, 3)
+        self.assertTrue(
+            all(
+                decision.reason.endswith(
+                    "album lookup: Spotify returned no album candidate with a matching title"
+                )
+                for decision in summary.decisions
+            )
+        )
+
     def test_album_server_error_stops_without_track_search_fallback_storm(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
@@ -1254,7 +1150,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
                                 "track_name": "Anchor Two",
                                 "match_status": "unmatched",
                                 "match_reason": "no Spotify track matched",
-                                "matcher_version": 11,
+                                "matcher_version": 12,
                             },
                         },
                     }
@@ -1634,6 +1530,257 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertEqual(cache_record["match_reason"], "track, artist, and album matched")
         self.assertNotIn("version_sensitive", cache_record)
 
+    def test_publish_applies_alphanumeric_spacing_only_after_search_ladder_finishes(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            write_playlist_master(
+                playlist_directory / "Techno" / "Techno.csv",
+                [playlist_row("35661301", "Chroma000", "Chroma001 Helium", "B.D.B")],
+            )
+            report_path = directory / "reports" / "spotify-report.txt"
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            spacing_candidate = SpotifyTrackCandidate(
+                uri="spotify:track:spacing",
+                name="CHROMA 001 HELIUM",
+                artists=("B.D.B",),
+                album_name="CHROMA 000",
+            )
+            exact_candidate = SpotifyTrackCandidate(
+                uri="spotify:track:exact",
+                name="Chroma001 Helium",
+                artists=("B.D.B",),
+                album_name="Chroma000",
+            )
+            client = PublishingSpotifyClient(
+                {
+                    'track:"Chroma001 Helium" artist:"B.D.B" album:"Chroma000"': (
+                        spacing_candidate,
+                    ),
+                    'track:"Chroma001 Helium" artist:"B.D.B"': (exact_candidate,),
+                }
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+            cache_payload = json.loads(match_cache_path.read_text(encoding="utf-8"))
+
+        cache_record = cache_payload["matches"]["35661301|1|b d b|chroma000|chroma001 helium"]
+        self.assertEqual(summary.search_count, 2)
+        self.assertEqual(summary.matched_count, 1)
+        self.assertEqual(cache_record["spotify_uri"], "spotify:track:exact")
+        self.assertEqual(cache_record["match_reason"], "track, artist, and album matched")
+        self.assertNotIn("version_sensitive", cache_record)
+
+    def test_publish_applies_version_substitute_only_after_search_ladder_finishes(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            write_playlist_master(
+                playlist_directory / "Techno" / "Techno.csv",
+                [playlist_row("5083040", "First Contact", "First Contact", "Outline")],
+            )
+            report_path = directory / "reports" / "spotify-report.txt"
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            substitute_candidate = SpotifyTrackCandidate(
+                uri="spotify:track:remastered",
+                name="First Contact - Remastered",
+                artists=("Outline",),
+                album_name="First Contact (Remastered)",
+            )
+            exact_candidate = SpotifyTrackCandidate(
+                uri="spotify:track:exact",
+                name="First Contact",
+                artists=("Outline",),
+                album_name="First Contact",
+            )
+            client = PublishingSpotifyClient(
+                {
+                    'track:"First Contact" artist:"Outline" album:"First Contact"': (
+                        substitute_candidate,
+                    ),
+                    'track:"First Contact" artist:"Outline"': (exact_candidate,),
+                }
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+            cache_payload = json.loads(match_cache_path.read_text(encoding="utf-8"))
+
+        cache_record = cache_payload["matches"]["5083040|1|outline|first contact|first contact"]
+        self.assertEqual(summary.search_count, 2)
+        self.assertEqual(summary.matched_count, 1)
+        self.assertEqual(cache_record["spotify_uri"], "spotify:track:exact")
+        self.assertEqual(cache_record["match_reason"], "track, artist, and album matched")
+        self.assertNotIn("version_sensitive", cache_record)
+
+    def test_publish_caches_and_reports_alphanumeric_spacing_as_version_sensitive(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            write_playlist_master(
+                playlist_directory / "Techno" / "Techno.csv",
+                [playlist_row("35661301", "Chroma000", "Chroma001 Helium", "B.D.B")],
+            )
+            report_path = directory / "reports" / "spotify-report.txt"
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            spacing_candidate = SpotifyTrackCandidate(
+                uri="spotify:track:spacing",
+                name="CHROMA 001 HELIUM",
+                artists=("B.D.B",),
+                album_name="CHROMA 000",
+            )
+            client = PublishingSpotifyClient(
+                {
+                    'track:"Chroma001 Helium" artist:"B.D.B" album:"Chroma000"': (
+                        spacing_candidate,
+                    ),
+                }
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+            cache_payload = json.loads(match_cache_path.read_text(encoding="utf-8"))
+            searched_report_text = report_path.read_text(encoding="utf-8")
+            second_client = PublishingSpotifyClient({})
+            second_summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=second_client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+            cached_report_text = report_path.read_text(encoding="utf-8")
+
+        cache_record = cache_payload["matches"]["35661301|1|b d b|chroma000|chroma001 helium"]
+        expected_reason = "track and album matched after normalizing letter-number spacing"
+        self.assertEqual(summary.matched_count, 1)
+        self.assertEqual(cache_record["matcher_version"], 12)
+        self.assertEqual(cache_record["match_strategy"], "alphanumeric_spacing")
+        self.assertIs(cache_record["version_sensitive"], True)
+        self.assertEqual(cache_record["match_reason"], expected_reason)
+        self.assertIn(expected_reason, searched_report_text)
+        self.assertEqual(second_summary.cache_hit_count, 1)
+        self.assertEqual(second_summary.search_count, 0)
+        self.assertEqual(second_client.searches, [])
+        self.assertIn(expected_reason, cached_report_text)
+
+    def test_publish_caches_version_substitute_as_version_sensitive(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            write_playlist_master(
+                playlist_directory / "Techno" / "Techno.csv",
+                [playlist_row("5083040", "First Contact", "First Contact", "Outline")],
+            )
+            report_path = directory / "reports" / "spotify-report.txt"
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+            substitute_candidate = SpotifyTrackCandidate(
+                uri="spotify:track:remastered",
+                name="First Contact - Remastered",
+                artists=("Outline",),
+                album_name="First Contact (Remastered)",
+            )
+            client = PublishingSpotifyClient(
+                {
+                    'track:"First Contact" artist:"Outline" album:"First Contact"': (
+                        substitute_candidate,
+                    ),
+                }
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+            cache_payload = json.loads(match_cache_path.read_text(encoding="utf-8"))
+            searched_report_text = report_path.read_text(encoding="utf-8")
+            second_client = PublishingSpotifyClient({})
+            second_summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=second_client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+            )
+            cached_report_text = report_path.read_text(encoding="utf-8")
+
+        cache_record = cache_payload["matches"]["5083040|1|outline|first contact|first contact"]
+        expected_reason = (
+            "track matched using the remastered version substitute "
+            "after no ordinary title match"
+        )
+        self.assertEqual(summary.matched_count, 1)
+        self.assertEqual(cache_record["matcher_version"], 12)
+        self.assertEqual(cache_record["match_strategy"], "version_substitute")
+        self.assertIs(cache_record["version_sensitive"], True)
+        self.assertEqual(cache_record["match_reason"], expected_reason)
+        self.assertIn(expected_reason, searched_report_text)
+        self.assertEqual(second_summary.cache_hit_count, 1)
+        self.assertEqual(second_summary.search_count, 0)
+        self.assertEqual(second_client.searches, [])
+        self.assertIn(expected_reason, cached_report_text)
+
     def test_publish_caches_and_reports_constrained_typo_match_as_version_sensitive(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
@@ -1695,7 +1842,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         )
         self.assertEqual(summary.search_count, 4)
         self.assertEqual(summary.matched_count, 1)
-        self.assertEqual(cache_record["matcher_version"], 11)
+        self.assertEqual(cache_record["matcher_version"], 12)
         self.assertEqual(cache_record["match_strategy"], "constrained_title_typo")
         self.assertIs(cache_record["version_sensitive"], True)
         self.assertEqual(cache_record["match_reason"], expected_reason)
@@ -1777,7 +1924,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         cache_record = cache_payload["matches"]["111|1|alpha artist|alpha album|loosing time"]
         self.assertEqual(summary.cache_hit_count, 0)
         self.assertEqual(summary.search_count, 4)
-        self.assertEqual(cache_record["matcher_version"], 11)
+        self.assertEqual(cache_record["matcher_version"], 12)
 
     def test_publish_ladder_matches_unique_title_and_artist_when_album_differs(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1972,7 +2119,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertEqual(summary.search_count, 1)
         self.assertEqual(summary.matched_count, 1)
         self.assertEqual(summary.would_add_count, 1)
-        self.assertEqual(cache_record["matcher_version"], 11)
+        self.assertEqual(cache_record["matcher_version"], 12)
         self.assertEqual(cache_record["spotify_uri"], "spotify:track:swim")
         self.assertEqual(cache_record["spotify_artist_names"], ["Carl Gari", "Polygonia"])
         self.assertEqual(
@@ -2072,7 +2219,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertEqual(summary.search_count, 1)
         self.assertEqual(summary.matched_count, 1)
         self.assertEqual(summary.would_add_count, 1)
-        self.assertEqual(cache_record["matcher_version"], 11)
+        self.assertEqual(cache_record["matcher_version"], 12)
         self.assertEqual(cache_record["spotify_uri"], "spotify:track:signal-path")
         self.assertEqual(cache_record["spotify_artist_names"], ["Main Artist", "Guest One"])
         self.assertEqual(cache_record["match_reason"], expected_reason)
@@ -2296,7 +2443,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertEqual(summary.matched_count, 1)
         self.assertEqual(summary.would_add_count, 1)
         self.assertEqual(cache_record["match_status"], "matched")
-        self.assertEqual(cache_record["matcher_version"], 11)
+        self.assertEqual(cache_record["matcher_version"], 12)
         self.assertEqual(
             cache_record["match_reason"],
             "track title differed only by Spotify's leading 'in'; artist and album matched",
@@ -3806,173 +3953,6 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
 
         self.assertEqual(client.add_calls, [])
         self.assertEqual(client.replace_calls, [])
-
-    def test_dry_run_report_keeps_multiline_search_errors_readable(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            directory = Path(temporary_directory)
-            playlist_directory = directory / "collection" / "playlists"
-            write_playlist_master(
-                playlist_directory / "Deep Techno" / "Deep Techno.csv",
-                [playlist_row("111", "Alpha Album", "Alpha One", "Alpha Artist")],
-            )
-            report_path = directory / "reports" / "spotify-dry-run.txt"
-
-            dry_run_spotify_playlist_publish(
-                playlist_output_directory=playlist_directory,
-                report_path=report_path,
-                spotify_client=MultilineErrorSpotifyClient(),
-                access_token="access-token",
-            )
-
-            report_text = report_path.read_text(encoding="utf-8")
-            self.assertIn('Error: Spotify search failed with status 429: { "error": "Too many requests" }', report_text)
-            self.assertNotIn('Error: Spotify search failed with status 429: {\n', report_text)
-
-    def test_dry_run_stops_when_spotify_defers_rate_limit_for_too_long(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            directory = Path(temporary_directory)
-            playlist_directory = directory / "collection" / "playlists"
-            write_playlist_master(
-                playlist_directory / "Deep Techno" / "Deep Techno.csv",
-                [
-                    playlist_row("111", "Alpha Album", "Alpha One", "Alpha Artist"),
-                    playlist_row("222", "Beta Album", "Beta One", "Beta Artist"),
-                ],
-            )
-            report_path = directory / "reports" / "spotify-dry-run.txt"
-            client = DeferredRateLimitSpotifyClient()
-            debug_lines = []
-
-            with self.assertRaisesRegex(SpotifyRateLimitDeferredError, "Retry-After is 2 hours 46 minutes 39 seconds"):
-                dry_run_spotify_playlist_publish(
-                    playlist_output_directory=playlist_directory,
-                    report_path=report_path,
-                    spotify_client=client,
-                    access_token="access-token",
-                    debug_log=debug_lines.append,
-                )
-
-            self.assertEqual(len(client.searches), 1)
-            self.assertFalse(report_path.exists())
-            self.assertIn("track_search_deferred index=1", debug_lines)
-
-    def test_dry_run_report_details_ambiguous_and_unmatched_tracks_for_manual_review(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            directory = Path(temporary_directory)
-            playlist_directory = directory / "collection" / "playlists"
-            write_playlist_master(
-                playlist_directory / "Discogs - Breakbeat" / "Discogs - Breakbeat.csv",
-                [
-                    playlist_row("111", "Alpha Album", "Alpha One", "Alpha Artist"),
-                    playlist_row("222", "Beta Album", "Beta One", "Beta Artist"),
-                ],
-            )
-            report_path = directory / "reports" / "spotify-dry-run.txt"
-            client = FakeSpotifyClient(
-                {
-                    'track:"Alpha One" artist:"Alpha Artist" album:"Alpha Album"': (
-                        SpotifyTrackCandidate(
-                            uri="spotify:track:alpha-1",
-                            name="Alpha One",
-                            artists=("Alpha Artist",),
-                            album_name="Alpha Album",
-                        ),
-                        SpotifyTrackCandidate(
-                            uri="spotify:track:alpha-2",
-                            name="Alpha One",
-                            artists=("Alpha Artist",),
-                            album_name="Alpha Album",
-                        ),
-                    ),
-                    'track:"Beta One" artist:"Beta Artist" album:"Beta Album"': (
-                        SpotifyTrackCandidate(
-                            uri="spotify:track:beta-two",
-                            name="Beta Two",
-                            artists=("Beta Artist",),
-                            album_name="Beta Album",
-                        ),
-                    ),
-                }
-            )
-
-            summary = dry_run_spotify_playlist_publish(
-                playlist_output_directory=playlist_directory,
-                report_path=report_path,
-                spotify_client=client,
-                access_token="access-token",
-            )
-
-            self.assertEqual(summary.ambiguous_count, 1)
-            self.assertEqual(summary.unmatched_count, 1)
-            report_text = report_path.read_text(encoding="utf-8")
-            self.assertIn("Ambiguous tracks needing review", report_text)
-            self.assertIn("Discogs - Breakbeat | 111 | 1 | Alpha Artist | Alpha One | Alpha Album", report_text)
-            self.assertIn('Search query: track:"Alpha One" artist:"Alpha Artist" album:"Alpha Album"', report_text)
-            self.assertIn("Why: 2 candidates matched track, artist, and album", report_text)
-            self.assertIn("spotify:track:alpha-1 | Alpha Artist | Alpha One | Alpha Album", report_text)
-            self.assertIn("spotify:track:alpha-2 | Alpha Artist | Alpha One | Alpha Album", report_text)
-            self.assertIn("Unmatched tracks needing review", report_text)
-            self.assertIn("Discogs - Breakbeat | 222 | 1 | Beta Artist | Beta One | Beta Album", report_text)
-            self.assertIn('Search query: track:"Beta One" artist:"Beta Artist" album:"Beta Album"', report_text)
-            self.assertIn("Why: no candidates matched track, artist, and album", report_text)
-            self.assertIn("Best diagnostic candidate: spotify:track:beta-two | Beta Artist | Beta Two | Beta Album", report_text)
-            self.assertIn("Track name: different (Discogs: Beta One; Spotify: Beta Two)", report_text)
-
-    def test_dry_run_only_reads_selected_playlist_tracks(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            directory = Path(temporary_directory)
-            playlist_directory = directory / "collection" / "playlists"
-            write_playlist_master(
-                playlist_directory / "House" / "House.csv",
-                [playlist_row("111", "House Album", "House One", "House Artist")],
-            )
-            write_playlist_master(
-                playlist_directory / "Techno" / "Techno.csv",
-                [playlist_row("222", "Techno Album", "Techno One", "Techno Artist")],
-            )
-            report_path = directory / "reports" / "spotify-dry-run.txt"
-            client = FakeSpotifyClient({})
-
-            summary = dry_run_spotify_playlist_publish(
-                playlist_output_directory=playlist_directory,
-                report_path=report_path,
-                spotify_client=client,
-                access_token="access-token",
-                playlist_selectors=("House",),
-            )
-
-        self.assertEqual(summary.track_count, 1)
-        self.assertEqual(len(client.searches), 4)
-        self.assertIn('track:"House One"', client.searches[0][1])
-        self.assertNotIn("Techno One", " ".join(search[1] for search in client.searches))
-
-    def test_dry_run_accepts_multiple_playlist_selectors_by_display_name_and_path(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            directory = Path(temporary_directory)
-            playlist_directory = directory / "collection" / "playlists"
-            breakbeat_folder = playlist_directory / safe_playlist_filename('Discogs: "Breakbeat"')
-            house_folder = playlist_directory / "House"
-            write_playlist_master(
-                breakbeat_folder / f"{breakbeat_folder.name}.csv",
-                [playlist_row("111", "Breakbeat Album", "Breakbeat One", "Breakbeat Artist")],
-            )
-            write_playlist_master(
-                house_folder / "House.csv",
-                [playlist_row("222", "House Album", "House One", "House Artist")],
-            )
-            report_path = directory / "reports" / "spotify-dry-run.txt"
-            client = FakeSpotifyClient({})
-
-            summary = dry_run_spotify_playlist_publish(
-                playlist_output_directory=playlist_directory,
-                report_path=report_path,
-                spotify_client=client,
-                access_token="access-token",
-                playlist_selectors=('Discogs: "Breakbeat"', str(house_folder / "House.csv")),
-            )
-
-        self.assertEqual(summary.track_count, 2)
-        self.assertEqual(len(client.searches), 8)
 
     def test_main_rejects_missing_playlist_before_authorizing_spotify(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

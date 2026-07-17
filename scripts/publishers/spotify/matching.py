@@ -31,6 +31,17 @@ ORIGINAL_MIX_SUFFIX_PATTERN = re.compile(r"\s*\(\s*original\s+mix\s*\)\s*$", re.
 ORIGINAL_MIX_MATCH_REASON_PREFIX = "track matched after removing source Original Mix annotation"
 LEADING_IN_TITLE_MATCH_REASON_PREFIX = "track title differed only by Spotify's leading 'in'"
 CONSTRAINED_TYPO_MATCH_REASON_PREFIX = "track title matched by constrained typo fallback"
+ALPHANUMERIC_SPACING_MATCH_REASON = "track and album matched after normalizing letter-number spacing"
+ALPHANUMERIC_SPACING_MATCH_STRATEGY = "alphanumeric_spacing"
+VERSION_SUBSTITUTE_MATCH_STRATEGY = "version_substitute"
+TRAILING_ENCLOSED_VERSION_PATTERN = re.compile(
+    r"\s*[\(\[]\s*(?P<label>remaster(?:ed)?|live|(?:radio\s+)?edit)\s*[\)\]]\s*$",
+    re.IGNORECASE,
+)
+TRAILING_DASHED_VERSION_PATTERN = re.compile(
+    r"\s*[-\u2013\u2014]\s*(?P<label>remaster(?:ed)?|live|(?:radio\s+)?edit)\s*$",
+    re.IGNORECASE,
+)
 PROTECTED_TITLE_TOKENS = frozenset(
     (
         "acoustic",
@@ -132,6 +143,10 @@ def build_spotify_track_search_queries(track: PlaylistTrack) -> tuple[str, ...]:
     original_mix_title = title_without_original_mix_suffix(track.track_name)
     append_title_variant_search_queries(queries, track, original_mix_title)
 
+    version_substitute = split_version_substitute_title(track.track_name)
+    if version_substitute is not None:
+        append_title_variant_search_queries(queries, track, version_substitute[0])
+
     append_unique_search_query(queries, track.spotify_search_query)
     return tuple(queries)
 
@@ -216,6 +231,28 @@ def title_without_original_mix_suffix(track_name: str) -> str:
     return base_title or clean_track_name
 
 
+def split_version_substitute_title(track_name: str) -> tuple[str, str] | None:
+    clean_track_name = track_name.strip()
+    for pattern in (TRAILING_ENCLOSED_VERSION_PATTERN, TRAILING_DASHED_VERSION_PATTERN):
+        match = pattern.search(clean_track_name)
+        if match is None:
+            continue
+        base_title = clean_track_name[:match.start()].strip()
+        if not base_title:
+            return None
+        return base_title, normalize_version_substitute_label(match.group("label"))
+    return None
+
+
+def normalize_version_substitute_label(label: str) -> str:
+    normalized_label = re.sub(r"\s+", " ", label.casefold()).strip()
+    if "remaster" in normalized_label:
+        return "remastered"
+    if normalized_label.endswith("edit"):
+        return "edit"
+    return "live"
+
+
 def split_source_artist_names(artist_name: str) -> tuple[str, ...]:
     parts = tuple(part.strip() for part in artist_name.split(",") if part.strip())
     if len(parts) < 2:
@@ -232,7 +269,9 @@ def choose_best_track_match(
     candidates: tuple[SpotifyTrackCandidate, ...],
     search_queries: tuple[str, ...] = (),
     allow_leading_in_title_variant: bool = True,
+    allow_alphanumeric_spacing_fallback: bool = True,
     allow_constrained_typo_fallback: bool = True,
+    allow_version_substitute: bool = True,
 ) -> TrackMatchDecision:
     candidates = deduplicate_spotify_track_candidates(candidates)
     exact_matches = tuple(candidate for candidate in candidates if candidate_matches_track(track, candidate))
@@ -422,6 +461,36 @@ def choose_best_track_match(
             search_queries=search_queries,
         )
 
+    alphanumeric_spacing_matches: tuple[SpotifyTrackCandidate, ...] = ()
+    if allow_alphanumeric_spacing_fallback:
+        alphanumeric_spacing_matches = tuple(
+            candidate
+            for candidate in candidates
+            if candidate_matches_alphanumeric_spacing(track, candidate)
+        )
+    if len(alphanumeric_spacing_matches) == 1:
+        candidate = alphanumeric_spacing_matches[0]
+        return TrackMatchDecision(
+            track=track,
+            status=MATCHED,
+            spotify_uri=candidate.uri,
+            reason=ALPHANUMERIC_SPACING_MATCH_REASON,
+            candidate=candidate,
+            review_candidates=(candidate,),
+            search_queries=search_queries,
+            match_strategy=ALPHANUMERIC_SPACING_MATCH_STRATEGY,
+        )
+    if len(alphanumeric_spacing_matches) > 1:
+        return TrackMatchDecision(
+            track=track,
+            status=AMBIGUOUS,
+            spotify_uri="",
+            reason=f"{len(alphanumeric_spacing_matches)} candidates matched after normalizing letter-number spacing",
+            candidate=None,
+            review_candidates=alphanumeric_spacing_matches,
+            search_queries=search_queries,
+        )
+
     constrained_typo_matches: tuple[tuple[SpotifyTrackCandidate, int], ...] = ()
     if allow_constrained_typo_fallback:
         constrained_typo_matches = tuple(
@@ -452,6 +521,40 @@ def choose_best_track_match(
             reason=f"{len(typo_candidates)} candidates matched by constrained typo fallback",
             candidate=None,
             review_candidates=typo_candidates,
+            search_queries=search_queries,
+        )
+
+    version_substitute_matches: tuple[tuple[SpotifyTrackCandidate, str], ...] = ()
+    if allow_version_substitute:
+        version_substitute_matches = tuple(
+            (candidate, version_label)
+            for candidate in candidates
+            if (version_label := candidate_version_substitute_label(track, candidate)) is not None
+        )
+    if len(version_substitute_matches) == 1:
+        candidate, version_label = version_substitute_matches[0]
+        return TrackMatchDecision(
+            track=track,
+            status=MATCHED,
+            spotify_uri=candidate.uri,
+            reason=(
+                f"track matched using the {version_label} version substitute "
+                "after no ordinary title match"
+            ),
+            candidate=candidate,
+            review_candidates=(candidate,),
+            search_queries=search_queries,
+            match_strategy=VERSION_SUBSTITUTE_MATCH_STRATEGY,
+        )
+    if len(version_substitute_matches) > 1:
+        substitute_candidates = tuple(candidate for candidate, _version_label in version_substitute_matches)
+        return TrackMatchDecision(
+            track=track,
+            status=AMBIGUOUS,
+            spotify_uri="",
+            reason=f"{len(substitute_candidates)} candidates matched as version substitutes",
+            candidate=None,
+            review_candidates=substitute_candidates,
             search_queries=search_queries,
         )
     return TrackMatchDecision(
@@ -575,6 +678,45 @@ def candidate_matches_leading_in_title_variant(
     )
 
 
+def candidate_matches_alphanumeric_spacing(
+    track: PlaylistTrack,
+    candidate: SpotifyTrackCandidate,
+) -> bool:
+    source_album = normalize_alphanumeric_spacing(track.album_name)
+    candidate_album = normalize_alphanumeric_spacing(candidate.album_name)
+    return bool(
+        music_values_match_only_after_alphanumeric_spacing(
+            track.track_name,
+            candidate.name,
+        )
+        and source_album
+        and source_album == candidate_album
+        and source_artist_set_is_subset_of_candidate(track.artist_name, candidate.artists)
+    )
+
+
+def candidate_version_substitute_label(
+    track: PlaylistTrack,
+    candidate: SpotifyTrackCandidate,
+) -> str | None:
+    source_version = split_version_substitute_title(track.track_name)
+    candidate_version = split_version_substitute_title(candidate.name)
+    if (source_version is None) == (candidate_version is None):
+        return None
+    source_base_title = source_version[0] if source_version is not None else track.track_name
+    candidate_base_title = candidate_version[0] if candidate_version is not None else candidate.name
+    if (
+        not normalized_nonempty_music_values_match(source_base_title, candidate_base_title)
+        or not source_artist_set_is_subset_of_candidate(track.artist_name, candidate.artists)
+    ):
+        return None
+    if source_version is not None:
+        return source_version[1]
+    if candidate_version is not None:
+        return candidate_version[1]
+    return None
+
+
 def spotify_title_has_leading_in_variant(source_title: str, spotify_title: str) -> bool:
     source_title_tokens = tuple(normalize_music_text(source_title).split())
     spotify_title_tokens = tuple(normalize_music_text(spotify_title).split())
@@ -696,6 +838,15 @@ def normalized_candidate_artist_set(candidate_artists: tuple[str, ...]) -> froze
     )
 
 
+def source_artist_set_is_subset_of_candidate(
+    source_artist_name: str,
+    candidate_artists: tuple[str, ...],
+) -> bool:
+    source_artist_set = normalized_source_artist_set(source_artist_name)
+    candidate_artist_set = normalized_candidate_artist_set(candidate_artists)
+    return bool(source_artist_set) and source_artist_set <= candidate_artist_set
+
+
 def source_artist_matches_candidate(artist_name: str, candidate_artists: tuple[str, ...]) -> bool:
     return any(
         normalized_artist_in_candidates(source_artist_name, candidate_artists)
@@ -770,3 +921,24 @@ def normalize_music_text(value: str) -> str:
     ascii_text = punctuation_separated.encode("ascii", "ignore").decode("ascii")
     ascii_text = re.sub(r"[^a-zA-Z0-9]+", " ", ascii_text.casefold())
     return re.sub(r"\s+", " ", ascii_text).strip()
+
+
+def normalize_alphanumeric_spacing(value: str) -> str:
+    normalized = normalize_music_text(value)
+    return re.sub(r"(?<=[a-z])\s+(?=\d)|(?<=\d)\s+(?=[a-z])", "", normalized)
+
+
+def music_values_match_only_after_alphanumeric_spacing(left: str, right: str) -> bool:
+    normalized_left = normalize_music_text(left)
+    normalized_right = normalize_music_text(right)
+    return bool(
+        normalized_left
+        and normalized_right
+        and normalized_left != normalized_right
+        and normalize_alphanumeric_spacing(left) == normalize_alphanumeric_spacing(right)
+    )
+
+
+def normalized_nonempty_music_values_match(left: str, right: str) -> bool:
+    left_key = normalize_music_text(left)
+    return bool(left_key) and left_key == normalize_music_text(right)

@@ -28,18 +28,6 @@ InfoLog = Callable[[str], None]
 
 
 @dataclass(frozen=True)
-class SpotifyDryRunSummary:
-    playlist_count: int
-    track_count: int
-    matched_count: int
-    ambiguous_count: int
-    unmatched_count: int
-    error_count: int
-    report_path: Path
-    decisions: tuple[TrackMatchDecision, ...]
-
-
-@dataclass(frozen=True)
 class PlaylistPublishDecision:
     playlist_name: str
     target_playlist_name: str

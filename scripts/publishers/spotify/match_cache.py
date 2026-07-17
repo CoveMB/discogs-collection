@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from publishers.spotify.matching import (
+    ALPHANUMERIC_SPACING_MATCH_STRATEGY,
     AMBIGUOUS,
     CONSTRAINED_TYPO_MATCH_REASON_PREFIX,
     MATCHED,
@@ -16,17 +17,23 @@ from publishers.spotify.matching import (
     PlaylistTrack,
     SpotifyTrackCandidate,
     TrackMatchDecision,
+    VERSION_SUBSTITUTE_MATCH_STRATEGY,
     build_spotify_track_search_query,
+    music_values_match_only_after_alphanumeric_spacing,
     normalize_music_text,
 )
-from publishers.spotify.release_matching import ALBUM_POSITION_MATCH_STRATEGY
+from publishers.spotify.release_matching import (
+    ALBUM_ALPHANUMERIC_SPACING_MATCH_STRATEGY,
+    ALBUM_EXACT_TRACK_MATCH_STRATEGY,
+    ALBUM_POSITION_MATCH_STRATEGY,
+)
 from shared.files import write_json_file
 from shared.text import clean_cell
 
 
 MATCH_CACHE_SCHEMA_VERSION = 1
 MATCH_CACHE_RECORD_TYPE = "spotify_track_match_cache"
-MATCHER_VERSION = 11
+MATCHER_VERSION = 12
 CACHEABLE_MATCH_STATUSES = {MATCHED, AMBIGUOUS, UNMATCHED}
 CONSTRAINED_TYPO_MATCH_STRATEGY = "constrained_title_typo"
 
@@ -102,7 +109,20 @@ def cache_record_matcher_version(record: Mapping[str, object]) -> int:
 
 
 def cache_record_is_version_sensitive(record: Mapping[str, object]) -> bool:
-    return record.get("version_sensitive") is True
+    if record.get("version_sensitive") is True:
+        return True
+    if clean_cell(record.get("match_strategy")) != ALBUM_EXACT_TRACK_MATCH_STRATEGY:
+        return False
+    return (
+        music_values_match_only_after_alphanumeric_spacing(
+            clean_cell(record.get("track_name")),
+            clean_cell(record.get("spotify_track_name")),
+        )
+        or music_values_match_only_after_alphanumeric_spacing(
+            clean_cell(record.get("album_name")),
+            clean_cell(record.get("spotify_album_name")),
+        )
+    )
 
 
 def cached_matched_track(
@@ -237,8 +257,11 @@ def cache_track_match(
         if candidate and candidate.album_id:
             record["spotify_album_id"] = candidate.album_id
         if match_strategy in {
+            ALPHANUMERIC_SPACING_MATCH_STRATEGY,
+            ALBUM_ALPHANUMERIC_SPACING_MATCH_STRATEGY,
             CONSTRAINED_TYPO_MATCH_STRATEGY,
             ALBUM_POSITION_MATCH_STRATEGY,
+            VERSION_SUBSTITUTE_MATCH_STRATEGY,
         }:
             record.update(
                 {
