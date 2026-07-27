@@ -249,9 +249,7 @@ def cache_record_has_current_album_recovery_attempt(
     record: Mapping[str, object],
     album_ids: Sequence[str],
 ) -> bool:
-    if clean_cell(record.get("match_status")) not in {AMBIGUOUS, UNMATCHED}:
-        return False
-    if cache_record_matcher_version(record) != MATCHER_VERSION:
+    if not cache_record_can_store_album_recovery_attempt(record):
         return False
     try:
         attempt_matcher_version = int(
@@ -278,15 +276,26 @@ def record_album_recovery_attempt(
     record: dict[str, object],
     album_ids: Sequence[str],
 ) -> None:
-    if clean_cell(record.get("match_status")) not in {AMBIGUOUS, UNMATCHED}:
-        return
-    if cache_record_matcher_version(record) != MATCHER_VERSION:
+    if not cache_record_can_store_album_recovery_attempt(record):
         return
     canonical_album_ids = canonical_album_recovery_candidate_ids(album_ids)
     if not canonical_album_ids:
         return
     record[ALBUM_RECOVERY_ATTEMPT_MATCHER_VERSION_FIELD] = MATCHER_VERSION
     record[ALBUM_RECOVERY_ATTEMPT_ALBUM_IDS_FIELD] = list(canonical_album_ids)
+
+
+def cache_record_can_store_album_recovery_attempt(
+    record: Mapping[str, object],
+) -> bool:
+    match_status = clean_cell(record.get("match_status"))
+    return bool(
+        match_status == MATCHED
+        or (
+            match_status in {AMBIGUOUS, UNMATCHED}
+            and cache_record_matcher_version(record) == MATCHER_VERSION
+        )
+    )
 
 
 def cache_track_match(

@@ -152,13 +152,73 @@ class SpotifyManualMatchTests(unittest.TestCase):
             overrides_path = directory / "manual-matches.json"
             write_override_file(overrides_path, spotify_uri="https://open.spotify.com/track/manual-one")
 
-            with self.assertRaisesRegex(ValueError, "spotify_uri must start with spotify:track:"):
+            with self.assertRaisesRegex(ValueError, "spotify_uri must be spotify:track:<identifier>"):
                 import_manual_match_overrides(
                     overrides_path=overrides_path,
                     playlist_output_directory=playlist_directory,
                     match_cache_path=directory / "matches.json",
                     apply=False,
                 )
+
+    def test_rejects_malformed_track_identifiers_without_mutating_cache(self) -> None:
+        invalid_spotify_uris = (
+            "spotify:track:",
+            "spotify:track:manual one",
+            "spotify:track:manual:one",
+        )
+        for spotify_uri in invalid_spotify_uris:
+            with self.subTest(spotify_uri=spotify_uri), tempfile.TemporaryDirectory() as temporary_directory:
+                directory = Path(temporary_directory)
+                playlist_directory = directory / "collection" / "playlists"
+                write_playlist_master(playlist_directory / "Techno" / "Techno.csv")
+                overrides_path = directory / "manual-matches.json"
+                write_override_file(overrides_path, spotify_uri=spotify_uri)
+                match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+                match_cache_path.parent.mkdir(parents=True)
+                match_cache_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "record_type": "spotify_track_match_cache",
+                            "matches": {},
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                original_cache = match_cache_path.read_bytes()
+
+                with self.assertRaisesRegex(ValueError, "spotify_uri must be spotify:track:<identifier>"):
+                    import_manual_match_overrides(
+                        overrides_path=overrides_path,
+                        playlist_output_directory=playlist_directory,
+                        match_cache_path=match_cache_path,
+                        apply=True,
+                        replace_existing=True,
+                    )
+
+                self.assertEqual(match_cache_path.read_bytes(), original_cache)
+
+    def test_accepts_short_structurally_valid_placeholder_uri(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            write_playlist_master(playlist_directory / "Techno" / "Techno.csv")
+            overrides_path = directory / "manual-matches.json"
+            write_override_file(overrides_path, spotify_uri="spotify:track:x")
+            match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+
+            summary = import_manual_match_overrides(
+                overrides_path=overrides_path,
+                playlist_output_directory=playlist_directory,
+                match_cache_path=match_cache_path,
+                apply=True,
+            )
+            payload = json.loads(match_cache_path.read_text(encoding="utf-8"))
+
+        record = payload["matches"]["release-1|1|source artist|source album|source track"]
+        self.assertEqual(summary.applied_count, 1)
+        self.assertEqual(record["spotify_uri"], "spotify:track:x")
 
     def test_replacing_different_matched_record_requires_explicit_flag(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

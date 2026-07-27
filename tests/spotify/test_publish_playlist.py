@@ -455,6 +455,67 @@ def write_cached_negative_release(
     return playlist_directory, match_cache_path, source_rows
 
 
+def write_automatic_matched_hint_release(
+    directory: Path,
+    *,
+    matcher_version: int = MATCHER_VERSION,
+) -> tuple[Path, Path, list[dict[str, str]], str]:
+    playlist_directory = directory / "collection" / "playlists"
+    source_rows = [
+        playlist_row("release-1", "Recovered Album", f"Anchor {index}", "Example Artist", str(index))
+        for index in range(1, 4)
+    ]
+    write_playlist_master(
+        playlist_directory / "Techno" / "Techno.csv",
+        source_rows,
+    )
+    first_row = source_rows[0]
+    first_cache_key = spotify_track_match_key(
+        playlist_track(
+            "Techno",
+            first_row["Release Id"],
+            first_row["Album Name"],
+            first_row["Track Name"],
+            first_row["Artist Name"],
+            first_row["Track Number"],
+        )
+    )
+    match_cache_path = directory / "collection" / "cache" / "spotify-track-matches.cache.json"
+    match_cache_path.parent.mkdir(parents=True)
+    match_cache_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "record_type": "spotify_track_match_cache",
+                "matches": {
+                    first_cache_key: {
+                        "release_id": first_row["Release Id"],
+                        "track_number": first_row["Track Number"],
+                        "artist_name": first_row["Artist Name"],
+                        "album_name": first_row["Album Name"],
+                        "track_name": first_row["Track Name"],
+                        "search_query": first_row["Spotify Search Query"],
+                        "search_queries": [first_row["Spotify Search Query"]],
+                        "match_status": "matched",
+                        "match_reason": "track, artist, and album matched",
+                        "matcher_version": matcher_version,
+                        "spotify_uri": "spotify:track:cached-anchor-one",
+                        "spotify_url": "https://open.spotify.com/track/cached-anchor-one",
+                        "spotify_track_name": first_row["Track Name"],
+                        "spotify_artist_names": [first_row["Artist Name"]],
+                        "spotify_album_name": first_row["Album Name"],
+                        "spotify_album_id": "recovered-album",
+                        "matched_at": "2026-07-17T00:00:00Z",
+                        "last_seen_at": "2026-07-17T00:00:00Z",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return playlist_directory, match_cache_path, source_rows, first_cache_key
+
+
 def seed_known_publish_state(path: Path, playlist_name: str, row: dict[str, str], source_position: int) -> None:
     from publishers.spotify import publish_playlist
 
@@ -1167,6 +1228,184 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
                 "release-1|1|example artist|recovered album|anchor 1"
             ]["spotify_uri"],
             "spotify:track:cached-anchor-one",
+        )
+        self.assertNotIn(
+            ALBUM_RECOVERY_ATTEMPT_ALBUM_IDS_FIELD,
+            cache_payload["matches"][
+                "release-1|1|example artist|recovered album|anchor 1"
+            ],
+        )
+
+    def test_failed_automatic_matched_album_recovery_records_attempt_and_next_run_advances(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            (
+                playlist_directory,
+                match_cache_path,
+                _source_rows,
+                matched_cache_key,
+            ) = write_automatic_matched_hint_release(
+                directory,
+                matcher_version=MATCHER_VERSION - 1,
+            )
+            invalid_album_tracks = tuple(
+                SpotifyAlbumTrack(
+                    uri=f"spotify:track:different-{index}",
+                    name=f"Different {index}",
+                    artists=("Other Artist",),
+                    disc_number=1,
+                    track_number=index,
+                    is_playable=True,
+                )
+                for index in range(1, 4)
+            )
+            album_candidates = (
+                SpotifyAlbumCandidate(
+                    album_id="different-album",
+                    uri="spotify:album:different-album",
+                    name="Different Album",
+                    artists=("Example Artist",),
+                    total_tracks=3,
+                ),
+            )
+            first_client = AlbumPublishingSpotifyClient(
+                album_candidates=album_candidates,
+                album_tracks_by_id={"recovered-album": invalid_album_tracks},
+            )
+            first_summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=directory / "reports" / "spotify-report.txt",
+                spotify_client=first_client,
+                access_token="access-token",
+                search_limit=7,
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+                max_new_searches_per_run=1,
+            )
+            first_cache_payload = json.loads(match_cache_path.read_text(encoding="utf-8"))
+            second_client = AlbumPublishingSpotifyClient(
+                album_candidates=album_candidates,
+                album_tracks_by_id={"recovered-album": invalid_album_tracks},
+            )
+            second_summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=directory / "reports" / "spotify-report.txt",
+                spotify_client=second_client,
+                access_token="access-token",
+                search_limit=7,
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+                max_new_searches_per_run=1,
+            )
+
+        matched_record = first_cache_payload["matches"][matched_cache_key]
+        self.assertEqual(first_summary.search_count, 1)
+        self.assertEqual(
+            first_client.album_searches,
+            [("access-token", 'album:"Recovered Album"', 7)],
+        )
+        self.assertEqual(first_client.album_track_requests, [("access-token", "recovered-album")])
+        self.assertEqual(
+            matched_record.get(ALBUM_RECOVERY_ATTEMPT_MATCHER_VERSION_FIELD),
+            MATCHER_VERSION,
+        )
+        self.assertEqual(
+            matched_record.get(ALBUM_RECOVERY_ATTEMPT_ALBUM_IDS_FIELD),
+            ["recovered-album"],
+        )
+        self.assertEqual(matched_record["spotify_uri"], "spotify:track:cached-anchor-one")
+        self.assertEqual(second_client.album_searches, [])
+        self.assertEqual(second_client.album_track_requests, [])
+        self.assertGreater(second_summary.search_count, 0)
+        self.assertTrue(second_client.searches)
+        self.assertTrue(all(search[2] == 7 for search in second_client.searches))
+
+    def test_automatic_matched_album_recovery_retries_after_transient_failure(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            (
+                playlist_directory,
+                match_cache_path,
+                _source_rows,
+                matched_cache_key,
+            ) = write_automatic_matched_hint_release(directory)
+            deferred_client = DeferredAlbumPublishingSpotifyClient((), {})
+
+            with self.assertRaises(SpotifyRateLimitDeferredError):
+                publish_spotify_playlists(
+                    playlist_output_directory=playlist_directory,
+                    report_path=directory / "reports" / "spotify-report.txt",
+                    spotify_client=deferred_client,
+                    access_token="access-token",
+                    match_cache_path=match_cache_path,
+                    publisher_config=PublisherConfig(
+                        default_publisher="spotify",
+                        playlist_prefix="Discogs - ",
+                        playlist_suffix="",
+                    ),
+                    apply=False,
+                    publisher_sync_mode="append",
+                    max_new_searches_per_run=1,
+                )
+            deferred_cache_payload = json.loads(match_cache_path.read_text(encoding="utf-8"))
+            invalid_album_tracks = tuple(
+                SpotifyAlbumTrack(
+                    uri=f"spotify:track:different-{index}",
+                    name=f"Different {index}",
+                    artists=("Other Artist",),
+                    disc_number=1,
+                    track_number=index,
+                    is_playable=True,
+                )
+                for index in range(1, 4)
+            )
+            retry_client = AlbumPublishingSpotifyClient(
+                album_candidates=(
+                    SpotifyAlbumCandidate(
+                        album_id="different-album",
+                        uri="spotify:album:different-album",
+                        name="Different Album",
+                        artists=("Example Artist",),
+                        total_tracks=3,
+                    ),
+                ),
+                album_tracks_by_id={"recovered-album": invalid_album_tracks},
+            )
+            retry_summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=directory / "reports" / "spotify-report.txt",
+                spotify_client=retry_client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="append",
+                max_new_searches_per_run=1,
+            )
+
+        deferred_record = deferred_cache_payload["matches"][matched_cache_key]
+        self.assertNotIn(ALBUM_RECOVERY_ATTEMPT_MATCHER_VERSION_FIELD, deferred_record)
+        self.assertNotIn(ALBUM_RECOVERY_ATTEMPT_ALBUM_IDS_FIELD, deferred_record)
+        self.assertEqual(retry_summary.search_count, 1)
+        self.assertEqual(
+            retry_client.album_track_requests,
+            [("access-token", "recovered-album")],
         )
 
     def test_publish_does_not_use_manual_match_as_cached_album_hint(self):

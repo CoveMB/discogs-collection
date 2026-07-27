@@ -384,8 +384,13 @@ def publish_spotify_playlists(
                         )
                         if (
                             refresh_match_cache
-                            or release_has_uncached_track(release_tracks, match_cache)
-                            or (cached_album_ids and not album_recovery_attempt_is_current)
+                            or (
+                                not album_recovery_attempt_is_current
+                                and (
+                                    release_has_uncached_track(release_tracks, match_cache)
+                                    or bool(cached_album_ids)
+                                )
+                            )
                         ):
                             album_result = resolve_release_with_album(
                                 source_tracks=release_tracks,
@@ -401,7 +406,10 @@ def publish_spotify_playlists(
                             search_count += album_result.search_count
                             if album_result.diagnostic:
                                 album_lookup_diagnostics_by_release_id[track.release_id] = album_result.diagnostic
-                            if album_result.used_fallback_track_candidates:
+                            if (
+                                album_result.used_fallback_track_candidates
+                                and len(album_result.decisions) < len(release_tracks)
+                            ):
                                 record_album_recovery_attempt_for_release(
                                     release_tracks,
                                     match_cache,

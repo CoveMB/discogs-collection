@@ -188,9 +188,10 @@ def load_manual_match_overrides(
         seen_keys.add(source_key)
 
         spotify_uri = required_text(raw_match, "spotify_uri", index)
-        if not spotify_uri.startswith("spotify:track:"):
+        if not spotify_track_uri_is_structurally_valid(spotify_uri):
             raise ValueError(
-                f"Spotify manual match override {index} spotify_uri must start with spotify:track:"
+                f"Spotify manual match override {index} spotify_uri must be spotify:track:<identifier> "
+                "with one nonempty identifier containing no whitespace or extra separators"
             )
         spotify_artist_names = required_text_sequence(
             raw_match,
@@ -208,6 +209,17 @@ def load_manual_match_overrides(
             )
         )
     return tuple(overrides)
+
+
+def spotify_track_uri_is_structurally_valid(spotify_uri: str) -> bool:
+    segments = spotify_uri.split(":")
+    return bool(
+        len(segments) == 3
+        and segments[0] == "spotify"
+        and segments[1] == "track"
+        and segments[2]
+        and not any(character.isspace() for character in segments[2])
+    )
 
 
 def required_text(
