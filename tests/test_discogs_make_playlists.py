@@ -12,10 +12,43 @@ SCRIPTS_DIRECTORY = PROJECT_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 
 import discogs_make_playlists as maker  # noqa: E402
+import discogs_release_playlist as release_playlists  # noqa: E402
 from publishers.spotify import publish_playlist as spotify_publisher  # noqa: E402
 
 
 class DiscogsMakePlaylistsTests(unittest.TestCase):
+    def setUp(self):
+        configured_main_patcher = patch.object(release_playlists, "main", return_value=0)
+        configured_main_patcher.start()
+        self.addCleanup(configured_main_patcher.stop)
+
+    def test_help_describes_options_forwarded_to_normal_and_configured_steps(self):
+        stdout = io.StringIO()
+
+        with (
+            patch("sys.stdout", stdout),
+            patch.dict("os.environ", {"COLUMNS": "500"}),
+            self.assertRaises(SystemExit) as exit_context,
+        ):
+            maker.parse_args(["--help"])
+
+        self.assertEqual(exit_context.exception.code, 0)
+        help_text = " ".join(stdout.getvalue().split())
+        expected_descriptions = (
+            "Run Discogs enrichment, playlist mapping, normal playlist export and splitting, configured release playlists, and playlist publishing in order.",
+            "Playlist map JSON passed to the mapper and configured release playlist step.",
+            "Workflow JSON config passed to the normal and configured playlist splitters.",
+            "Directory for normal per-playlist TuneMyMusic CSV files. Configured release playlists use PATH/release-playlists.",
+            "Skip configured and normal playlist publishing for this run. Equivalent to --publisher none.",
+            "Disable progress output in enrichment, normal playlist export, configured release playlist export, and Spotify publishing.",
+            "HTTP timeout per Discogs request for enrichment and normal and configured playlist export.",
+            "Minimum delay between Discogs requests for enrichment and normal and configured playlist export.",
+            "Maximum uncached Spotify searches per publisher run. Passed to configured and normal Spotify publishers; use 0 for unlimited.",
+        )
+        for description in expected_descriptions:
+            with self.subTest(description=description):
+                self.assertIn(description, help_text)
+
     def test_missing_publisher_config_defaults_to_non_publishing_workflow(self):
         calls: list[tuple[str, list[str]]] = []
 
@@ -33,6 +66,7 @@ class DiscogsMakePlaylistsTests(unittest.TestCase):
                 patch.object(maker.mapper, "main", side_effect=record_step("mapper")),
                 patch.object(maker.exporter, "main", side_effect=record_step("exporter")),
                 patch.object(maker.splitter, "main", side_effect=record_step("splitter")),
+                patch.object(release_playlists, "main", side_effect=record_step("configured_release_playlists")),
                 patch.object(spotify_publisher, "main") as publisher_main,
                 patch("sys.stdout", new_callable=io.StringIO) as stdout,
             ):
@@ -46,12 +80,22 @@ class DiscogsMakePlaylistsTests(unittest.TestCase):
                 ("mapper", []),
                 ("exporter", []),
                 ("splitter", []),
+                (
+                    "configured_release_playlists",
+                    [
+                        "--from-config",
+                        "--publisher-config",
+                        str(publisher_config_path),
+                        "--publisher",
+                        "none",
+                    ],
+                ),
             ],
         )
         self.assertIn("Playlist publishing skipped because the resolved publisher is none.", stdout.getvalue())
         publisher_main.assert_not_called()
 
-    def test_run_pipeline_includes_configured_publisher_step(self):
+    def test_run_pipeline_places_configured_release_playlists_before_normal_publisher(self):
         calls: list[tuple[str, list[str]]] = []
 
         def record_step(name: str):
@@ -67,7 +111,24 @@ class DiscogsMakePlaylistsTests(unittest.TestCase):
                 "spotify",
                 "--playlist-output-dir",
                 "collection/custom-playlists",
+                "--config",
+                "config/custom-playlists.json",
+                "--workflow-config",
+                "config/workflow.json",
+                "--tracklist-cache",
+                "collection/cache/tracks.json",
+                "--publisher-config",
+                "config/custom-publisher.json",
                 "--publishing-dry-run",
+                "--timeout-seconds",
+                "10",
+                "--request-interval-seconds",
+                "0.25",
+                "--max-rows",
+                "250",
+                "--max-new-searches-per-run",
+                "125",
+                "--no-progress",
             ]
         )
 
@@ -76,6 +137,7 @@ class DiscogsMakePlaylistsTests(unittest.TestCase):
             patch.object(maker.mapper, "main", side_effect=record_step("mapper")),
             patch.object(maker.exporter, "main", side_effect=record_step("exporter")),
             patch.object(maker.splitter, "main", side_effect=record_step("splitter")),
+            patch.object(release_playlists, "main", side_effect=record_step("configured_release_playlists")),
             patch.object(spotify_publisher, "main", side_effect=record_step("publisher")),
             patch("sys.stdout", new_callable=io.StringIO),
         ):
@@ -86,22 +148,182 @@ class DiscogsMakePlaylistsTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                ("enricher", []),
-                ("mapper", []),
-                ("exporter", ["--output-dir", "collection/custom-playlists"]),
-                ("splitter", ["--output-dir", "collection/custom-playlists"]),
+                (
+                    "enricher",
+                    [
+                        "--no-progress",
+                        "--timeout-seconds",
+                        "10",
+                        "--request-interval-seconds",
+                        "0.25",
+                    ],
+                ),
+                ("mapper", ["--config", "config/custom-playlists.json"]),
+                (
+                    "exporter",
+                    [
+                        "--output-dir",
+                        "collection/custom-playlists",
+                        "--cache",
+                        "collection/cache/tracks.json",
+                        "--no-progress",
+                        "--timeout-seconds",
+                        "10",
+                        "--request-interval-seconds",
+                        "0.25",
+                    ],
+                ),
+                (
+                    "splitter",
+                    [
+                        "--output-dir",
+                        "collection/custom-playlists",
+                        "--workflow-config",
+                        "config/workflow.json",
+                        "--max-rows",
+                        "250",
+                    ],
+                ),
+                (
+                    "configured_release_playlists",
+                    [
+                        "--from-config",
+                        "--config",
+                        "config/custom-playlists.json",
+                        "--workflow-config",
+                        "config/workflow.json",
+                        "--output-dir",
+                        "collection/custom-playlists/release-playlists",
+                        "--tracklist-cache",
+                        "collection/cache/tracks.json",
+                        "--publisher-config",
+                        "config/custom-publisher.json",
+                        "--publisher",
+                        "spotify",
+                        "--timeout-seconds",
+                        "10",
+                        "--request-interval-seconds",
+                        "0.25",
+                        "--max-rows",
+                        "250",
+                        "--max-new-searches-per-run",
+                        "125",
+                        "--publishing-dry-run",
+                        "--no-progress",
+                    ],
+                ),
                 (
                     "publisher",
                     [
                         "--playlist-output-dir",
                         "collection/custom-playlists",
                         "--publisher-config",
-                        "config/publisher.json",
+                        "config/custom-publisher.json",
+                        "--no-progress",
                         "--publishing-dry-run",
+                        "--max-new-searches-per-run",
+                        "125",
                     ],
                 ),
             ],
         )
+
+    def test_configured_generation_cleanup_and_spotify_failures_skip_normal_publisher(self):
+        failure_exit_codes = (
+            ("generation", 1),
+            ("cleanup", 2),
+            ("Spotify", 3),
+        )
+        for failure_source, configured_exit_code in failure_exit_codes:
+            with self.subTest(failure_source=failure_source, configured_exit_code=configured_exit_code):
+                with (
+                    patch.object(maker.enricher, "main", return_value=0),
+                    patch.object(maker.mapper, "main", return_value=0),
+                    patch.object(maker.exporter, "main", return_value=0),
+                    patch.object(maker.splitter, "main", return_value=0),
+                    patch.object(release_playlists, "main", return_value=configured_exit_code),
+                    patch.object(spotify_publisher, "main") as publisher_main,
+                    patch("sys.stdout", new_callable=io.StringIO),
+                    patch("sys.stderr", new_callable=io.StringIO) as stderr,
+                ):
+                    exit_code = maker.main(["--publisher", "spotify"])
+
+                self.assertEqual(exit_code, configured_exit_code)
+                publisher_main.assert_not_called()
+                self.assertIn("Stopping before Spotify playlist publisher", stderr.getvalue())
+
+    def test_forwards_distinct_configured_reports_and_logs_their_sanitized_paths(self):
+        calls: list[tuple[str, list[str]]] = []
+
+        def record_step(name: str):
+            def step(argv):
+                calls.append((name, list(argv)))
+                return 0
+
+            return step
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            debug_log_path = Path(temporary_directory) / "make-playlists.log"
+            with (
+                patch.object(maker.enricher, "main", side_effect=record_step("enricher")),
+                patch.object(maker.mapper, "main", side_effect=record_step("mapper")),
+                patch.object(maker.exporter, "main", side_effect=record_step("exporter")),
+                patch.object(maker.splitter, "main", side_effect=record_step("splitter")),
+                patch.object(release_playlists, "main", side_effect=record_step("configured_release_playlists")),
+                patch("sys.stdout", new_callable=io.StringIO),
+            ):
+                try:
+                    exit_code = maker.main(
+                        [
+                            "--publisher",
+                            "none",
+                            "--playlist-report",
+                            "reports/normal-playlists.txt",
+                            "--split-report",
+                            "reports/normal-splits.txt",
+                            "--release-playlist-report",
+                            "reports/release-playlists.txt",
+                            "--release-split-report",
+                            "reports/release-splits.txt",
+                            "--release-publisher-report",
+                            "reports/release-publisher.txt",
+                            "--debug-log",
+                            str(debug_log_path),
+                        ]
+                    )
+                except SystemExit as error:
+                    self.fail(f"configured report arguments were rejected with exit code {error.code}")
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(
+                calls,
+                [
+                    ("enricher", []),
+                    ("mapper", []),
+                    ("exporter", ["--report", "reports/normal-playlists.txt"]),
+                    ("splitter", ["--report", "reports/normal-splits.txt"]),
+                    (
+                        "configured_release_playlists",
+                        [
+                            "--from-config",
+                            "--report",
+                            "reports/release-playlists.txt",
+                            "--split-report",
+                            "reports/release-splits.txt",
+                            "--publisher-report",
+                            "reports/release-publisher.txt",
+                            "--publisher-config",
+                            "config/publisher.json",
+                            "--publisher",
+                            "none",
+                        ],
+                    ),
+                ],
+            )
+            debug_text = debug_log_path.read_text(encoding="utf-8")
+            self.assertIn("path release_playlist_report=reports/release-playlists.txt", debug_text)
+            self.assertIn("path release_split_report=reports/release-splits.txt", debug_text)
+            self.assertIn("path release_publisher_report=reports/release-publisher.txt", debug_text)
 
     def test_writes_debug_log_for_pipeline_steps_when_requested(self):
         calls: list[tuple[str, list[str]]] = []
@@ -120,6 +342,7 @@ class DiscogsMakePlaylistsTests(unittest.TestCase):
                 patch.object(maker.mapper, "main", side_effect=record_step("mapper")),
                 patch.object(maker.exporter, "main", side_effect=record_step("exporter")),
                 patch.object(maker.splitter, "main", side_effect=record_step("splitter")),
+                patch.object(release_playlists, "main", side_effect=record_step("configured_release_playlists")),
                 patch("sys.stdout", new_callable=io.StringIO),
             ):
                 exit_code = maker.main(
@@ -136,16 +359,21 @@ class DiscogsMakePlaylistsTests(unittest.TestCase):
                 )
 
             self.assertEqual(exit_code, 0)
-            self.assertEqual([name for name, _arguments in calls], ["enricher", "mapper", "exporter", "splitter"])
+            self.assertEqual(
+                [name for name, _arguments in calls],
+                ["enricher", "mapper", "exporter", "splitter", "configured_release_playlists"],
+            )
             debug_text = debug_log_path.read_text(encoding="utf-8")
             self.assertIn("start discogs_make_playlists", debug_text)
             self.assertIn("resolved_publisher value=none", debug_text)
             self.assertIn("path export=export/subset.csv", debug_text)
-            self.assertIn("pipeline_steps count=5", debug_text)
-            self.assertIn("step_start index=1 total=5 label=Discogs style enricher", debug_text)
-            self.assertIn("step_end index=4 total=5 label=Discogs playlist splitter exit_code=0", debug_text)
-            self.assertIn("step_start index=5 total=5 label=Playlist publisher", debug_text)
-            self.assertIn("step_end index=5 total=5 label=Playlist publisher exit_code=0", debug_text)
+            self.assertIn("pipeline_steps count=6", debug_text)
+            self.assertIn("step_start index=1 total=6 label=Discogs style enricher", debug_text)
+            self.assertIn("step_end index=4 total=6 label=Discogs playlist splitter exit_code=0", debug_text)
+            self.assertIn("step_start index=5 total=6 label=Configured release playlists", debug_text)
+            self.assertIn("step_end index=5 total=6 label=Configured release playlists exit_code=0", debug_text)
+            self.assertIn("step_start index=6 total=6 label=Playlist publisher", debug_text)
+            self.assertIn("step_end index=6 total=6 label=Playlist publisher exit_code=0", debug_text)
             self.assertIn("completed exit_code=0", debug_text)
 
     def test_forwards_shared_paths_and_options_to_the_matching_steps(self):
@@ -163,6 +391,7 @@ class DiscogsMakePlaylistsTests(unittest.TestCase):
             patch.object(maker.mapper, "main", side_effect=record_step("mapper")),
             patch.object(maker.exporter, "main", side_effect=record_step("exporter")),
             patch.object(maker.splitter, "main", side_effect=record_step("splitter")),
+            patch.object(release_playlists, "main", side_effect=record_step("configured_release_playlists")),
             patch("sys.stdout", new_callable=io.StringIO),
         ):
             exit_code = maker.main(
@@ -279,6 +508,31 @@ class DiscogsMakePlaylistsTests(unittest.TestCase):
                         "Evening Listening",
                         "--max-rows",
                         "250",
+                    ],
+                ),
+                (
+                    "configured_release_playlists",
+                    [
+                        "--from-config",
+                        "--config",
+                        "config/custom-playlists.json",
+                        "--workflow-config",
+                        "config/workflow.json",
+                        "--output-dir",
+                        "collection/custom-playlists/release-playlists",
+                        "--tracklist-cache",
+                        "collection/cache/tracks.json",
+                        "--publisher-config",
+                        "config/publisher.json",
+                        "--publisher",
+                        "none",
+                        "--timeout-seconds",
+                        "10",
+                        "--request-interval-seconds",
+                        "0.25",
+                        "--max-rows",
+                        "250",
+                        "--no-progress",
                     ],
                 ),
             ],
@@ -434,7 +688,8 @@ class DiscogsMakePlaylistsTests(unittest.TestCase):
                 exit_code = maker.main(["--publisher-config", str(publisher_config_path)])
 
         output = stdout.getvalue()
-        splitter_position = output.find("Step 4/5\n--------\nRunning: Discogs playlist splitter")
+        splitter_position = output.find("Step 4/6\n--------\nRunning: Discogs playlist splitter")
+        configured_position = output.find("Step 5/6\n--------\nRunning: Configured release playlists")
         available_publishers = ", ".join(maker.available_playlist_publishers())
         publisher_notice = (
             "Playlist publishing skipped because the resolved publisher is none. "
@@ -444,7 +699,8 @@ class DiscogsMakePlaylistsTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIn(f"Publisher\n---------\n{publisher_notice}", output)
         self.assertGreaterEqual(splitter_position, 0)
-        self.assertGreater(publisher_notice_position, splitter_position)
+        self.assertGreater(configured_position, splitter_position)
+        self.assertGreater(publisher_notice_position, configured_position)
         publisher_main.assert_not_called()
 
     def test_stops_before_publisher_when_splitter_fails(self):
@@ -465,7 +721,7 @@ class DiscogsMakePlaylistsTests(unittest.TestCase):
         exporter_main.assert_called_once_with([])
         splitter_main.assert_called_once_with([])
         publisher_main.assert_not_called()
-        self.assertIn("Stopping before Spotify playlist publisher", stderr.getvalue())
+        self.assertIn("Stopping before Configured release playlists", stderr.getvalue())
 
     def test_available_playlist_publishers_are_derived_from_supported_publishers(self):
         self.assertEqual(
@@ -527,6 +783,7 @@ class DiscogsMakePlaylistsTests(unittest.TestCase):
                 patch.object(maker.mapper, "main", side_effect=record_step("mapper")),
                 patch.object(maker.exporter, "main", side_effect=record_step("exporter")),
                 patch.object(maker.splitter, "main", side_effect=record_step("splitter")),
+                patch.object(release_playlists, "main", side_effect=record_step("configured_release_playlists")),
                 patch.object(spotify_publisher, "main") as publisher_main,
                 patch("sys.stdout", new_callable=io.StringIO) as stdout,
             ):
@@ -539,7 +796,7 @@ class DiscogsMakePlaylistsTests(unittest.TestCase):
                 )
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(calls, ["enricher", "mapper", "exporter", "splitter"])
+        self.assertEqual(calls, ["enricher", "mapper", "exporter", "splitter", "configured_release_playlists"])
         self.assertIn("Playlist publishing skipped because the resolved publisher is none.", stdout.getvalue())
         publisher_main.assert_not_called()
 

@@ -15,7 +15,11 @@ by default without calling Spotify or writing the match cache, writes only in
 explicit apply mode, and stores authoritative manual cache records. A separate
 release-ID playlist script can create an isolated on-the-fly playlist from
 explicit Discogs `release_id` values without adding those releases to the
-collection master.
+collection master. The same script can rebuild durable configured release
+playlists from ordered release IDs, by default under
+`collection/playlists/release-playlists`, without reading or changing enriched
+collection rows or playlist associations. Configured Spotify publishing uses
+exact-mirror replace semantics.
 
 The tool should stay focused on this workflow: read Discogs export rows, use
 `release_id` to find explicit Discogs metadata, write an enriched CSV with audit
@@ -23,9 +27,15 @@ columns, map configured playlist labels, export reviewable playlist CSVs from
 Discogs tracklists, and write split CSVs in each playlist folder with a 500-row
 default batch size. On-the-fly release playlists should stay under
 `collection/playlists/on-the-fly`, reuse lookup caches only as lookup caches, and
-never change collection row order or playlist mapping. Spotify publisher code belongs under
-`scripts/publishers/spotify/` and should keep matching, API client, auth/cache,
-dedupe, and CLI orchestration concerns separate.
+never change collection row order or playlist mapping. Configured release
+playlists should default to `collection/playlists/release-playlists`. Any
+explicitly selected configured root must remain isolated from the enriched
+collection and from mapped or on-the-fly playlist ownership. Local folders may
+be deleted only when valid configured ownership metadata and known generated
+content make cleanup safe.
+Spotify publisher code belongs under `scripts/publishers/spotify/` and should
+keep matching, API client, auth/cache, dedupe, and CLI orchestration concerns
+separate.
 
 Do not add style or genre guessing, fuzzy matching, machine learning, broad
 scraping, or collection management features unless the user asks for them.
@@ -106,6 +116,18 @@ The tool should:
 - create split CSVs from playlist master CSVs, defaulting to 500 rows per file
 - write export reports for missing playlist labels, missing `release_id`, empty
   tracklists, and release-level fallback rows
+- parse optional ordered configured release definitions without writing them to
+  the enriched collection's `Playlists` column
+- rebuild configured release playlist masters, metadata, and splits only under
+  the selected isolated configured root, which defaults to
+  `collection/playlists/release-playlists`
+- treat empty configured definitions as authoritative empty playlists
+- publish configured release playlists from their exact current master paths in
+  replace mode only, after every non-empty source row resolves to Spotify
+- remove metadata-owned local folders for deleted configured definitions only
+  when their metadata is valid and they contain no unknown content
+- never delete or change a Spotify playlist merely because its configured
+  release definition was removed
 - dedupe only repo-managed Spotify publisher playlists owned by the current user
   whose names match the configured publisher prefix or suffix
 - use exact Spotify track URI duplicates only, keep the first added item, and

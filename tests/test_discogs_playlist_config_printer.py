@@ -43,6 +43,26 @@ class PlaylistConfigPrinterTests(unittest.TestCase):
             self.assertIn("- Breakbeat -> Breakbeat", output)
             self.assertIn("Raw Discogs terms: Breakbeat, Breaks", output)
 
+    def test_cli_prints_ordered_and_authoritative_empty_configured_release_playlists(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config_path = Path(temporary_directory) / "playlist-map.json"
+            payload = sample_config()
+            payload["release_playlists"] = {
+                "My Latest Discovery": ["4390198", "123456"],
+                "Clear This Playlist": [],
+            }
+            write_json(config_path, payload)
+
+            with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                exit_code = printer.main(["--config", str(config_path)])
+
+            output = stdout.getvalue()
+
+            self.assertEqual(exit_code, 0)
+            self.assertIn("Configured release playlists\n----------------------------", output)
+            self.assertIn("- My Latest Discovery\n  Release IDs: 4390198, 123456", output)
+            self.assertIn("- Clear This Playlist\n  Release IDs: None (authoritative empty playlist)", output)
+
     def test_cli_creates_missing_config_and_prints_blank_config(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             config_path = Path(temporary_directory) / "config" / "playlist-map.json"
@@ -59,6 +79,7 @@ class PlaylistConfigPrinterTests(unittest.TestCase):
                 {
                     "excluded_terms": [],
                     "playlists": {},
+                    "release_playlists": {},
                 },
             )
             self.assertIn("Status: Created blank playlist config.", output)

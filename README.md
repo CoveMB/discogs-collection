@@ -8,11 +8,14 @@ CSVs. The main workflow is:
 2. Map those Discogs terms to local playlist labels.
 3. Export full TuneMyMusic-style playlist master CSVs into per-playlist folders.
 4. Create split CSVs from each playlist master, defaulting to 500 rows per file.
-5. Optionally publish Spotify playlists from those playlist CSVs, or run an
+5. Rebuild configured release playlists from ordered release IDs when defined.
+6. Optionally publish Spotify playlists from those playlist CSVs, or run an
    explicit dry-run preview first.
 
-You can also create an on-the-fly publisher playlist from explicit Discogs
-`release_id` values without adding those releases to the collection master.
+You can also define durable release playlists as ordered Discogs `release_id`
+values in `config/playlist-map.json`, or create an ad-hoc release playlist from
+explicit IDs. Neither workflow adds those releases or playlist associations to
+the collection master.
 
 The durable file is the enriched master CSV. By default that file is:
 
@@ -160,8 +163,7 @@ before doing any lookups.
 
 ## One-command playlist workflow
 
-To run enrichment, playlist mapping, TuneMyMusic export, and playlist splitting
-one after the other, use:
+To run the complete collection and configured-release workflow in order, use:
 
 ```bash
 python3 scripts/discogs_make_playlists.py
@@ -174,14 +176,23 @@ With no options, the command uses the same defaults as the individual scripts:
 - export playlist master CSVs into folders under `collection/playlists`
 - write split CSVs under each playlist folder, using `config/workflow.json`
   when it exists and creating it with 500-row defaults when it does not
-- read `config/publisher.json` for the final publisher step, creating a default
-  config that skips publishing when the file does not exist
+- rebuild, split, and safely clean up configured release playlists under
+  `collection/playlists/release-playlists`
+- publish the configured release playlists in exact-mirror replace mode when
+  Spotify is selected
+- run the normal mapped-playlist publisher last, creating a default publisher
+  config that skips Spotify when `config/publisher.json` does not exist
+
+The exact step order is enrichment, mapping, normal playlist export, normal
+playlist splitting, configured release playlists, and the normal playlist
+publisher. If `--playlist-output-dir` is set, configured output goes under
+`<playlist-output-dir>/release-playlists`.
 
 The command stops before the next step when a step exits with a nonzero status.
-For example, if enrichment reports lookup errors, mapping, playlist export,
-playlist splitting, and publishing do not run. If playlist splitting fails,
-publishing does not run. Check the relevant report, then rerun after the issue
-is resolved.
+For example, if enrichment reports lookup errors, mapping and every later step
+are skipped. If configured generation, splitting, cleanup, or Spotify publishing
+fails, the final normal playlist publisher does not run. Check the relevant
+report, then rerun after the issue is resolved.
 
 The child enrichment and exporter scripts still read `DISCOGS_TOKEN` from the
 environment. The combined command does not have a separate token option.
@@ -208,29 +219,35 @@ from the combined workflow, pass `--publisher spotify` or set
 resolved Spotify publisher to preview changes without creating or updating
 playlists.
 
-Pass `--skip-publish-playlist` to skip the final publisher for one run, even
-when the publisher config defaults to Spotify. This is a convenience alias for
+Pass `--skip-publish-playlist` to skip Spotify publishing for both configured
+release playlists and normal mapped playlists for one run, even when the
+publisher config defaults to Spotify. This is a convenience alias for
 `--publisher none`.
 
 When Spotify publishing is enabled, the combined workflow accepts
 `--max-new-searches-per-run N` and passes it to the Spotify publisher. Use `0`
 for an uncapped publisher run.
 
-`config/publisher.json` defaults to:
+When `config/publisher.json` is created, its defaults are:
 
 ```json
 {
   "default_publisher": "none",
-  "playlist_prefix": "Discogs - ",
-  "playlist_suffix": ""
+  "playlist_prefix": "",
+  "playlist_suffix": "",
+  "release_playlists_prefix": "",
+  "release_playlists_suffix": ""
 }
 ```
 
 `default_publisher` must be `spotify` or `none` and controls the combined
 workflow when you omit `--publisher`. The Spotify publisher uses
-`playlist_prefix` and `playlist_suffix` when it resolves target playlist names.
-Both values must be strings. With the default config, local `House` publishes to
-Spotify playlist `Discogs - House` when Spotify publishing is enabled.
+`playlist_prefix` and `playlist_suffix` for normal mapped playlists, and
+`release_playlists_prefix` and `release_playlists_suffix` for configured release
+playlists. All four values must be strings and default to empty strings when
+omitted. Existing explicit values remain unchanged, so no automatic migration
+is required. With the empty defaults, local `House` publishes to Spotify
+playlist `House` when Spotify publishing is enabled.
 
 ## Spotify publisher
 
@@ -699,6 +716,101 @@ The report lists fetched playlists, eligible playlists, skipped playlists,
 planned duplicate removals, and applied removals. It does not update collection
 CSVs, playlist master CSVs, split CSVs, or Spotify match caches.
 
+## Configured release playlists
+
+Use configured release playlists for durable, ordered release selections that
+remain independent of style and genre mapping. Define every playlist in the
+optional `release_playlists` object in `config/playlist-map.json`, then rebuild
+the complete configured set directly:
+
+```bash
+python3 scripts/discogs_release_playlist.py --from-config
+```
+
+Configured mode defaults to:
+
+```text
+--config config/playlist-map.json
+--workflow-config config/workflow.json
+--output-dir collection/playlists/release-playlists
+```
+
+It does not require a collection export or
+`collection/enriched-collection.csv`. Release IDs may be absent from the
+collection, and configured definitions never change enriched rows, their order,
+or the `Playlists` column. The mapper continues to use only the existing
+`playlists` term mappings.
+
+Configured mode always rebuilds every definition; it has no per-playlist
+selector. `--from-config` cannot be combined with `--name`, positional release
+IDs, or `--release-ids-file`. An explicit configured `--output-dir` cannot equal
+or sit inside `collection/playlists/on-the-fly`.
+
+Each configured playlist has an isolated folder:
+
+```text
+collection/playlists/release-playlists/<configured-name>/<configured-name>.csv
+collection/playlists/release-playlists/<configured-name>/.release-playlist.json
+collection/playlists/release-playlists/<configured-name>/splits/*.csv
+```
+
+Folder and file names use the existing safe-name cleanup, while Spotify uses the
+configured display name plus `release_playlists_prefix` and
+`release_playlists_suffix`. Configured Spotify targets are checked against one
+another and against normal mapped-playlist targets before Spotify is called.
+
+For non-empty definitions, every release must return at least one usable
+explicit Discogs track. A missing or unusable tracklist, lookup error, fallback
+row, invalid definition, unsafe path, or split failure stops preparation. The
+complete batch is prepared in staging first, so a preparation failure leaves
+previously generated configured masters and splits unchanged, deletes no owned
+folder, and makes no Spotify call. Successfully fetched records may remain in
+the shared tracklist cache because that cache stores lookups only. A later
+filesystem failure while committing staged files can still leave part of the
+local batch updated; the failure report lists completed and failed paths.
+
+Configured splits use the same `config/workflow.json` settings as normal
+playlists: `max_rows_per_split`, `keep_release_tracks_together`, and
+`create_new_split_files_for_new_releases`. `--max-rows` overrides the configured
+row limit for one run. Existing stable-split behavior and warnings still apply.
+An empty definition writes a header-only master and removes its generated split
+CSVs.
+
+The `.release-playlist.json` file identifies a folder as generated and owned by
+configured mode. Removing a definition from the config deletes its local folder
+only when the metadata has the supported schema and configured record type, its
+playlist name matches the folder, and the folder contains only the known master,
+metadata, and direct `splits/*.csv` content. Unknown folders without valid
+configured metadata are not cleanup candidates: an inactive folder without
+metadata is ignored, while an active path without metadata or any invalid
+metadata fails preflight. Unexpected content in a folder scheduled for cleanup
+blocks the command, preserves the folder, and prevents publishing.
+Non-conflicting extra files in an active metadata-owned folder are preserved.
+
+Removing a definition never selects, changes, clears, or deletes its Spotify
+playlist.
+
+When Spotify is selected, configured playlists always publish in `replace`
+mode. The Spotify playlist becomes an exact mirror of the current generated
+master and track order, so releases removed from the definition and tracks added
+manually in Spotify are removed on a successful run. Before any configured
+replace write, every non-empty source row must resolve to a publishable Spotify
+URI; an ambiguous, unmatched, or errored row aborts all configured replace
+writes.
+
+An empty release-ID array is authoritative. It writes a header-only local
+master, creates no split CSV, and clears an existing Spotify playlist when
+publishing succeeds. It does not create a missing Spotify playlist just to keep
+it empty.
+
+`--publishing-dry-run` previews external Spotify changes only. Local masters,
+metadata, splits, and safe cleanup still follow the config. Spotify writes are
+not transactional across playlists: a failure after writing starts may leave
+earlier playlists updated and later playlists unchanged. A playlist with more
+than 100 tracks can also be partially replaced if its first replacement batch
+succeeds and a later append fails. The publisher report records these partial
+states; there is no remote rollback.
+
 ## On-the-fly release playlists
 
 Use `scripts/discogs_release_playlist.py` when you already have Discogs
@@ -779,6 +891,11 @@ python3 scripts/discogs_release_playlist.py \
   --release-ids-file release-ids.txt
 ```
 
+This ad-hoc workflow is unchanged. It still uses
+`collection/playlists/on-the-fly`, accepts and deduplicates direct release-ID
+inputs, uses the exact `--name` as its Spotify target, does not create splits,
+and defaults to `append` when Spotify publishing is selected.
+
 ## Playlist mapper
 
 `scripts/discogs_playlist_mapper.py` is a separate local step. It reads an
@@ -845,6 +962,10 @@ The config shape is:
     "Bossanova": ["Bossa Nova", "Bossanova"],
     "Breakbeat": ["Breakbeat", "Breaks"],
     "House": ["House", "Deep House", "Acid House"]
+  },
+  "release_playlists": {
+    "Weekend Finds": ["123456", "789012"],
+    "Clear This Playlist": []
   }
 }
 ```
@@ -861,6 +982,16 @@ playlist labels. They are exact term rules with case-insensitive matching.
 aliases that should create that playlist. The canonical label casing is kept in
 the output.
 
+`release_playlists` is optional. If omitted, it behaves as an empty object, so
+existing playlist-map files remain valid. Each key is a non-empty display name,
+and each value is an ordered array of positive-integer strings. JSON numbers,
+zero, negative or non-digit values, duplicate IDs within one playlist, and two
+names that resolve to the same case-insensitive safe folder are rejected. Array
+order controls release order, while Discogs track order controls track order
+within each release. The same release ID may appear in different configured
+playlists, and the ID does not need to exist in the enriched collection. An
+empty array defines an authoritative empty playlist.
+
 Mapping rules:
 
 - `Style` and `Genre` are parsed as comma-separated term lists.
@@ -875,10 +1006,12 @@ Mapping rules:
 - Playlist order follows the order of `playlists` in the config.
 - Rows with no matching term get a blank `Playlists` value.
 
-The mapper validates the config before writing output. It rejects malformed JSON,
-missing or invalid `playlists`, invalid `excluded_terms`, empty playlist labels,
-empty aliases, non-string aliases, and aliases that appear in both
-`excluded_terms` and `playlists`.
+The mapper validates the complete config before writing output. It rejects
+malformed JSON, unknown keys, missing or invalid `playlists`, invalid
+`excluded_terms`, empty playlist labels, empty aliases, non-string aliases,
+aliases that appear in both `excluded_terms` and `playlists`, and invalid
+configured release definitions. It validates `release_playlists` but does not
+use those definitions to populate the enriched master's `Playlists` column.
 
 ## TuneMyMusic playlist exporter
 
@@ -1393,21 +1526,23 @@ Combined workflow options:
     from this path.
 
 --config PATH
-    Playlist map JSON passed to the mapper.
+    Playlist map JSON passed to the mapper and configured release-playlist step.
 
 --workflow-config PATH
-    Workflow JSON config passed to the splitter. Defaults to
-    config/workflow.json when omitted by the splitter.
+    Workflow JSON config passed to both split workflows. Defaults to
+    config/workflow.json when omitted.
 
 --playlist-output-dir PATH
-    Directory for per-playlist folders, playlist master CSVs, and split CSVs.
+    Directory for normal per-playlist folders, master CSVs, and split CSVs.
+    Configured output is written under PATH/release-playlists.
 
 --enrichment-cache PATH
     Discogs style and genre lookup cache JSON passed to the enricher as
     --cache.
 
 --tracklist-cache PATH
-    Discogs tracklist lookup cache JSON passed to the exporter as --cache.
+    Discogs tracklist lookup cache JSON passed to the normal exporter and
+    configured release-playlist step.
 
 --enrichment-report PATH
     Enrichment report path.
@@ -1421,6 +1556,15 @@ Combined workflow options:
 --split-report PATH
     Playlist split report path.
 
+--release-playlist-report PATH
+    Configured release playlist generation and cleanup report path.
+
+--release-split-report PATH
+    Configured release playlist split report path.
+
+--release-publisher-report PATH
+    Configured release playlist Spotify publisher report path.
+
 --regenerate-splits TARGET
     Playlist folder/display name/path to regenerate, or all, passed to the
     splitter.
@@ -1431,18 +1575,19 @@ Combined workflow options:
 --publisher spotify|none
     Publisher override for the workflow. If omitted, the workflow uses
     default_publisher from the publisher config. The default config resolves to
-    none, so the final workflow step prints a skip notice. When resolved to
-    spotify, the final workflow step runs the Spotify publisher after split CSVs
-    are written.
+    none, so both publishing stages are skipped. When resolved to spotify,
+    configured release playlists publish in replace mode before the normal
+    mapped-playlist publisher runs with its existing sync behavior.
 
 --skip-publish-playlist
-    Skip the final playlist publisher for this run. This is equivalent to
-    --publisher none and cannot be combined with --publisher.
+    Skip both configured and normal playlist publishing for this run. This is
+    equivalent to --publisher none and cannot be combined with --publisher.
 
 --publishing-dry-run
     Preview playlist publishing without creating or updating Spotify playlists.
-    This only affects runs where the resolved publisher is spotify. When omitted,
-    the resolved Spotify publisher can write changes.
+    This only prevents external Spotify writes; configured local generation,
+    splitting, and safe cleanup still run. When omitted, the resolved Spotify
+    publishers can write changes.
 
 --max-new-searches-per-run COUNT
     Maximum uncached Spotify searches per publisher run. Defaults to the
@@ -1458,14 +1603,16 @@ Combined workflow options:
     Disable seen Discogs terms tracking in the enricher.
 
 --no-progress
-    Disable progress output in enrichment, playlist export, and Spotify
-    publishing.
+    Disable progress output in enrichment, normal and configured playlist
+    export, and Spotify publishing.
 
 --timeout-seconds SECONDS
-    HTTP timeout per Discogs request for enrichment and playlist export.
+    HTTP timeout per Discogs request for enrichment and normal and configured
+    playlist export.
 
 --request-interval-seconds SECONDS
-    Minimum delay between Discogs requests for enrichment and playlist export.
+    Minimum delay between Discogs requests for enrichment and normal and
+    configured playlist export.
 
 --max-workers COUNT
     Maximum concurrent uncached enrichment lookups.
@@ -1586,26 +1733,48 @@ TuneMyMusic playlist exporter options:
 Release playlist options:
 
 ```text
+--from-config
+    Rebuild every configured release playlist instead of creating one ad-hoc
+    playlist. Cannot be combined with --name, positional release IDs, or
+    --release-ids-file.
+
 release_ids
-    Discogs release IDs to export. Values must be positive integers. You can
-    also pass --release-ids-file.
+    Ad-hoc Discogs release IDs to export. Values must be positive integers. You
+    can also pass --release-ids-file.
 
 --name TEXT
-    Required playlist name. The same name updates the same on-the-fly master CSV.
-    The file path may be sanitized, but the publisher target keeps this exact
-    name.
+    Required in ad-hoc mode. The same name updates the same on-the-fly master
+    CSV. The file path may be sanitized, but the publisher target keeps this
+    exact name.
 
 --release-ids-file PATH
-    Text file containing release IDs separated by whitespace or commas. IDs from
-    the file are appended after IDs passed as arguments, then deduped in order.
+    Ad-hoc text file containing release IDs separated by whitespace or commas.
+    IDs from the file are appended after positional IDs, then deduped in order.
+
+--config PATH
+    Playlist map JSON config. Defaults to config/playlist-map.json.
+
+--workflow-config PATH
+    Workflow JSON config for configured splits. Defaults to
+    config/workflow.json.
 
 --output-dir PATH
-    Directory for on-the-fly playlist folders. Defaults to
-    collection/playlists/on-the-fly.
+    Playlist output root. Ad-hoc mode defaults to
+    collection/playlists/on-the-fly; configured mode defaults to
+    collection/playlists/release-playlists.
 
 --report PATH
     Release playlist report path. Defaults to
     reports/YYYY-MM-DD_HH-MM-SS_discogs_release_playlist.txt.
+
+--split-report PATH
+    Configured release playlist split report path. In configured mode, the
+    default is
+    reports/YYYY-MM-DD_HH-MM-SS_configured_release_playlist_splitter.txt.
+
+--max-rows COUNT
+    Maximum rows per configured split CSV, overriding workflow config for one
+    run.
 
 --tracklist-cache PATH
     Discogs tracklist cache JSON. Defaults to
@@ -1619,14 +1788,16 @@ release_ids
     publisher config. Use none to write the CSV and report without publishing.
 
 --publisher-report PATH
-    Spotify publisher report path. Defaults to
-    reports/YYYY-MM-DD_HH-MM-SS_publish_playlist.txt.
+    Spotify publisher report path. Ad-hoc mode defaults to
+    reports/YYYY-MM-DD_HH-MM-SS_publish_playlist.txt; configured mode defaults
+    to reports/YYYY-MM-DD_HH-MM-SS_configured_release_playlist_publisher.txt.
 
 --publishing-dry-run
     Preview Spotify playlist changes without creating or updating playlists.
 
 --publisher-sync-mode append|replace
-    Spotify sync mode. Defaults to append. This only affects Spotify publishing.
+    Spotify sync mode. Ad-hoc mode defaults to append. Configured mode requires
+    replace and rejects append.
 
 --refresh-match-cache
     Recheck every generated playlist row with Spotify and update the local track
@@ -1636,10 +1807,6 @@ release_ids
 --match-cache PATH
     Spotify track match cache path. Defaults to
     collection/cache/spotify-track-matches.cache.json.
-
---publish-state-cache PATH
-    Spotify publish-state cache path. Defaults to
-    collection/cache/spotify-publish-state.cache.json.
 
 --env-file PATH
     Local env file containing Spotify app settings. Defaults to .env.

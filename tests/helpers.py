@@ -12,6 +12,7 @@ from typing import TypedDict
 class SamplePlaylistConfig(TypedDict):
     excluded_terms: list[str]
     playlists: dict[str, list[str]]
+    release_playlists: dict[str, list[str]]
 
 
 def read_csv_text(csv_text: str) -> list[dict[str, str]]:
@@ -30,4 +31,5 @@ def sample_playlist_config() -> SamplePlaylistConfig:
             "Breakbeat": ["Breakbeat", "Breaks"],
             "House": ["House", "Deep House", "Acid House"],
         },
+        "release_playlists": {},
     }

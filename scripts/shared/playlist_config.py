@@ -8,11 +8,18 @@ from pathlib import Path
 
 from shared.config_files import load_json_file, reject_unknown_keys
 from shared.files import write_json_file
+from shared.playlist_selection import safe_playlist_filename
 from shared.reports import format_report_section
 
 
 DEFAULT_CONFIG_PATH = Path("config/playlist-map.json")
-PLAYLIST_CONFIG_KEYS = frozenset({"excluded_terms", "playlists"})
+PLAYLIST_CONFIG_KEYS = frozenset({"excluded_terms", "playlists", "release_playlists"})
+
+
+@dataclass(frozen=True)
+class ConfiguredReleasePlaylist:
+    name: str
+    release_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -22,13 +29,65 @@ class PlaylistConfig:
     playlist_labels: tuple[str, ...]
     raw_aliases_by_label: Mapping[str, tuple[str, ...]]
     alias_keys_by_label: Mapping[str, tuple[str, ...]]
+    release_playlists: tuple[ConfiguredReleasePlaylist, ...] = ()
 
 
 def blank_playlist_config_payload() -> dict[str, object]:
     return {
         "excluded_terms": [],
         "playlists": {},
+        "release_playlists": {},
     }
+
+
+def normalize_configured_release_playlists(value: object) -> tuple[ConfiguredReleasePlaylist, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, Mapping):
+        raise ValueError("release_playlists must be an object")
+
+    definitions: list[ConfiguredReleasePlaylist] = []
+    safe_names: dict[str, str] = {}
+    for raw_name, raw_release_ids in value.items():
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raise ValueError("release playlist names must be non-empty strings")
+        name = raw_name.strip()
+        safe_name = safe_playlist_filename(name)
+        if not is_strict_configured_release_playlist_folder_name(safe_name):
+            raise ValueError(
+                f"release playlist name {name!r} must resolve to a strict direct child folder"
+            )
+        safe_key = safe_name.casefold()
+        existing_name = safe_names.get(safe_key)
+        if existing_name is not None:
+            raise ValueError(
+                f"release playlist names {existing_name!r} and {name!r} resolve to the same release playlist folder"
+            )
+        safe_names[safe_key] = name
+
+        if not isinstance(raw_release_ids, list):
+            raise ValueError(f"release IDs for {name} must be a list of positive-integer strings")
+        release_ids: list[str] = []
+        seen_release_ids: set[str] = set()
+        for release_id in raw_release_ids:
+            if not isinstance(release_id, str) or not release_id.isdigit() or int(release_id) < 1:
+                raise ValueError(f"release IDs for {name} must be positive-integer strings")
+            normalized_release_id = str(int(release_id))
+            if normalized_release_id in seen_release_ids:
+                raise ValueError(f"duplicate release_id in {name}: {normalized_release_id}")
+            seen_release_ids.add(normalized_release_id)
+            release_ids.append(normalized_release_id)
+        definitions.append(ConfiguredReleasePlaylist(name=name, release_ids=tuple(release_ids)))
+    return tuple(definitions)
+
+
+def is_strict_configured_release_playlist_folder_name(folder_name: str) -> bool:
+    folder_component = Path(folder_name)
+    return (
+        folder_name not in {".", ".."}
+        and folder_component.parent == Path(".")
+        and folder_component.name == folder_name
+    )
 
 
 def normalize_playlist_config(payload: object) -> PlaylistConfig:
@@ -82,6 +141,7 @@ def normalize_playlist_config(payload: object) -> PlaylistConfig:
         playlist_labels=tuple(playlist_labels),
         raw_aliases_by_label=raw_aliases_by_label,
         alias_keys_by_label=alias_keys_by_label,
+        release_playlists=normalize_configured_release_playlists(payload.get("release_playlists")),
     )
 
 
@@ -134,6 +194,16 @@ def format_playlist_config_overview(path: Path, config: PlaylistConfig, created:
     else:
         playlist_lines.append("No playlists configured yet.")
     lines.extend(format_report_section("Playlist labels and raw Discogs terms", playlist_lines))
+
+    release_playlist_lines: list[str] = []
+    if config.release_playlists:
+        for definition in config.release_playlists:
+            release_playlist_lines.append(f"- {definition.name}")
+            release_ids_text = ", ".join(definition.release_ids) if definition.release_ids else "None (authoritative empty playlist)"
+            release_playlist_lines.append(f"  Release IDs: {release_ids_text}")
+    else:
+        release_playlist_lines.append("No configured release playlists yet.")
+    lines.extend(format_report_section("Configured release playlists", release_playlist_lines))
 
     lines.append("")
     return "\n".join(lines)

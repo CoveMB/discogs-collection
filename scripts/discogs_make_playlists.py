@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run Discogs enrichment, playlist mapping, and playlist export in order."""
+"""Run Discogs enrichment, playlist mapping, normal playlist export and splitting, configured release playlists, and playlist publishing in order."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from pathlib import Path
 import discogs_playlist_exporter as exporter
 import discogs_playlist_mapper as mapper
 import discogs_playlist_splitter as splitter
+import discogs_release_playlist as release_playlists
 import discogs_style_enricher as enricher
 from publishers.spotify import publish_playlist as spotify_publisher
 from shared.cli import console_section, print_console_sections, print_step_header
@@ -43,6 +44,9 @@ DEBUG_PATH_FIELDS = (
     "mapping_report",
     "playlist_report",
     "split_report",
+    "release_playlist_report",
+    "release_split_report",
+    "release_publisher_report",
     "publisher_config",
 )
 
@@ -53,15 +57,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--input-dir", type=Path, help="Folder containing one Discogs export CSV passed to the enricher.")
     parser.add_argument("--processed-dir", type=Path, help="Folder where default-folder exports are moved after enrichment.")
     parser.add_argument("--master", type=Path, help="Enriched master CSV used by all three steps.")
-    parser.add_argument("--config", type=Path, help="Playlist map JSON passed to the mapper.")
-    parser.add_argument("--workflow-config", type=Path, help="Workflow JSON config passed to the splitter.")
-    parser.add_argument("--playlist-output-dir", type=Path, help="Directory for per-playlist TuneMyMusic CSV files.")
+    parser.add_argument("--config", type=Path, help="Playlist map JSON passed to the mapper and configured release playlist step.")
+    parser.add_argument("--workflow-config", type=Path, help="Workflow JSON config passed to the normal and configured playlist splitters.")
+    parser.add_argument("--playlist-output-dir", type=Path, help="Directory for normal per-playlist TuneMyMusic CSV files. Configured release playlists use PATH/release-playlists.")
     parser.add_argument("--enrichment-cache", type=Path, help="Discogs style and genre lookup cache JSON.")
     parser.add_argument("--tracklist-cache", type=Path, help="Discogs tracklist lookup cache JSON.")
     parser.add_argument("--enrichment-report", type=Path, help="Enrichment report path.")
     parser.add_argument("--mapping-report", type=Path, help="Playlist mapping report path.")
     parser.add_argument("--playlist-report", type=Path, help="Playlist export report path.")
     parser.add_argument("--split-report", type=Path, help="Playlist split report path.")
+    parser.add_argument("--release-playlist-report", type=Path, help="Configured release playlist report path.")
+    parser.add_argument("--release-split-report", type=Path, help="Configured release playlist split report path.")
+    parser.add_argument("--release-publisher-report", type=Path, help="Configured release playlist publisher report path.")
     parser.add_argument("--debug-log", type=Path, help="Write sanitized make-playlists pipeline debug logs to this path.")
     parser.add_argument("--regenerate-splits", help="Playlist folder/display name/path to regenerate, or all, passed to the splitter.")
     parser.add_argument("--publisher-config", type=Path, default=DEFAULT_PUBLISHER_CONFIG_PATH, help="Publisher JSON config. Defaults to config/publisher.json.")
@@ -72,17 +79,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_const",
         const=NO_PUBLISHER,
         dest="publisher",
-        help="Skip the final playlist publisher for this run. Equivalent to --publisher none.",
+        help="Skip configured and normal playlist publishing for this run. Equivalent to --publisher none.",
     )
     parser.add_argument("--publishing-dry-run", action="store_true", help="Preview playlist publishing without creating or updating Spotify playlists.")
     parser.add_argument("--refresh-existing", action="store_true", help="Ask the enricher to replace existing Style and Genre values.")
     parser.add_argument("--no-seen-terms", action="store_true", help="Disable seen Discogs terms tracking in the enricher.")
-    parser.add_argument("--no-progress", action="store_true", help="Disable progress output in enrichment, playlist export, and Spotify publishing.")
-    parser.add_argument("--timeout-seconds", type=int, help="HTTP timeout per Discogs request for enrichment and playlist export.")
+    parser.add_argument("--no-progress", action="store_true", help="Disable progress output in enrichment, normal playlist export, configured release playlist export, and Spotify publishing.")
+    parser.add_argument("--timeout-seconds", type=int, help="HTTP timeout per Discogs request for enrichment and normal and configured playlist export.")
     parser.add_argument(
         "--request-interval-seconds",
         type=float,
-        help="Minimum delay between Discogs requests for enrichment and playlist export.",
+        help="Minimum delay between Discogs requests for enrichment and normal and configured playlist export.",
     )
     parser.add_argument("--max-workers", type=int, help="Maximum concurrent uncached enrichment lookups.")
     parser.add_argument("--max-rows", type=int, help="Maximum rows per split CSV, overriding workflow config.")
@@ -91,7 +98,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         help=(
             "Maximum uncached Spotify searches per publisher run. "
-            "Passed to the Spotify publisher; use 0 for unlimited."
+            "Passed to configured and normal Spotify publishers; use 0 for unlimited."
         ),
     )
     args = parser.parse_args(argv)
@@ -202,6 +209,29 @@ def build_splitter_args(args: argparse.Namespace) -> list[str]:
     return arguments
 
 
+def build_configured_release_playlist_args(args: argparse.Namespace) -> list[str]:
+    arguments = ["--from-config"]
+    append_option(arguments, "--config", args.config)
+    append_option(arguments, "--workflow-config", args.workflow_config)
+    if args.playlist_output_dir is not None:
+        append_option(arguments, "--output-dir", args.playlist_output_dir / "release-playlists")
+    append_option(arguments, "--tracklist-cache", args.tracklist_cache)
+    append_option(arguments, "--report", args.release_playlist_report)
+    append_option(arguments, "--split-report", args.release_split_report)
+    append_option(arguments, "--publisher-report", args.release_publisher_report)
+    append_option(arguments, "--publisher-config", args.publisher_config)
+    append_option(arguments, "--publisher", args.publisher)
+    append_option(arguments, "--timeout-seconds", args.timeout_seconds)
+    append_option(arguments, "--request-interval-seconds", args.request_interval_seconds)
+    append_option(arguments, "--max-rows", args.max_rows)
+    append_option(arguments, "--max-new-searches-per-run", args.max_new_searches_per_run)
+    if args.publishing_dry_run:
+        arguments.append("--publishing-dry-run")
+    if args.no_progress:
+        arguments.append("--no-progress")
+    return arguments
+
+
 def build_spotify_publisher_args(args: argparse.Namespace) -> list[str]:
     return spotify_publisher.build_spotify_publisher_argv(
         playlist_output_dir=args.playlist_output_dir,
@@ -238,6 +268,11 @@ def build_pipeline_steps(args: argparse.Namespace) -> tuple[PipelineStep, ...]:
         ("Discogs playlist mapper", mapper.main, build_mapper_args(args)),
         ("Discogs playlist exporter", exporter.main, build_exporter_args(args)),
         ("Discogs playlist splitter", splitter.main, build_splitter_args(args)),
+        (
+            "Configured release playlists",
+            release_playlists.main,
+            build_configured_release_playlist_args(args),
+        ),
         build_publisher_step(args),
     )
 

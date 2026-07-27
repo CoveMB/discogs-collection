@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Create an isolated publisher playlist from explicit Discogs release IDs."""
+"""Create isolated ad-hoc or configured publisher playlists from Discogs release IDs."""
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+import configured_release_playlists
 import discogs_playlist_exporter as exporter
 import discogs_tracklists as tracklists
 from publishers.spotify import publish_playlist as spotify_publisher
@@ -18,28 +18,42 @@ from publishers.spotify.env import DEFAULT_ENV_PATH, DEFAULT_TOKEN_CACHE_PATH
 from shared.cli import EXPECTED_CLI_ERRORS, run_cli
 from shared.debug_log import DebugLog, build_debug_logger
 from shared.discogs_columns import RELEASE_ID_COLUMN
-from shared.files import write_json_file
 from shared.playlist_selection import (
     ensure_path_inside_output_directory,
     playlist_master_path,
     safe_playlist_filename,
 )
+from shared import playlist_config, workflow_config
+from shared.playlist_config import DEFAULT_CONFIG_PATH, PlaylistConfig
 from shared.progress import ProgressReporter
+from shared.release_playlist_metadata import (
+    AD_HOC_RELEASE_PLAYLIST_RECORD_TYPE,
+    RELEASE_PLAYLIST_METADATA_FILENAME,
+    RELEASE_PLAYLIST_METADATA_SCHEMA_VERSION,
+    ReleasePlaylistMetadata,
+    read_release_playlist_metadata as load_release_playlist_metadata,
+    write_release_playlist_metadata as save_release_playlist_metadata,
+)
 from shared.publisher_config import (
     DEFAULT_PUBLISHER_CONFIG_PATH,
     NO_PUBLISHER,
     PUBLISHER_CHOICES,
     SPOTIFY_PUBLISHER,
     PublisherConfig,
+    configured_release_publisher_config,
     load_or_create_publisher_config,
+    publisher_playlist_name,
 )
 from shared.cli import print_cli_summary
 from shared.reports import format_report_section, format_report_title, script_report_path, write_text_report
 from shared.workflow_paths import (
+    DEFAULT_CONFIGURED_RELEASE_PLAYLIST_DIRECTORY,
     DEFAULT_ON_THE_FLY_PLAYLIST_DIRECTORY,
+    DEFAULT_PLAYLIST_OUTPUT_DIRECTORY,
     DEFAULT_SPOTIFY_MATCH_CACHE_PATH,
     DEFAULT_TRACKLIST_CACHE_PATH,
 )
+from shared.workflow_config import DEFAULT_WORKFLOW_CONFIG_PATH
 
 
 PLAYLISTS_COLUMN = exporter.PLAYLISTS_COLUMN
@@ -47,9 +61,6 @@ DEFAULT_OUTPUT_DIRECTORY = DEFAULT_ON_THE_FLY_PLAYLIST_DIRECTORY
 DEFAULT_MATCH_CACHE_PATH = DEFAULT_SPOTIFY_MATCH_CACHE_PATH
 DEFAULT_USER_AGENT = "DiscogsReleasePlaylist/1.0 +https://www.discogs.com"
 SUPPORTED_PUBLISHERS = PUBLISHER_CHOICES
-RELEASE_PLAYLIST_METADATA_FILENAME = ".release-playlist.json"
-RELEASE_PLAYLIST_METADATA_SCHEMA_VERSION = 1
-RELEASE_PLAYLIST_METADATA_RECORD_TYPE = "discogs_release_playlist"
 RELEASE_PLAYLIST_FIELDNAMES = (
     RELEASE_ID_COLUMN,
     "Artist",
@@ -69,6 +80,13 @@ class ReleasePlaylistSummary:
     report_path: Path
     publisher: str
     export_summary: exporter.PlaylistExportSummary
+    publisher_summary: spotify_publisher.SpotifyPublishSummary | None = None
+
+
+@dataclass(frozen=True)
+class ConfiguredReleasePlaylistRunSummary:
+    local_summary: configured_release_playlists.ConfiguredReleasePlaylistsSummary
+    publisher: str
     publisher_summary: spotify_publisher.SpotifyPublishSummary | None = None
 
 
@@ -199,30 +217,20 @@ def ensure_release_playlist_target_available(
 
 
 def read_release_playlist_metadata_name(path: Path) -> str:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as error:
-        raise ValueError(f"{path}: malformed release playlist metadata") from error
-    if (
-        not isinstance(payload, Mapping)
-        or payload.get("schema_version") != RELEASE_PLAYLIST_METADATA_SCHEMA_VERSION
-        or payload.get("record_type") != RELEASE_PLAYLIST_METADATA_RECORD_TYPE
-    ):
-        raise ValueError(f"{path}: unsupported release playlist metadata")
-    playlist_name = payload.get("playlist_name")
-    if not isinstance(playlist_name, str) or not playlist_name.strip():
-        raise ValueError(f"{path}: release playlist metadata is missing playlist_name")
-    return playlist_name.strip()
+    return load_release_playlist_metadata(
+        path,
+        AD_HOC_RELEASE_PLAYLIST_RECORD_TYPE,
+    ).playlist_name
 
 
 def write_release_playlist_metadata(path: Path, playlist_name: str) -> None:
-    write_json_file(
+    save_release_playlist_metadata(
         path,
-        {
-            "schema_version": RELEASE_PLAYLIST_METADATA_SCHEMA_VERSION,
-            "record_type": RELEASE_PLAYLIST_METADATA_RECORD_TYPE,
-            "playlist_name": playlist_name,
-        },
+        ReleasePlaylistMetadata(
+            schema_version=RELEASE_PLAYLIST_METADATA_SCHEMA_VERSION,
+            record_type=AD_HOC_RELEASE_PLAYLIST_RECORD_TYPE,
+            playlist_name=playlist_name,
+        ),
     )
 
 
@@ -248,7 +256,11 @@ def ad_hoc_publisher_config() -> PublisherConfig:
     return PublisherConfig(default_publisher=SPOTIFY_PUBLISHER, playlist_prefix="", playlist_suffix="")
 
 
-def build_spotify_publisher_args(args: argparse.Namespace) -> argparse.Namespace:
+def build_spotify_publisher_args(
+    args: argparse.Namespace,
+    *,
+    publisher_sync_mode: str | None = None,
+) -> argparse.Namespace:
     return spotify_publisher.build_spotify_publisher_namespace(
         env_file=args.env_file,
         playlist_output_dir=args.output_dir,
@@ -262,11 +274,153 @@ def build_spotify_publisher_args(args: argparse.Namespace) -> argparse.Namespace
         playlists=None,
         search_limit=args.search_limit,
         max_new_searches_per_run=args.max_new_searches_per_run,
-        publisher_sync_mode=args.publisher_sync_mode,
+        publisher_sync_mode=publisher_sync_mode or args.publisher_sync_mode,
         refresh_match_cache=args.refresh_match_cache,
         dry_run=args.publishing_dry_run,
         progress=args.progress,
     )
+
+
+def validate_configured_output_directory(output_directory: Path) -> None:
+    output_parts = casefolded_resolved_path_parts(output_directory)
+    normal_output_parts = casefolded_resolved_path_parts(
+        DEFAULT_PLAYLIST_OUTPUT_DIRECTORY
+    )
+    if output_parts == normal_output_parts:
+        raise ValueError(
+            f"configured release playlist output {output_directory} cannot equal "
+            f"the normal playlist output root {DEFAULT_PLAYLIST_OUTPUT_DIRECTORY}"
+        )
+
+    on_the_fly_parts = casefolded_resolved_path_parts(
+        DEFAULT_ON_THE_FLY_PLAYLIST_DIRECTORY
+    )
+    if output_parts[: len(on_the_fly_parts)] == on_the_fly_parts:
+        raise ValueError(
+            f"configured release playlist output {output_directory} cannot be inside "
+            f"the on-the-fly directory {DEFAULT_ON_THE_FLY_PLAYLIST_DIRECTORY}"
+        )
+
+
+def casefolded_resolved_path_parts(path: Path) -> tuple[str, ...]:
+    return tuple(part.casefold() for part in path.resolve().parts)
+
+
+def validate_configured_publisher_targets(
+    config: PlaylistConfig,
+    publisher_config: PublisherConfig,
+) -> None:
+    normal_targets: dict[str, tuple[str, str]] = {}
+    for label in config.playlist_labels:
+        target_name = publisher_playlist_name(label, publisher_config)
+        normal_targets[target_name.casefold()] = (label, target_name)
+    release_publisher_config = configured_release_publisher_config(publisher_config)
+    release_targets: dict[str, tuple[str, str]] = {}
+    for definition in config.release_playlists:
+        target_name = publisher_playlist_name(definition.name, release_publisher_config)
+        target_key = target_name.casefold()
+        normal_target = normal_targets.get(target_key)
+        if normal_target is not None:
+            normal_label, normal_target_name = normal_target
+            raise ValueError(
+                f"configured release playlist {definition.name!r} Spotify target {target_name!r} "
+                f"collides with normal playlist {normal_label!r} target {normal_target_name!r}"
+            )
+        release_target = release_targets.get(target_key)
+        if release_target is not None:
+            release_name, release_target_name = release_target
+            raise ValueError(
+                f"configured release playlists {release_name!r} and {definition.name!r} have "
+                f"the same Spotify target {release_target_name!r}"
+            )
+        release_targets[target_key] = (definition.name, target_name)
+
+
+def reject_unexpected_configured_lookup(
+    _row: Mapping[str, str],
+) -> tracklists.ReleaseTracklistLookup:
+    raise AssertionError("configured tracklist lookup was called for an empty release set")
+
+
+def run_configured_release_playlist(
+    args: argparse.Namespace,
+) -> ConfiguredReleasePlaylistRunSummary:
+    debug_log = build_debug_logger(args.debug_log)
+    if debug_log:
+        debug_log("start discogs_release_playlist configured_mode=true")
+
+    try:
+        validate_configured_output_directory(args.output_dir)
+        config = playlist_config.load_playlist_config(args.config)
+        resolved_workflow_config = workflow_config.load_or_create_workflow_config(
+            args.workflow_config
+        )
+        if args.max_rows is not None:
+            resolved_workflow_config = replace(
+                resolved_workflow_config,
+                max_rows_per_split=args.max_rows,
+            )
+        publisher_config = load_or_create_publisher_config(args.publisher_config)
+        validate_configured_publisher_targets(config, publisher_config)
+    except Exception as error:
+        try:
+            configured_release_playlists.write_configured_release_playlist_failure_report(
+                args.report,
+                config_path=args.config,
+                output_directory=args.output_dir,
+                error=error,
+            )
+        except Exception:
+            pass
+        raise
+
+    publisher = args.publisher or publisher_config.default_publisher
+    has_release_ids = any(
+        definition.release_ids for definition in config.release_playlists
+    )
+    lookup_tracklist = (
+        tracklists.make_cached_tracklist_lookup(
+            cache_path=args.tracklist_cache,
+            token=args.discogs_token,
+            user_agent=args.user_agent,
+            timeout_seconds=args.timeout_seconds,
+            request_interval_seconds=args.request_interval_seconds,
+        )
+        if has_release_ids
+        else reject_unexpected_configured_lookup
+    )
+    local_summary = configured_release_playlists.create_configured_release_playlists(
+        config=config,
+        config_path=args.config,
+        workflow_config=resolved_workflow_config,
+        output_directory=args.output_dir,
+        report_path=args.report,
+        split_report_path=args.split_report,
+        lookup_tracklist=lookup_tracklist,
+    )
+    summary = ConfiguredReleasePlaylistRunSummary(
+        local_summary=local_summary,
+        publisher=publisher,
+    )
+    if publisher == NO_PUBLISHER:
+        return summary
+    if publisher != SPOTIFY_PUBLISHER:
+        raise ValueError(f"unsupported publisher: {publisher}")
+    if not local_summary.master_paths:
+        return summary
+
+    publisher_args = build_spotify_publisher_args(
+        args,
+        publisher_sync_mode=spotify_publisher.REPLACE_SYNC_MODE,
+    )
+    publisher_summary = spotify_publisher.run_spotify_publish_from_args(
+        publisher_args,
+        playlist_master_paths=local_summary.master_paths,
+        playlist_names_by_master_path=local_summary.playlist_names_by_master_path,
+        publisher_config=configured_release_publisher_config(publisher_config),
+        debug_log=debug_log,
+    )
+    return replace(summary, publisher_summary=publisher_summary)
 
 
 def publish_release_playlist(
@@ -387,17 +541,70 @@ def print_summary(summary: ReleasePlaylistSummary) -> None:
     )
 
 
+def print_configured_summary(summary: ConfiguredReleasePlaylistRunSummary) -> None:
+    local_summary = summary.local_summary
+    print_cli_summary(
+        files=[
+            f"Config: {local_summary.config_path}",
+            f"Output directory: {local_summary.output_directory}",
+            f"Report: {local_summary.report_path}",
+            f"Split report: {local_summary.split_report_path}",
+            *(
+                [f"Publisher report: {summary.publisher_summary.report_path}"]
+                if summary.publisher_summary is not None
+                else []
+            ),
+        ],
+        processed=[
+            f"Current playlists: {len(local_summary.playlists)}",
+            f"Deleted folders: {len(local_summary.deleted_folder_paths)}",
+            f"Output track rows: {sum(playlist.track_row_count for playlist in local_summary.playlists)}",
+            f"Publisher: {summary.publisher}",
+        ],
+    )
+
+
+def run_release_playlist_mode(
+    args: argparse.Namespace,
+) -> ReleasePlaylistSummary | ConfiguredReleasePlaylistRunSummary:
+    if args.from_config:
+        return run_configured_release_playlist(args)
+    return run_release_playlist(args)
+
+
+def print_release_playlist_mode_summary(
+    summary: ReleasePlaylistSummary | ConfiguredReleasePlaylistRunSummary,
+) -> None:
+    if isinstance(summary, ConfiguredReleasePlaylistRunSummary):
+        print_configured_summary(summary)
+        return
+    print_summary(summary)
+
+
 def default_report_path() -> Path:
     return script_report_path(__file__)
+
+
+def default_configured_split_report_path() -> Path:
+    return script_report_path("configured_release_playlist_splitter.py")
+
+
+def default_configured_publisher_report_path() -> Path:
+    return script_report_path("configured_release_playlist_publisher.py")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("release_ids", nargs="*", help="Discogs release IDs to export into the playlist.")
-    parser.add_argument("--name", required=True, help="Playlist name to create or update under the on-the-fly playlist folder.")
+    parser.add_argument("--from-config", action="store_true", help="Rebuild all configured release playlists instead of creating one ad-hoc playlist.")
+    parser.add_argument("--name", help="Ad-hoc playlist name to create or update under the on-the-fly playlist folder.")
     parser.add_argument("--release-ids-file", type=Path, help="Text file containing release IDs separated by whitespace or commas.")
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIRECTORY, help="Directory for on-the-fly playlist folders. Defaults to collection/playlists/on-the-fly.")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="Playlist map JSON config. Defaults to config/playlist-map.json.")
+    parser.add_argument("--workflow-config", type=Path, default=DEFAULT_WORKFLOW_CONFIG_PATH, help="Workflow JSON config. Defaults to config/workflow.json.")
+    parser.add_argument("--output-dir", type=Path, help="Playlist output root. Defaults depend on the selected mode.")
     parser.add_argument("--report", type=Path, help="Release playlist report path. Defaults to reports/<timestamp>_discogs_release_playlist.txt.")
+    parser.add_argument("--split-report", type=Path, help="Configured release playlist split report path. Defaults to reports/<timestamp>_configured_release_playlist_splitter.txt.")
+    parser.add_argument("--max-rows", type=int, help="Maximum rows per configured split CSV. Overrides workflow config.")
     parser.add_argument("--tracklist-cache", type=Path, default=DEFAULT_TRACKLIST_CACHE_PATH, help="Discogs tracklist cache JSON. Defaults to collection/cache/playlist-tracks.cache.json.")
     parser.add_argument("--discogs-token", default=os.environ.get("DISCOGS_TOKEN", ""), help="Optional Discogs personal access token. Defaults to DISCOGS_TOKEN.")
     parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT, help="User-Agent sent to Discogs.")
@@ -405,7 +612,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--request-interval-seconds", type=float, default=exporter.DEFAULT_REQUEST_INTERVAL_SECONDS, help="Minimum delay between Discogs requests. Defaults to header-aware throttling.")
     parser.add_argument("--publisher-config", type=Path, default=DEFAULT_PUBLISHER_CONFIG_PATH, help="Publisher JSON config. Defaults to config/publisher.json.")
     parser.add_argument("--publisher", choices=SUPPORTED_PUBLISHERS, help="Publisher override. Omit to use default_publisher from the publisher config.")
-    parser.add_argument("--publisher-report", type=Path, help="Spotify publisher report path. Defaults to reports/<timestamp>_publish_playlist.txt.")
+    parser.add_argument("--publisher-report", type=Path, help="Spotify publisher report path. Ad-hoc mode defaults to reports/<timestamp>_publish_playlist.txt; configured mode defaults to reports/<timestamp>_configured_release_playlist_publisher.txt.")
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_PATH, help="Local env file containing Spotify app settings. Defaults to .env.")
     parser.add_argument("--token-cache", type=Path, default=DEFAULT_TOKEN_CACHE_PATH, help="Spotify token cache path.")
     parser.add_argument("--match-cache", type=Path, default=DEFAULT_MATCH_CACHE_PATH, help="Spotify track match cache path.")
@@ -421,7 +628,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "Defaults to 500. Use 0 for unlimited."
         ),
     )
-    parser.add_argument("--publisher-sync-mode", choices=spotify_publisher.PUBLISHER_SYNC_MODES, default=spotify_publisher.APPEND_SYNC_MODE, help="Publisher sync mode. append adds missing tracks; replace replaces playlist contents. Defaults to append.")
+    parser.add_argument("--publisher-sync-mode", choices=spotify_publisher.PUBLISHER_SYNC_MODES, help="Publisher sync mode. Ad-hoc mode defaults to append; configured mode requires replace.")
     parser.add_argument("--refresh-match-cache", action="store_true", help="Recheck every generated playlist row with Spotify and update the local track match cache.")
     parser.add_argument("--publishing-dry-run", action="store_true", help="Preview Spotify playlist changes without creating or updating playlists.")
     parser.add_argument("--debug-log", type=Path, help="Write sanitized release playlist debug logs to this path.")
@@ -429,7 +636,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     validate_args(parser, args)
     args.report = args.report or default_report_path()
-    args.publisher_report = args.publisher_report or spotify_publisher.default_report_path()
+    if args.from_config:
+        args.split_report = args.split_report or default_configured_split_report_path()
+        args.publisher_report = args.publisher_report or default_configured_publisher_report_path()
+    else:
+        args.publisher_report = args.publisher_report or spotify_publisher.default_report_path()
     return args
 
 
@@ -442,15 +653,29 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--search-limit must be between 1 and 10")
     if args.max_new_searches_per_run < 0:
         parser.error("--max-new-searches-per-run must be non-negative")
+    if args.max_rows is not None and args.max_rows < 1:
+        parser.error("--max-rows must be at least 1")
+    if args.from_config:
+        if args.name or args.release_ids or args.release_ids_file is not None:
+            parser.error("--from-config cannot be combined with ad-hoc playlist inputs")
+        if args.publisher_sync_mode not in {None, spotify_publisher.REPLACE_SYNC_MODE}:
+            parser.error("configured release playlists require --publisher-sync-mode replace")
+        args.output_dir = args.output_dir or DEFAULT_CONFIGURED_RELEASE_PLAYLIST_DIRECTORY
+        args.publisher_sync_mode = spotify_publisher.REPLACE_SYNC_MODE
+        return
+    if not args.name:
+        parser.error("--name is required unless --from-config is used")
     if not args.release_ids and args.release_ids_file is None:
         parser.error("at least one release_id or --release-ids-file is required")
+    args.output_dir = args.output_dir or DEFAULT_ON_THE_FLY_PLAYLIST_DIRECTORY
+    args.publisher_sync_mode = args.publisher_sync_mode or spotify_publisher.APPEND_SYNC_MODE
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     return run_cli(
         parse_args,
-        run_release_playlist,
-        print_summary,
+        run_release_playlist_mode,
+        print_release_playlist_mode_summary,
         argv,
         expected_errors=(*EXPECTED_CLI_ERRORS, spotify_publisher.SpotifyApiError),
     )

@@ -17,6 +17,81 @@ import discogs_playlist_mapper as mapper  # noqa: E402
 
 
 class PlaylistMapperTests(unittest.TestCase):
+    def test_legacy_config_defaults_to_no_release_playlists(self):
+        payload: dict[str, object] = dict(sample_config())
+        del payload["release_playlists"]
+
+        config = mapper.normalize_playlist_config(payload)
+
+        self.assertEqual(config.release_playlists, ())
+
+    def test_release_playlists_preserve_playlist_and_release_order_and_allow_empty(self):
+        payload: dict[str, object] = dict(sample_config())
+        payload["release_playlists"] = {
+            "My Latest Discovery": ["4390198", "123456"],
+            "Clear This Playlist": [],
+        }
+
+        config = mapper.normalize_playlist_config(payload)
+
+        self.assertEqual(
+            [(definition.name, definition.release_ids) for definition in config.release_playlists],
+            [
+                ("My Latest Discovery", ("4390198", "123456")),
+                ("Clear This Playlist", ()),
+            ],
+        )
+
+    def test_release_playlist_ids_must_be_unique_positive_integer_strings(self):
+        invalid_values = (
+            [4390198],
+            ["0"],
+            ["-1"],
+            ["1.5"],
+            [""],
+            ["111", "111"],
+        )
+        for release_ids in invalid_values:
+            with self.subTest(release_ids=release_ids):
+                payload: dict[str, object] = dict(sample_config())
+                payload["release_playlists"] = {"My Playlist": release_ids}
+
+                with self.assertRaises(ValueError):
+                    mapper.normalize_playlist_config(payload)
+
+    def test_release_playlist_sanitized_folder_collisions_are_rejected(self):
+        payload: dict[str, object] = dict(sample_config())
+        payload["release_playlists"] = {
+            "Friday/Picks": ["111"],
+            "Friday:Picks": ["222"],
+        }
+
+        with self.assertRaisesRegex(ValueError, "same release playlist folder"):
+            mapper.normalize_playlist_config(payload)
+
+    def test_release_playlist_names_must_resolve_to_strict_direct_child_folders(self):
+        for playlist_name in (".", ".."):
+            with self.subTest(playlist_name=playlist_name):
+                payload: dict[str, object] = dict(sample_config())
+                payload["release_playlists"] = {playlist_name: ["111"]}
+
+                with self.assertRaisesRegex(ValueError, "strict direct child"):
+                    mapper.normalize_playlist_config(payload)
+
+    def test_release_playlist_membership_does_not_change_enriched_playlist_column(self):
+        payload: dict[str, object] = dict(sample_config())
+        payload["release_playlists"] = {"Selected Releases": ["111"]}
+        config = mapper.normalize_playlist_config(payload)
+
+        output_fieldnames, output_rows = mapper.add_playlist_mappings(
+            ["release_id", "Artist", "Style", "Genre"],
+            [{"release_id": "111", "Artist": "Artist", "Style": "", "Genre": ""}],
+            config,
+        )
+
+        self.assertIn("Playlists", output_fieldnames)
+        self.assertEqual(output_rows[0]["Playlists"], "")
+
     def test_bossa_nova_aliases_map_to_configured_playlist_label(self):
         config = mapper.normalize_playlist_config(sample_config())
 
