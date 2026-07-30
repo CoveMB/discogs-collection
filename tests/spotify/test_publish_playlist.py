@@ -4432,6 +4432,162 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertEqual(len(client.replace_calls), 1)
         self.assertEqual(len(client.replace_calls[0][1]), 100)
 
+    def test_replace_mode_preserves_repeated_rows_while_append_still_dedupes(self):
+        rows = [
+            playlist_row("111", "Shared Album", "Shared Track", "Shared Artist"),
+            playlist_row("222", "Shared Album", "Shared Track", "Shared Artist"),
+        ]
+        candidate = SpotifyTrackCandidate(
+            uri="spotify:track:shared",
+            name="Shared Track",
+            artists=("Shared Artist",),
+            album_name="Shared Album",
+        )
+        query = 'track:"Shared Track" artist:"Shared Artist" album:"Shared Album"'
+
+        for publisher_sync_mode, expected_statuses in (
+            ("replace", ["would_include", "would_include"]),
+            ("append", ["would_add", "duplicate_in_source"]),
+        ):
+            with self.subTest(publisher_sync_mode=publisher_sync_mode):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    directory = Path(temporary_directory)
+                    playlist_directory = directory / "collection" / "playlists"
+                    write_playlist_master(playlist_directory / "House" / "House.csv", rows)
+                    client = PublishingSpotifyClient({query: (candidate,)})
+
+                    summary = publish_spotify_playlists(
+                        playlist_output_directory=playlist_directory,
+                        report_path=directory / "reports" / "spotify-report.txt",
+                        spotify_client=client,
+                        access_token="access-token",
+                        match_cache_path=directory / "collection" / "cache" / "matches.json",
+                        publisher_config=PublisherConfig(
+                            default_publisher="spotify",
+                            playlist_prefix="Discogs - ",
+                            playlist_suffix="",
+                        ),
+                        apply=False,
+                        publisher_sync_mode=publisher_sync_mode,
+                    )
+
+                self.assertEqual([decision.status for decision in summary.decisions], expected_statuses)
+                self.assertEqual(client.add_calls, [])
+                self.assertEqual(client.replace_calls, [])
+                if publisher_sync_mode == "replace":
+                    self.assertEqual(summary.would_include_count, 2)
+                    self.assertEqual(summary.duplicate_in_source_count, 0)
+                    self.assertEqual(
+                        [item.spotify_uri for item in summary.final_items],
+                        ["spotify:track:shared", "spotify:track:shared"],
+                    )
+                else:
+                    self.assertEqual(summary.would_add_count, 1)
+                    self.assertEqual(summary.duplicate_in_source_count, 1)
+
+    def test_replace_mode_preserves_repeated_rows_across_write_batch_boundary(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            rows = [
+                playlist_row(str(index), f"Album {index}", f"Track {index}", f"Artist {index}")
+                for index in range(1, 101)
+            ]
+            rows.append(playlist_row("101", "Album 100", "Track 100", "Artist 100"))
+            write_playlist_master(playlist_directory / "House" / "House.csv", rows)
+            candidates_by_query = {
+                f'track:"{row["Track Name"]}" artist:"{row["Artist Name"]}" album:"{row["Album Name"]}"': (
+                    matching_candidate(row),
+                )
+                for row in rows
+            }
+            client = PublishingSpotifyClient(
+                candidates_by_query,
+                playlists=(
+                    SpotifyPlaylist(
+                        playlist_id="playlist-house",
+                        name="Discogs - House",
+                        url="",
+                        owner_id="current-user",
+                        public=False,
+                    ),
+                ),
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=directory / "reports" / "spotify-report.txt",
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=directory / "collection" / "cache" / "matches.json",
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                publisher_sync_mode="replace",
+            )
+
+        expected_uris = tuple(f"spotify:track:{index}" for index in range(1, 100)) + (
+            "spotify:track:101",
+            "spotify:track:101",
+        )
+        self.assertEqual(summary.included_count, 101)
+        self.assertEqual(summary.duplicate_in_source_count, 0)
+        self.assertEqual(client.replace_calls, [("playlist-house", expected_uris[:100])])
+        self.assertEqual(client.add_calls, [("playlist-house", expected_uris[100:], None)])
+
+    def test_replace_mode_preserves_repeated_cached_rows_without_searching(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            rows = [
+                playlist_row("111", "Shared Album", "Shared Track", "Shared Artist"),
+                playlist_row("222", "Shared Album", "Shared Track", "Shared Artist"),
+            ]
+            write_playlist_master(playlist_directory / "House" / "House.csv", rows)
+            query = 'track:"Shared Track" artist:"Shared Artist" album:"Shared Album"'
+            candidate = SpotifyTrackCandidate(
+                uri="spotify:track:shared",
+                name="Shared Track",
+                artists=("Shared Artist",),
+                album_name="Shared Album",
+            )
+            match_cache_path = directory / "collection" / "cache" / "matches.json"
+            publisher_config = PublisherConfig(
+                default_publisher="spotify",
+                playlist_prefix="Discogs - ",
+                playlist_suffix="",
+            )
+            publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=directory / "reports" / "first-report.txt",
+                spotify_client=PublishingSpotifyClient({query: (candidate,)}),
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=publisher_config,
+                apply=False,
+                publisher_sync_mode="replace",
+            )
+            cached_client = PublishingSpotifyClient({})
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=directory / "reports" / "cached-report.txt",
+                spotify_client=cached_client,
+                access_token="access-token",
+                match_cache_path=match_cache_path,
+                publisher_config=publisher_config,
+                apply=False,
+                publisher_sync_mode="replace",
+            )
+
+        self.assertEqual(summary.cache_hit_count, 2)
+        self.assertEqual(summary.search_count, 0)
+        self.assertEqual(summary.would_include_count, 2)
+        self.assertEqual(summary.duplicate_in_source_count, 0)
+        self.assertEqual(cached_client.searches, [])
+
     def test_replace_mode_search_budget_stops_without_writing(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
@@ -4480,6 +4636,207 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertEqual(summary.would_include_count, 500)
         self.assertEqual(client.replace_calls, [])
         self.assertEqual(client.add_calls, [])
+
+    def test_replace_mode_clears_existing_playlist_for_selected_header_only_master(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists" / "release-playlists"
+            master_path = playlist_directory / "Empty Mirror" / "Empty Mirror.csv"
+            write_playlist_master(master_path, [])
+            client = PublishingSpotifyClient(
+                {},
+                playlists=(
+                    SpotifyPlaylist(
+                        playlist_id="playlist-empty",
+                        name="Release - Empty Mirror",
+                        url="",
+                        owner_id="current-user",
+                        public=False,
+                    ),
+                ),
+                playlist_items_by_id={
+                    "playlist-empty": (
+                        SpotifyPlaylistItem(
+                            uri="spotify:track:old",
+                            name="Old Track",
+                            artists=("Old Artist",),
+                            album_name="Old Album",
+                        ),
+                    )
+                },
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=directory / "reports" / "spotify-report.txt",
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=directory / "collection" / "cache" / "matches.json",
+                playlist_master_paths=(master_path,),
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Release - ",
+                    playlist_suffix="",
+                ),
+                publisher_sync_mode="replace",
+            )
+
+        self.assertEqual(summary.run_status, "complete")
+        self.assertEqual(client.replace_calls, [("playlist-empty", ())])
+        self.assertEqual(client.created_playlists, [])
+
+    def test_replace_mode_does_not_create_missing_playlist_for_selected_header_only_master(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists" / "release-playlists"
+            master_path = playlist_directory / "Empty Mirror" / "Empty Mirror.csv"
+            write_playlist_master(master_path, [])
+            client = PublishingSpotifyClient({})
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=directory / "reports" / "spotify-report.txt",
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=directory / "collection" / "cache" / "matches.json",
+                playlist_master_paths=(master_path,),
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Release - ",
+                    playlist_suffix="",
+                ),
+                publisher_sync_mode="replace",
+            )
+
+        self.assertEqual(summary.run_status, "complete")
+        self.assertEqual(client.created_playlists, [])
+        self.assertEqual(client.replace_calls, [])
+
+    def test_replace_mode_unmatched_row_in_later_selected_playlist_blocks_all_writes(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists" / "release-playlists"
+            report_path = directory / "reports" / "spotify-report.txt"
+            match_cache_path = directory / "collection" / "cache" / "matches.json"
+            first_master_path = playlist_directory / "First Picks" / "First Picks.csv"
+            second_master_path = playlist_directory / "Second Picks" / "Second Picks.csv"
+            first_row = playlist_row("111", "First Album", "First Track", "First Artist")
+            second_row = playlist_row("222", "Second Album", "Missing Track", "Second Artist")
+            write_playlist_master(first_master_path, [first_row])
+            write_playlist_master(second_master_path, [second_row])
+            client = PublishingSpotifyClient(
+                {
+                    'track:"First Track" artist:"First Artist" album:"First Album"': (
+                        matching_candidate(first_row),
+                    ),
+                },
+                playlists=(
+                    SpotifyPlaylist(
+                        playlist_id="playlist-first",
+                        name="Release - First Picks",
+                        url="",
+                        owner_id="current-user",
+                        public=False,
+                    ),
+                    SpotifyPlaylist(
+                        playlist_id="playlist-second",
+                        name="Release - Second Picks",
+                        url="",
+                        owner_id="current-user",
+                        public=False,
+                    ),
+                ),
+            )
+
+            with self.assertRaisesRegex(ValueError, "replace mode aborted before writing"):
+                publish_spotify_playlists(
+                    playlist_output_directory=playlist_directory,
+                    report_path=report_path,
+                    spotify_client=client,
+                    access_token="access-token",
+                    match_cache_path=match_cache_path,
+                    playlist_master_paths=(first_master_path, second_master_path),
+                    playlist_names_by_master_path={
+                        first_master_path: "First Picks",
+                        second_master_path: "Second Picks",
+                    },
+                    publisher_config=PublisherConfig(
+                        default_publisher="spotify",
+                        playlist_prefix="Release - ",
+                        playlist_suffix="",
+                    ),
+                    publisher_sync_mode="replace",
+                )
+            report_text = report_path.read_text(encoding="utf-8")
+            match_cache_exists = match_cache_path.is_file()
+
+        self.assertEqual(client.replace_calls, [])
+        self.assertEqual(client.add_calls, [])
+        self.assertEqual(client.created_playlists, [])
+        self.assertTrue(match_cache_exists)
+        self.assertIn(
+            "Run status: replace mode aborted before writing because not every source row resolved "
+            "to a publishable Spotify URI (unmatched=1)",
+            report_text,
+        )
+        self.assertNotIn("Run status: complete", report_text)
+
+    def test_replace_mode_blocking_dry_run_reports_complete_without_writes(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            playlist_directory = directory / "collection" / "playlists"
+            write_playlist_master(
+                playlist_directory / "House" / "House.csv",
+                [
+                    playlist_row("111", "Alpha Album", "Alpha One", "Alpha Artist"),
+                    playlist_row("222", "Beta Album", "Missing Track", "Beta Artist"),
+                ],
+            )
+            report_path = directory / "reports" / "spotify-report.txt"
+            client = PublishingSpotifyClient(
+                {
+                    'track:"Alpha One" artist:"Alpha Artist" album:"Alpha Album"': (
+                        SpotifyTrackCandidate(
+                            uri="spotify:track:alpha",
+                            name="Alpha One",
+                            artists=("Alpha Artist",),
+                            album_name="Alpha Album",
+                        ),
+                    ),
+                },
+                playlists=(
+                    SpotifyPlaylist(
+                        playlist_id="playlist-house",
+                        name="Discogs - House",
+                        url="",
+                        owner_id="current-user",
+                        public=False,
+                    ),
+                ),
+            )
+
+            summary = publish_spotify_playlists(
+                playlist_output_directory=playlist_directory,
+                report_path=report_path,
+                spotify_client=client,
+                access_token="access-token",
+                match_cache_path=directory / "collection" / "cache" / "matches.json",
+                publisher_config=PublisherConfig(
+                    default_publisher="spotify",
+                    playlist_prefix="Discogs - ",
+                    playlist_suffix="",
+                ),
+                apply=False,
+                publisher_sync_mode="replace",
+            )
+            report_text = report_path.read_text(encoding="utf-8")
+
+        self.assertEqual(summary.run_status, "complete")
+        self.assertEqual(summary.would_include_count, 1)
+        self.assertEqual(summary.unmatched_count, 1)
+        self.assertEqual(client.replace_calls, [])
+        self.assertEqual(client.add_calls, [])
+        self.assertIn("Run status: complete", report_text)
 
     def test_append_allows_same_artist_and_track_on_different_albums(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -4679,7 +5036,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertEqual(summary.decisions[0].target_playlist_name, "Friday/Picks")
         self.assertEqual(client.created_playlists, [])
 
-    def test_publish_uses_discogs_prefix_when_config_is_omitted(self):
+    def test_publish_uses_empty_affixes_when_config_is_omitted(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
             playlist_directory = directory / "collection" / "playlists"
@@ -4711,7 +5068,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
                 publisher_sync_mode="append",
             )
 
-        self.assertEqual(client.created_playlists, [("Discogs - House", False, "Generated from Discogs collection")])
+        self.assertEqual(client.created_playlists, [("House", False, "Generated from Discogs collection")])
 
     def test_publish_failure_after_partial_write_leaves_durable_report(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -4899,6 +5256,12 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
 
         self.assertEqual(client.replace_calls, [])
         self.assertEqual(client.add_calls, [])
+        self.assertIn(
+            "Run status: replace mode aborted before writing because not every source row resolved "
+            "to a publishable Spotify URI (error=1)",
+            report_text,
+        )
+        self.assertNotIn("Run status: complete", report_text)
         self.assertIn("Search errors: 1", report_text)
         self.assertIn("Discogs - House | 222 | 1 | Beta Artist | Beta One | error | no Spotify URI", report_text)
 

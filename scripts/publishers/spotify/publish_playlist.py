@@ -716,6 +716,12 @@ def publish_spotify_playlists(
     save_spotify_track_match_cache(match_cache_path, match_cache)
     if apply and publisher_sync_mode == APPEND_SYNC_MODE:
         save_spotify_publish_state(resolved_publish_state_cache_path, publish_state)
+    replace_validation_error: ValueError | None = None
+    if apply and not (publisher_sync_mode == APPEND_SYNC_MODE):
+        try:
+            validate_replace_apply_decisions(tuple(decisions), publisher_sync_mode)
+        except ValueError as error:
+            replace_validation_error = error
     summary = write_publish_summary(
         decisions=tuple(decisions),
         final_items=tuple(reindex_final_items(final_items)),
@@ -726,9 +732,11 @@ def publish_spotify_playlists(
         cache_hit_count=cache_hit_count,
         search_count=search_count,
         searched_row_count=searched_row_count,
+        run_status=str(replace_validation_error) if replace_validation_error else "complete",
     )
+    if replace_validation_error is not None:
+        raise replace_validation_error
     if apply and not (publisher_sync_mode == APPEND_SYNC_MODE):
-        validate_replace_apply_decisions(tuple(decisions), publisher_sync_mode)
         applied_decisions, applied_final_items, applied_playlist_contexts, spotify_playlists = apply_planned_playlist_writes(
             spotify_client=write_client,
             access_token=access_token,
@@ -1271,7 +1279,7 @@ def build_publish_decision(
             search_queries=decision.search_queries,
         )
     identity_key = track_match_decision_identity_key(target_playlist_name, decision)
-    if identity_key in seen_source_identity_keys:
+    if publisher_sync_mode == APPEND_SYNC_MODE and identity_key in seen_source_identity_keys:
         status = DUPLICATE_IN_SOURCE
         reason = "Spotify artist, album, and track already planned from an earlier local row"
     elif publisher_sync_mode == APPEND_SYNC_MODE and identity_key in existing_identity_keys:

@@ -13,6 +13,7 @@ from shared.publisher_config import (  # noqa: E402
     DEFAULT_PUBLISHER_CONFIG_PATH,
     NON_PUBLISHING_PUBLISHERS,
     PublisherConfig,
+    configured_release_publisher_config,
     load_or_create_publisher_config,
     publisher_local_name_from_target,
     publisher_playlist_name,
@@ -22,24 +23,73 @@ from shared.publisher_config import (  # noqa: E402
 
 
 class PublisherConfigTests(unittest.TestCase):
-    def test_missing_config_is_created_with_safe_defaults(self):
+    def test_missing_config_is_created_with_empty_affix_defaults(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "config" / "publisher.json"
 
             config = load_or_create_publisher_config(path)
 
+            self.assertEqual(config.playlist_prefix, "")
+            self.assertEqual(config.playlist_suffix, "")
+            self.assertEqual(config.release_playlists_prefix, "")
+            self.assertEqual(config.release_playlists_suffix, "")
+            self.assertEqual(publisher_playlist_name("House", config), "House")
             self.assertEqual(
-                config,
-                PublisherConfig(
-                    default_publisher="none",
-                    playlist_prefix="Discogs - ",
-                    playlist_suffix="",
-                ),
+                json.loads(path.read_text(encoding="utf-8")),
+                {
+                    "default_publisher": "none",
+                    "playlist_prefix": "",
+                    "playlist_suffix": "",
+                    "release_playlists_prefix": "",
+                    "release_playlists_suffix": "",
+                },
             )
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(payload["default_publisher"], "none")
-            self.assertEqual(payload["playlist_prefix"], "Discogs - ")
             self.assertEqual(DEFAULT_PUBLISHER_CONFIG_PATH, Path("config/publisher.json"))
+
+    def test_omitted_playlist_prefix_uses_empty_normal_target_and_preserves_release_affixes(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "publisher.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "default_publisher": "spotify",
+                        "playlist_suffix": " Archive",
+                        "release_playlists_prefix": "Selected - ",
+                        "release_playlists_suffix": " Picks",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_or_create_publisher_config(path)
+
+        self.assertEqual(config.playlist_prefix, "")
+        self.assertEqual(config.playlist_suffix, " Archive")
+        self.assertEqual(publisher_playlist_name("House", config), "House Archive")
+        self.assertEqual(
+            publisher_playlist_name("Friday", configured_release_publisher_config(config)),
+            "Selected - Friday Picks",
+        )
+        self.assertEqual(
+            publisher_playlist_name(
+                "House",
+                PublisherConfig(default_publisher="spotify", playlist_prefix="", playlist_suffix=""),
+            ),
+            "House",
+        )
+
+    def test_projects_release_affixes_for_existing_publisher(self):
+        config = PublisherConfig(
+            default_publisher="spotify",
+            playlist_prefix="Discogs - ",
+            playlist_suffix=" Archive",
+            release_playlists_prefix="Selected - ",
+            release_playlists_suffix=" Picks",
+        )
+
+        projected = configured_release_publisher_config(config)
+
+        self.assertEqual(publisher_playlist_name("Friday", projected), "Selected - Friday Picks")
 
     def test_loads_custom_valid_config(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

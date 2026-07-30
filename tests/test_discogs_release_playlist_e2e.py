@@ -225,6 +225,7 @@ def spotify_publish_summary_stub(report_path: Path) -> SimpleNamespace:
         track_count=2,
         cache_hit_count=0,
         search_count=0,
+        searched_row_count=0,
         matched_count=0,
         already_present_count=0,
         would_add_count=0,
@@ -282,6 +283,12 @@ def make_collection_args(
         str(reports_dir / f"{run_name}-playlists.txt"),
         "--split-report",
         str(reports_dir / f"{run_name}-splits.txt"),
+        "--release-playlist-report",
+        str(reports_dir / f"{run_name}-release-playlists.txt"),
+        "--release-split-report",
+        str(reports_dir / f"{run_name}-release-splits.txt"),
+        "--release-publisher-report",
+        str(reports_dir / f"{run_name}-release-publisher.txt"),
         "--no-seen-terms",
         "--no-progress",
         "--timeout-seconds",
@@ -683,6 +690,244 @@ class DiscogsReleasePlaylistE2ETests(unittest.TestCase):
             self.assertIn(str(publisher_config_path), publisher_args)
             self.assertIn("--publishing-dry-run", publisher_args)
             self.assertIn("--no-progress", publisher_args)
+            self.assertEqual(unexpected_urls, [])
+
+    def test_combined_workflow_manages_configured_release_playlist_lifecycle_in_isolation(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            collection_dir = directory / "collection"
+            export_dir = directory / "exports"
+            reports_dir = directory / "reports"
+            config_dir = directory / "config"
+            master_path = collection_dir / "enriched-collection.csv"
+            playlist_output_dir = collection_dir / "playlists"
+            configured_output_dir = playlist_output_dir / "release-playlists"
+            on_the_fly_dir = playlist_output_dir / "on-the-fly"
+            enrichment_cache_path = collection_dir / "cache" / "processing.cache.json"
+            tracklist_cache_path = collection_dir / "cache" / "playlist-tracks.cache.json"
+            playlist_config_path = config_dir / "playlist-map.json"
+            workflow_config_path = config_dir / "workflow.json"
+            publisher_config_path = config_dir / "publisher.json"
+            requested_urls: list[str] = []
+            unexpected_urls: list[str] = []
+            publisher_calls: list[dict[str, object]] = []
+            payloads = {
+                "111": discogs_release_payload(
+                    "111",
+                    styles=["House"],
+                    tracklist=[discogs_track("111", "A1")],
+                ),
+                "222": discogs_release_payload(
+                    "222",
+                    styles=["Techno"],
+                    tracklist=[
+                        discogs_track("222", "A1"),
+                        discogs_track("222", "A2"),
+                    ],
+                ),
+                "333": discogs_release_payload(
+                    "333",
+                    styles=["Techno"],
+                    tracklist=[discogs_track("333", "A1")],
+                ),
+            }
+
+            write_json(
+                workflow_config_path,
+                {
+                    "max_rows_per_split": 2,
+                    "keep_release_tracks_together": True,
+                    "create_new_split_files_for_new_releases": False,
+                },
+            )
+            write_json(
+                publisher_config_path,
+                {
+                    "default_publisher": "spotify",
+                    "playlist_prefix": "Mapped - ",
+                    "playlist_suffix": "",
+                    "release_playlists_prefix": "Release - ",
+                    "release_playlists_suffix": "",
+                },
+            )
+            export_path = export_dir / "collection.csv"
+            write_discogs_export(export_path, ("111", "333"))
+
+            def record_publish(args, **kwargs):
+                from shared.playlist_selection import resolve_playlist_master_paths
+
+                exact_master_paths = kwargs.get("playlist_master_paths")
+                selected_master_paths = (
+                    tuple(exact_master_paths)
+                    if exact_master_paths is not None
+                    else resolve_playlist_master_paths(args.playlist_output_dir)
+                )
+                publisher_calls.append(
+                    {
+                        "selected_master_paths": selected_master_paths,
+                        "playlist_names_by_master_path": kwargs.get("playlist_names_by_master_path"),
+                        "publisher_sync_mode": args.publisher_sync_mode,
+                        "dry_run": args.dry_run,
+                        "release_ids": tuple(
+                            release_id
+                            for selected_path in selected_master_paths
+                            for release_id in release_ids_from_csv(selected_path, "Release Id")
+                        ),
+                    }
+                )
+                return spotify_publish_summary_stub(args.report)
+
+            def run_combined_workflow(run_name: str) -> int:
+                return make_playlists.main(
+                    make_collection_args(
+                        export_path=export_path,
+                        master_path=master_path,
+                        playlist_config_path=playlist_config_path,
+                        workflow_config_path=workflow_config_path,
+                        playlist_output_dir=playlist_output_dir,
+                        enrichment_cache_path=enrichment_cache_path,
+                        tracklist_cache_path=tracklist_cache_path,
+                        reports_dir=reports_dir,
+                        run_name=run_name,
+                        publisher="spotify",
+                        publisher_config_path=publisher_config_path,
+                        publishing_dry_run=True,
+                        max_rows=2,
+                    )
+                )
+
+            write_json(
+                playlist_config_path,
+                {
+                    "excluded_terms": ["Electronic"],
+                    "playlists": {"House": ["House"]},
+                    "release_playlists": {"Friday Picks": ["222", "111"]},
+                },
+            )
+            with (
+                patched_discogs(payloads, requested_urls, unexpected_urls),
+                patch.object(
+                    spotify_publisher,
+                    "run_spotify_publish_from_args",
+                    side_effect=record_publish,
+                ),
+                patch("sys.stdout", new_callable=io.StringIO),
+                patch("sys.stderr", new_callable=io.StringIO) as first_stderr,
+            ):
+                first_exit_code = run_combined_workflow("configured-first")
+
+            house_master_path = playlist_output_dir / "House" / "House.csv"
+            configured_master_path = configured_output_dir / "Friday Picks" / "Friday Picks.csv"
+            configured_splits_dir = configured_master_path.parent / "splits"
+            master_rows = read_csv_rows(master_path)
+            self.assertEqual(first_exit_code, 0, first_stderr.getvalue())
+            self.assertEqual([row["release_id"] for row in master_rows], ["111", "333"])
+            self.assertEqual([row["Playlists"] for row in master_rows], ["House", ""])
+            self.assertEqual(release_ids_from_csv(house_master_path, "Release Id"), ["111"])
+            self.assertEqual(release_ids_from_csv(configured_master_path, "Release Id"), ["222", "222", "111"])
+            self.assertEqual(
+                [row["Track Name"] for row in read_csv_rows(configured_master_path)],
+                ["Track 222 A1", "Track 222 A2", "Track 111 A1"],
+            )
+            self.assertEqual(
+                release_ids_from_csv(configured_splits_dir / "1-2.csv", "Release Id"),
+                ["222", "222"],
+            )
+            self.assertEqual(
+                release_ids_from_csv(configured_splits_dir / "3-3.csv", "Release Id"),
+                ["111"],
+            )
+            self.assertFalse(on_the_fly_dir.exists())
+            self.assertEqual(cache_record_ids(tracklist_cache_path), ["111", "222"])
+            self.assertEqual(len(publisher_calls), 2)
+            self.assertEqual(publisher_calls[0]["selected_master_paths"], (configured_master_path,))
+            self.assertEqual(
+                publisher_calls[0]["playlist_names_by_master_path"],
+                {configured_master_path: "Friday Picks"},
+            )
+            self.assertEqual(publisher_calls[0]["publisher_sync_mode"], "replace")
+            self.assertTrue(publisher_calls[0]["dry_run"])
+            self.assertEqual(publisher_calls[0]["release_ids"], ("222", "222", "111"))
+            self.assertEqual(publisher_calls[1]["selected_master_paths"], (house_master_path,))
+            self.assertEqual(publisher_calls[1]["release_ids"], ("111",))
+            request_count_after_first_run = len(requested_urls)
+
+            write_json(
+                playlist_config_path,
+                {
+                    "excluded_terms": ["Electronic"],
+                    "playlists": {"House": ["House"]},
+                    "release_playlists": {"Friday Picks": ["333"]},
+                },
+            )
+            with (
+                patched_discogs(
+                    payloads,
+                    requested_urls,
+                    unexpected_urls,
+                    blocked_release_ids={"111", "222"},
+                ),
+                patch.object(
+                    spotify_publisher,
+                    "run_spotify_publish_from_args",
+                    side_effect=record_publish,
+                ),
+                patch("sys.stdout", new_callable=io.StringIO),
+                patch("sys.stderr", new_callable=io.StringIO) as second_stderr,
+            ):
+                second_exit_code = run_combined_workflow("configured-second")
+
+            self.assertEqual(second_exit_code, 0, second_stderr.getvalue())
+            self.assertEqual(release_ids_from_csv(master_path, "release_id"), ["111", "333"])
+            self.assertEqual(release_ids_from_csv(configured_master_path, "Release Id"), ["333"])
+            self.assertEqual(release_ids_from_csv(configured_splits_dir / "1-1.csv", "Release Id"), ["333"])
+            self.assertFalse((configured_splits_dir / "1-2.csv").exists())
+            self.assertFalse((configured_splits_dir / "3-3.csv").exists())
+            self.assertEqual(cache_record_ids(tracklist_cache_path), ["111", "222", "333"])
+            self.assertEqual(len(requested_urls), request_count_after_first_run + 1)
+            self.assertTrue(requested_urls[-1].endswith("/releases/333"))
+            self.assertEqual(len(publisher_calls), 4)
+            self.assertEqual(publisher_calls[2]["selected_master_paths"], (configured_master_path,))
+            self.assertEqual(publisher_calls[2]["publisher_sync_mode"], "replace")
+            self.assertEqual(publisher_calls[2]["release_ids"], ("333",))
+            self.assertEqual(publisher_calls[3]["selected_master_paths"], (house_master_path,))
+            self.assertFalse(on_the_fly_dir.exists())
+
+            write_json(
+                playlist_config_path,
+                {
+                    "excluded_terms": ["Electronic"],
+                    "playlists": {"House": ["House"]},
+                },
+            )
+            with (
+                patched_discogs(
+                    payloads,
+                    requested_urls,
+                    unexpected_urls,
+                    blocked_release_ids={"111", "222", "333"},
+                ),
+                patch.object(
+                    spotify_publisher,
+                    "run_spotify_publish_from_args",
+                    side_effect=record_publish,
+                ),
+                patch("sys.stdout", new_callable=io.StringIO),
+                patch("sys.stderr", new_callable=io.StringIO) as third_stderr,
+            ):
+                third_exit_code = run_combined_workflow("configured-third")
+
+            self.assertEqual(third_exit_code, 0, third_stderr.getvalue())
+            self.assertFalse(configured_master_path.parent.exists())
+            self.assertEqual(len(publisher_calls), 5)
+            self.assertEqual(publisher_calls[4]["selected_master_paths"], (house_master_path,))
+            self.assertEqual(publisher_calls[4]["release_ids"], ("111",))
+            self.assertEqual(len(requested_urls), request_count_after_first_run + 1)
+            self.assertFalse(on_the_fly_dir.exists())
+            self.assertIn(
+                "Deleted folders: 1",
+                (reports_dir / "configured-third-release-playlists.txt").read_text(encoding="utf-8"),
+            )
             self.assertEqual(unexpected_urls, [])
 
     def test_collection_workflow_stops_after_mapper_failure_without_export_split_or_publish(self):
