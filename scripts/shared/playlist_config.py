@@ -41,8 +41,6 @@ def blank_playlist_config_payload() -> dict[str, object]:
 
 
 def normalize_configured_release_playlists(value: object) -> tuple[ConfiguredReleasePlaylist, ...]:
-    if value is None:
-        return ()
     if not isinstance(value, Mapping):
         raise ValueError("release_playlists must be an object")
 
@@ -141,7 +139,7 @@ def normalize_playlist_config(payload: object) -> PlaylistConfig:
         playlist_labels=tuple(playlist_labels),
         raw_aliases_by_label=raw_aliases_by_label,
         alias_keys_by_label=alias_keys_by_label,
-        release_playlists=normalize_configured_release_playlists(payload.get("release_playlists")),
+        release_playlists=normalize_configured_release_playlists(payload.get("release_playlists", {})),
     )
 
 

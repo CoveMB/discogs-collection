@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from helpers import read_csv_text, sample_playlist_config as sample_config, write_json
+from tests.helpers import read_csv_text, sample_playlist_config as sample_config, write_json
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +17,26 @@ import discogs_playlist_mapper as mapper  # noqa: E402
 
 
 class PlaylistMapperTests(unittest.TestCase):
+    def test_release_playlists_distinguishes_omitted_null_and_empty_object(self):
+        omitted_payload: dict[str, object] = dict(sample_config())
+        del omitted_payload["release_playlists"]
+        empty_payload: dict[str, object] = dict(sample_config())
+        empty_payload["release_playlists"] = {}
+        named_empty_payload: dict[str, object] = dict(sample_config())
+        named_empty_payload["release_playlists"] = {"Clear This Playlist": []}
+        null_payload: dict[str, object] = dict(sample_config())
+        null_payload["release_playlists"] = None
+
+        self.assertEqual(mapper.normalize_playlist_config(omitted_payload).release_playlists, ())
+        self.assertEqual(mapper.normalize_playlist_config(empty_payload).release_playlists, ())
+        named_empty_definitions = mapper.normalize_playlist_config(named_empty_payload).release_playlists
+        self.assertEqual(
+            [(definition.name, definition.release_ids) for definition in named_empty_definitions],
+            [("Clear This Playlist", ())],
+        )
+        with self.assertRaisesRegex(ValueError, "release_playlists must be an object"):
+            mapper.normalize_playlist_config(null_payload)
+
     def test_legacy_config_defaults_to_no_release_playlists(self):
         payload: dict[str, object] = dict(sample_config())
         del payload["release_playlists"]

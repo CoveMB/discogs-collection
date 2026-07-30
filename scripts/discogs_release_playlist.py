@@ -663,6 +663,8 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         args.output_dir = args.output_dir or DEFAULT_CONFIGURED_RELEASE_PLAYLIST_DIRECTORY
         args.publisher_sync_mode = spotify_publisher.REPLACE_SYNC_MODE
         return
+    if args.max_rows is not None:
+        parser.error("--max-rows requires --from-config")
     if not args.name:
         parser.error("--name is required unless --from-config is used")
     if not args.release_ids and args.release_ids_file is None:

@@ -22,6 +22,12 @@ from shared.playlist_config import (  # noqa: E402
     PlaylistConfig,
 )
 from shared.publisher_config import PublisherConfig  # noqa: E402
+from shared.release_playlist_metadata import (  # noqa: E402
+    CONFIGURED_RELEASE_PLAYLIST_RECORD_TYPE,
+    RELEASE_PLAYLIST_METADATA_FILENAME,
+    ReleasePlaylistMetadata,
+    write_release_playlist_metadata,
+)
 from shared.playlist_selection import resolve_all_playlist_master_paths  # noqa: E402
 from shared.workflow_config import WorkflowConfig  # noqa: E402
 
@@ -223,6 +229,17 @@ class DiscogsReleasePlaylistTests(unittest.TestCase):
         self.assertFalse(getattr(args, "from_config", False))
         self.assertEqual(args.output_dir, Path("collection/playlists/on-the-fly"))
         self.assertEqual(args.publisher_sync_mode, "append")
+
+    def test_ad_hoc_mode_rejects_configured_max_rows_option(self):
+        stderr = io.StringIO()
+
+        with patch("sys.stderr", stderr), self.assertRaises(SystemExit) as exit_context:
+            release_playlist.parse_args(
+                ["--name", "Friday Picks", "--max-rows", "25", "111"]
+            )
+
+        self.assertEqual(exit_context.exception.code, 2)
+        self.assertIn("--max-rows requires --from-config", stderr.getvalue())
 
     def test_from_config_accepts_configured_paths_and_uses_distinct_default_reports(self):
         try:
@@ -431,6 +448,60 @@ class DiscogsReleasePlaylistTests(unittest.TestCase):
             report_text = report_path.read_text(encoding="utf-8")
             self.assertIn("Configured release playlist generation failure report", report_text)
             self.assertIn("playlist map", report_text)
+
+    def test_explicit_null_release_playlists_fails_before_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            config_path = directory / "playlist-map.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "excluded_terms": [],
+                        "playlists": {},
+                        "release_playlists": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output_directory = directory / "release-playlists"
+            stale_folder_path = output_directory / "Old Picks"
+            metadata_path = stale_folder_path / RELEASE_PLAYLIST_METADATA_FILENAME
+            write_release_playlist_metadata(
+                metadata_path,
+                ReleasePlaylistMetadata(
+                    schema_version=1,
+                    record_type=CONFIGURED_RELEASE_PLAYLIST_RECORD_TYPE,
+                    playlist_name="Old Picks",
+                ),
+            )
+            report_path = directory / "configured-report.txt"
+            args = release_playlist.parse_args(
+                [
+                    "--from-config",
+                    "--publisher",
+                    "none",
+                    "--config",
+                    str(config_path),
+                    "--output-dir",
+                    str(output_directory),
+                    "--report",
+                    str(report_path),
+                ]
+            )
+
+            with patch(
+                "discogs_release_playlist.tracklists.make_cached_tracklist_lookup"
+            ) as make_lookup:
+                with self.assertRaisesRegex(ValueError, "release_playlists must be an object"):
+                    run_configured(args)
+
+            make_lookup.assert_not_called()
+            self.assertTrue(stale_folder_path.is_dir())
+            self.assertTrue(metadata_path.is_file())
+            self.assertIn(
+                "Error: ValueError: release_playlists must be an object",
+                report_path.read_text(encoding="utf-8"),
+            )
 
     def test_configured_workflow_and_publisher_config_failures_write_reports(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

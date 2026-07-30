@@ -33,6 +33,7 @@ class PublisherConfigTests(unittest.TestCase):
             self.assertEqual(config.playlist_suffix, "")
             self.assertEqual(config.release_playlists_prefix, "")
             self.assertEqual(config.release_playlists_suffix, "")
+            self.assertEqual(publisher_playlist_name("House", config), "House")
             self.assertEqual(
                 json.loads(path.read_text(encoding="utf-8")),
                 {
@@ -44,6 +45,38 @@ class PublisherConfigTests(unittest.TestCase):
                 },
             )
             self.assertEqual(DEFAULT_PUBLISHER_CONFIG_PATH, Path("config/publisher.json"))
+
+    def test_omitted_playlist_prefix_uses_empty_normal_target_and_preserves_release_affixes(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "publisher.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "default_publisher": "spotify",
+                        "playlist_suffix": " Archive",
+                        "release_playlists_prefix": "Selected - ",
+                        "release_playlists_suffix": " Picks",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = load_or_create_publisher_config(path)
+
+        self.assertEqual(config.playlist_prefix, "")
+        self.assertEqual(config.playlist_suffix, " Archive")
+        self.assertEqual(publisher_playlist_name("House", config), "House Archive")
+        self.assertEqual(
+            publisher_playlist_name("Friday", configured_release_publisher_config(config)),
+            "Selected - Friday Picks",
+        )
+        self.assertEqual(
+            publisher_playlist_name(
+                "House",
+                PublisherConfig(default_publisher="spotify", playlist_prefix="", playlist_suffix=""),
+            ),
+            "House",
+        )
 
     def test_projects_release_affixes_for_existing_publisher(self):
         config = PublisherConfig(

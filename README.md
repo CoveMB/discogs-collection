@@ -245,9 +245,16 @@ workflow when you omit `--publisher`. The Spotify publisher uses
 `playlist_prefix` and `playlist_suffix` for normal mapped playlists, and
 `release_playlists_prefix` and `release_playlists_suffix` for configured release
 playlists. All four values must be strings and default to empty strings when
-omitted. Existing explicit values remain unchanged, so no automatic migration
-is required. With the empty defaults, local `House` publishes to Spotify
-playlist `House` when Spotify publishing is enabled.
+omitted. Existing explicit values remain unchanged.
+
+The empty normal `playlist_prefix` fallback is an intentional compatibility
+change from older versions, which used `"Discogs - "`. After upgrading, a
+missing publisher config or an existing config that omits `playlist_prefix`
+causes local `House` to target Spotify playlist `House` when Spotify publishing
+is enabled; an existing `Discogs - House` playlist is not renamed or migrated.
+To keep the earlier target names, set `"playlist_prefix": "Discogs - "`
+explicitly. Configured release playlist affixes remain independent of this
+normal-playlist setting.
 
 ## Spotify publisher
 
