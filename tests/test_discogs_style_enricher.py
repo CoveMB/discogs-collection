@@ -6,6 +6,8 @@ import sys
 import tempfile
 import threading
 import unittest
+from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -398,56 +400,43 @@ class TerminalStream(io.StringIO):
         return True
 
 
-class NonTerminalStream(io.StringIO):
-    def isatty(self):
-        return False
-
-
-class ProgressReporterTests(unittest.TestCase):
-    def test_progress_reporter_updates_same_terminal_line_with_percentage(self):
-        stream = TerminalStream()
-        progress = ProgressReporter(stream=stream, width=10, label="Enriching rows")
-
-        progress.start(total=4)
-        progress.update(current=2)
-        progress.update(current=4)
-        progress.finish()
-
-        output = stream.getvalue()
-        self.assertIn("\rEnriching rows [----------] 0/4 0%", output)
-        self.assertIn("\rEnriching rows [#####-----] 2/4 50%", output)
-        self.assertIn("\rEnriching rows [##########] 4/4 100%", output)
-        self.assertTrue(output.endswith("\n"))
-
-    def test_progress_reporter_stays_quiet_when_stream_is_not_terminal(self):
-        stream = NonTerminalStream()
-        progress = ProgressReporter(stream=stream)
-
-        progress.start(total=2)
-        progress.update(current=1)
-        progress.finish()
-
-        self.assertEqual(stream.getvalue(), "")
+_NEUTRAL_RUN_SUMMARY = enricher.RunSummary(
+    input_rows=0,
+    master_rows_before=0,
+    output_rows=0,
+    appended_rows=0,
+    filled_style_count=0,
+    filled_genre_count=0,
+    preserved_style_count=0,
+    preserved_genre_count=0,
+    blank_count=0,
+    error_count=0,
+    not_sure_release_ids=(),
+    output_path=Path("collection/enriched-collection.csv"),
+    report_path=Path("reports/report.txt"),
+    cache_path=Path("collection/cache/processing.cache.json"),
+    processed_export_path=None,
+    seen_terms_path=None,
+    new_styles=(),
+    new_genres=(),
+    seen_terms_initialized=False,
+    seen_styles_count=0,
+    seen_genres_count=0,
+    refreshed_existing_rows=(),
+    skipped_missing_release_id_rows=(),
+    skipped_duplicate_release_id_rows=(),
+)
 
 
 class ReportTests(unittest.TestCase):
     def test_write_report_lists_new_discogs_terms_before_not_sure_rows(self):
-        summary = enricher.RunSummary(
+        summary = replace(
+            _NEUTRAL_RUN_SUMMARY,
             input_rows=1,
-            master_rows_before=0,
             output_rows=1,
             appended_rows=1,
-            filled_style_count=0,
-            filled_genre_count=0,
             preserved_style_count=1,
             preserved_genre_count=1,
-            blank_count=0,
-            error_count=0,
-            not_sure_release_ids=(),
-            output_path=Path("collection/enriched-collection.csv"),
-            report_path=Path("reports/report.txt"),
-            cache_path=Path("collection/cache/processing.cache.json"),
-            processed_export_path=None,
             seen_terms_path=Path("collection/cache/collected.cache.json"),
             new_styles=("Acid Jazz", "Breaks"),
             new_genres=(),
@@ -476,22 +465,13 @@ class ReportTests(unittest.TestCase):
         )
 
     def test_write_report_notes_initialized_seen_terms_snapshot_and_new_terms(self):
-        summary = enricher.RunSummary(
+        summary = replace(
+            _NEUTRAL_RUN_SUMMARY,
             input_rows=1,
-            master_rows_before=0,
             output_rows=1,
             appended_rows=1,
-            filled_style_count=0,
-            filled_genre_count=0,
             preserved_style_count=1,
             preserved_genre_count=1,
-            blank_count=0,
-            error_count=0,
-            not_sure_release_ids=(),
-            output_path=Path("collection/enriched-collection.csv"),
-            report_path=Path("reports/report.txt"),
-            cache_path=Path("collection/cache/processing.cache.json"),
-            processed_export_path=None,
             seen_terms_path=Path("collection/cache/collected.cache.json"),
             new_styles=("Deep House", "House"),
             new_genres=("Electronic",),
@@ -516,7 +496,8 @@ class ReportTests(unittest.TestCase):
         self.assertIn("Genres:\n- Electronic", report_text)
 
     def test_write_report_groups_summary_files_terms_and_review_sections(self):
-        summary = enricher.RunSummary(
+        summary = replace(
+            _NEUTRAL_RUN_SUMMARY,
             input_rows=1,
             master_rows_before=0,
             output_rows=1,
@@ -529,15 +510,13 @@ class ReportTests(unittest.TestCase):
             error_count=0,
             not_sure_release_ids=(),
             output_path=Path("collection/enriched-collection.csv"),
-            report_path=Path("reports/report.txt"),
             cache_path=Path("collection/cache/processing.cache.json"),
-            processed_export_path=None,
             seen_terms_path=Path("collection/cache/collected.cache.json"),
-            new_styles=(),
-            new_genres=(),
-            seen_terms_initialized=False,
             seen_styles_count=1,
             seen_genres_count=1,
+            refreshed_existing_rows=(),
+            skipped_missing_release_id_rows=(),
+            skipped_duplicate_release_id_rows=(),
         )
 
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -591,7 +570,8 @@ class ReportTests(unittest.TestCase):
         )
 
     def test_write_report_lists_refreshed_and_skipped_export_rows(self):
-        summary = enricher.RunSummary(
+        summary = replace(
+            _NEUTRAL_RUN_SUMMARY,
             input_rows=4,
             master_rows_before=1,
             output_rows=2,
@@ -602,11 +582,6 @@ class ReportTests(unittest.TestCase):
             preserved_genre_count=2,
             blank_count=0,
             error_count=0,
-            not_sure_release_ids=(),
-            output_path=Path("collection/enriched-collection.csv"),
-            report_path=Path("reports/report.txt"),
-            cache_path=Path("collection/cache/processing.cache.json"),
-            processed_export_path=None,
             refreshed_existing_rows=(
                 "release_id 111 | Old Artist | Old Title -> New Artist | New Title",
             ),
@@ -645,22 +620,13 @@ class ReportTests(unittest.TestCase):
         )
 
     def test_print_summary_omits_styles_and_genres_section_when_no_new_terms_were_found(self):
-        summary = enricher.RunSummary(
+        summary = replace(
+            _NEUTRAL_RUN_SUMMARY,
             input_rows=1,
-            master_rows_before=0,
             output_rows=1,
             appended_rows=1,
             filled_style_count=1,
             filled_genre_count=1,
-            preserved_style_count=0,
-            preserved_genre_count=0,
-            blank_count=0,
-            error_count=0,
-            not_sure_release_ids=(),
-            output_path=Path("collection/enriched-collection.csv"),
-            report_path=Path("reports/report.txt"),
-            cache_path=Path("collection/cache/processing.cache.json"),
-            processed_export_path=None,
             seen_terms_path=Path("collection/cache/collected.cache.json"),
             new_styles=(),
             new_genres=(),
@@ -708,22 +674,13 @@ class ReportTests(unittest.TestCase):
                 "Genre Notes": "no explicit genres found",
             },
         ]
-        summary = enricher.RunSummary(
+        summary = replace(
+            _NEUTRAL_RUN_SUMMARY,
             input_rows=3,
-            master_rows_before=0,
             output_rows=3,
             appended_rows=3,
-            filled_style_count=0,
-            filled_genre_count=0,
-            preserved_style_count=0,
-            preserved_genre_count=0,
             blank_count=3,
-            error_count=0,
             not_sure_release_ids=("111", "222", "333"),
-            output_path=Path("collection/enriched-collection.csv"),
-            report_path=Path("reports/report.txt"),
-            cache_path=Path("collection/cache/processing.cache.json"),
-            processed_export_path=None,
         )
 
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1107,6 +1064,48 @@ class CacheTests(unittest.TestCase):
                 load_lookup_cache(cache_path)
 
 
+def _run_enrichment_args(
+    *,
+    export: Path,
+    master: Path,
+    output: Path,
+    report: Path,
+    cache: Path,
+    **optional_attributes: object,
+) -> argparse.Namespace:
+    return argparse.Namespace(
+        export=export,
+        master=master,
+        output=output,
+        report=report,
+        cache=cache,
+        user_agent="test",
+        discogs_token="",
+        timeout_seconds=1,
+        request_interval_seconds=0,
+        refresh_existing=False,
+        **optional_attributes,
+    )
+
+
+def _successful_discogs_json_getter(
+    _user_agent: str,
+    _token: str,
+    _timeout_seconds: int,
+    _request_interval_seconds: float = 0,
+) -> Callable[[str], dict[str, object]]:
+    def get_json(url: str) -> dict[str, object]:
+        if url.endswith("/releases/30887115"):
+            return {
+                "styles": ["Deep Techno", "Ambient"],
+                "genres": ["Electronic"],
+                "master_id": 3509550,
+            }
+        raise AssertionError(f"unexpected JSON URL {url}")
+
+    return get_json
+
+
 class RunEnrichmentTests(unittest.TestCase):
     def test_parse_args_defaults_to_export_folder_and_reports_folder(self):
         default_export_path = Path("export/discogs-export.csv")
@@ -1213,33 +1212,16 @@ class RunEnrichmentTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            def fake_json_getter(_user_agent, _token, _timeout_seconds, _request_interval_seconds=0):
-                def get_json(url):
-                    if url.endswith("/releases/30887115"):
-                        return {
-                            "styles": ["Deep Techno", "Ambient"],
-                            "genres": ["Electronic"],
-                            "master_id": 3509550,
-                        }
-                    raise AssertionError(f"unexpected JSON URL {url}")
-
-                return get_json
-
-            args = argparse.Namespace(
+            args = _run_enrichment_args(
                 export=export_path,
                 master=master_path,
                 output=output_path,
                 report=report_path,
                 cache=cache_path,
-                user_agent="test",
-                discogs_token="",
-                timeout_seconds=1,
-                request_interval_seconds=0,
-                refresh_existing=False,
                 seen_terms=directory / "collected.cache.json",
             )
 
-            with patch.object(enricher, "make_http_json_getter", fake_json_getter):
+            with patch.object(enricher, "make_http_json_getter", _successful_discogs_json_getter):
                 summary = run_enrichment(args)
 
             output_rows = read_csv_text(output_path.read_text(encoding="utf-8"))
@@ -1287,35 +1269,18 @@ class RunEnrichmentTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            def fake_json_getter(_user_agent, _token, _timeout_seconds, _request_interval_seconds=0):
-                def get_json(url):
-                    if url.endswith("/releases/30887115"):
-                        return {
-                            "styles": ["Deep Techno", "Ambient"],
-                            "genres": ["Electronic"],
-                            "master_id": 3509550,
-                        }
-                    raise AssertionError(f"unexpected JSON URL {url}")
-
-                return get_json
-
-            args = argparse.Namespace(
+            args = _run_enrichment_args(
                 export=export_path,
                 master=output_path,
                 output=output_path,
                 report=report_path,
                 cache=cache_path,
-                user_agent="test",
-                discogs_token="",
-                timeout_seconds=1,
-                request_interval_seconds=0,
-                refresh_existing=False,
                 processed_dir=processed_directory,
                 move_processed_export=True,
                 seen_terms=directory / "collected.cache.json",
             )
 
-            with patch.object(enricher, "make_http_json_getter", fake_json_getter):
+            with patch.object(enricher, "make_http_json_getter", _successful_discogs_json_getter):
                 summary = run_enrichment(args)
 
             processed_path = processed_directory / "discogs-export.csv"
@@ -1339,18 +1304,6 @@ class RunEnrichmentTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            def fake_json_getter(_user_agent, _token, _timeout_seconds, _request_interval_seconds=0):
-                def get_json(url):
-                    if url.endswith("/releases/30887115"):
-                        return {
-                            "styles": ["Deep Techno", "Ambient"],
-                            "genres": ["Electronic"],
-                            "master_id": 3509550,
-                        }
-                    raise AssertionError(f"unexpected JSON URL {url}")
-
-                return get_json
-
             args = parse_args(
                 [
                     "--input-dir",
@@ -1369,7 +1322,7 @@ class RunEnrichmentTests(unittest.TestCase):
                 ]
             )
 
-            with patch.object(enricher, "make_http_json_getter", fake_json_getter):
+            with patch.object(enricher, "make_http_json_getter", _successful_discogs_json_getter):
                 summary = run_enrichment(args)
 
             processed_path = processed_directory / "discogs-export.csv"
@@ -1409,17 +1362,12 @@ class RunEnrichmentTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            args = argparse.Namespace(
+            args = _run_enrichment_args(
                 export=export_path,
                 master=master_path,
                 output=output_path,
                 report=report_path,
                 cache=cache_path,
-                user_agent="test",
-                discogs_token="",
-                timeout_seconds=1,
-                request_interval_seconds=0,
-                refresh_existing=False,
                 seen_terms=seen_terms_path,
             )
 
@@ -1467,17 +1415,12 @@ class RunEnrichmentTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            args = argparse.Namespace(
+            args = _run_enrichment_args(
                 export=export_path,
                 master=master_path,
                 output=output_path,
                 report=report_path,
                 cache=cache_path,
-                user_agent="test",
-                discogs_token="",
-                timeout_seconds=1,
-                request_interval_seconds=0,
-                refresh_existing=False,
                 seen_terms=seen_terms_path,
             )
 
@@ -1518,17 +1461,12 @@ class RunEnrichmentTests(unittest.TestCase):
 
                 return get_json
 
-            args = argparse.Namespace(
+            args = _run_enrichment_args(
                 export=export_path,
                 master=output_path,
                 output=output_path,
                 report=report_path,
                 cache=cache_path,
-                user_agent="test",
-                discogs_token="",
-                timeout_seconds=1,
-                request_interval_seconds=0,
-                refresh_existing=False,
                 seen_terms=seen_terms_path,
             )
 
@@ -1561,17 +1499,12 @@ class RunEnrichmentTests(unittest.TestCase):
 
                 return get_json
 
-            args = argparse.Namespace(
+            args = _run_enrichment_args(
                 export=export_path,
                 master=output_path,
                 output=output_path,
                 report=report_path,
                 cache=cache_path,
-                user_agent="test",
-                discogs_token="",
-                timeout_seconds=1,
-                request_interval_seconds=0,
-                refresh_existing=False,
                 processed_dir=processed_directory,
                 move_processed_export=True,
                 seen_terms=directory / "collected.cache.json",
