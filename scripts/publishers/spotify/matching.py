@@ -288,6 +288,38 @@ def split_source_artist_names(artist_name: str) -> tuple[str, ...]:
     return parts
 
 
+def _decision_from_candidates(
+    track: PlaylistTrack,
+    candidates: tuple[SpotifyTrackCandidate, ...],
+    search_queries: tuple[str, ...],
+    *,
+    matched_reason: str,
+    ambiguous_reason: str,
+    match_strategy: str = "",
+) -> TrackMatchDecision:
+    candidate = candidates[0]
+    if len(candidates) == 1:
+        return TrackMatchDecision(
+            track=track,
+            status=MATCHED,
+            spotify_uri=candidate.uri,
+            reason=matched_reason,
+            candidate=candidate,
+            review_candidates=(candidate,),
+            search_queries=search_queries,
+            match_strategy=match_strategy,
+        )
+    return TrackMatchDecision(
+        track=track,
+        status=AMBIGUOUS,
+        spotify_uri="",
+        reason=ambiguous_reason,
+        candidate=None,
+        review_candidates=candidates,
+        search_queries=search_queries,
+    )
+
+
 def choose_best_track_match(
     track: PlaylistTrack,
     candidates: tuple[SpotifyTrackCandidate, ...],
@@ -299,101 +331,53 @@ def choose_best_track_match(
 ) -> TrackMatchDecision:
     candidates = deduplicate_spotify_track_candidates(candidates)
     exact_matches = tuple(candidate for candidate in candidates if candidate_matches_track(track, candidate))
-    if len(exact_matches) == 1:
-        return TrackMatchDecision(
-            track=track,
-            status=MATCHED,
-            spotify_uri=exact_matches[0].uri,
-            reason="track, artist, and album matched",
-            candidate=exact_matches[0],
-            review_candidates=(exact_matches[0],),
-            search_queries=search_queries,
-        )
-    if len(exact_matches) > 1:
-        return TrackMatchDecision(
-            track=track,
-            status=AMBIGUOUS,
-            spotify_uri="",
-            reason=f"{len(exact_matches)} candidates matched track, artist, and album",
-            candidate=None,
-            review_candidates=exact_matches,
-            search_queries=search_queries,
+    if exact_matches:
+        return _decision_from_candidates(
+            track,
+            exact_matches,
+            search_queries,
+            matched_reason="track, artist, and album matched",
+            ambiguous_reason=f"{len(exact_matches)} candidates matched track, artist, and album",
         )
 
     title_artist_matches = tuple(candidate for candidate in candidates if candidate_matches_track_and_artist(track, candidate))
-    if len(title_artist_matches) == 1:
-        return TrackMatchDecision(
-            track=track,
-            status=MATCHED,
-            spotify_uri=title_artist_matches[0].uri,
-            reason="track and artist matched; album differed",
-            candidate=title_artist_matches[0],
-            review_candidates=(title_artist_matches[0],),
-            search_queries=search_queries,
-        )
-    if len(title_artist_matches) > 1:
-        return TrackMatchDecision(
-            track=track,
-            status=AMBIGUOUS,
-            spotify_uri="",
-            reason=f"{len(title_artist_matches)} candidates matched track and artist",
-            candidate=None,
-            review_candidates=title_artist_matches,
-            search_queries=search_queries,
+    if title_artist_matches:
+        return _decision_from_candidates(
+            track,
+            title_artist_matches,
+            search_queries,
+            matched_reason="track and artist matched; album differed",
+            ambiguous_reason=f"{len(title_artist_matches)} candidates matched track and artist",
         )
 
     original_mix_album_matches = tuple(
         candidate for candidate in candidates if candidate_matches_original_mix_track(track, candidate)
     )
-    if len(original_mix_album_matches) == 1:
-        return TrackMatchDecision(
-            track=track,
-            status=MATCHED,
-            spotify_uri=original_mix_album_matches[0].uri,
-            reason=f"{ORIGINAL_MIX_MATCH_REASON_PREFIX}; artist and album matched",
-            candidate=original_mix_album_matches[0],
-            review_candidates=(original_mix_album_matches[0],),
-            search_queries=search_queries,
-        )
-    if len(original_mix_album_matches) > 1:
-        return TrackMatchDecision(
-            track=track,
-            status=AMBIGUOUS,
-            spotify_uri="",
-            reason=(
+    if original_mix_album_matches:
+        return _decision_from_candidates(
+            track,
+            original_mix_album_matches,
+            search_queries,
+            matched_reason=f"{ORIGINAL_MIX_MATCH_REASON_PREFIX}; artist and album matched",
+            ambiguous_reason=(
                 f"{len(original_mix_album_matches)} candidates matched after removing source Original Mix annotation, "
                 "artist, and album"
             ),
-            candidate=None,
-            review_candidates=original_mix_album_matches,
-            search_queries=search_queries,
         )
 
     original_mix_artist_matches = tuple(
         candidate for candidate in candidates if candidate_matches_original_mix_track_and_artist(track, candidate)
     )
-    if len(original_mix_artist_matches) == 1:
-        return TrackMatchDecision(
-            track=track,
-            status=MATCHED,
-            spotify_uri=original_mix_artist_matches[0].uri,
-            reason=f"{ORIGINAL_MIX_MATCH_REASON_PREFIX}; artist matched; album differed",
-            candidate=original_mix_artist_matches[0],
-            review_candidates=(original_mix_artist_matches[0],),
-            search_queries=search_queries,
-        )
-    if len(original_mix_artist_matches) > 1:
-        return TrackMatchDecision(
-            track=track,
-            status=AMBIGUOUS,
-            spotify_uri="",
-            reason=(
+    if original_mix_artist_matches:
+        return _decision_from_candidates(
+            track,
+            original_mix_artist_matches,
+            search_queries,
+            matched_reason=f"{ORIGINAL_MIX_MATCH_REASON_PREFIX}; artist matched; album differed",
+            ambiguous_reason=(
                 f"{len(original_mix_artist_matches)} candidates matched after removing source Original Mix annotation "
                 "and matching artist"
             ),
-            candidate=None,
-            review_candidates=original_mix_artist_matches,
-            search_queries=search_queries,
         )
 
     spotify_original_annotation_matches = tuple(
@@ -401,30 +385,17 @@ def choose_best_track_match(
         for candidate in candidates
         if candidate_matches_spotify_original_annotation(track, candidate)
     )
-    if len(spotify_original_annotation_matches) == 1:
-        candidate = spotify_original_annotation_matches[0]
-        return TrackMatchDecision(
-            track=track,
-            status=MATCHED,
-            spotify_uri=candidate.uri,
-            reason=SPOTIFY_ORIGINAL_ANNOTATION_MATCH_REASON,
-            candidate=candidate,
-            review_candidates=(candidate,),
-            search_queries=search_queries,
-            match_strategy=SPOTIFY_ORIGINAL_ANNOTATION_MATCH_STRATEGY,
-        )
-    if len(spotify_original_annotation_matches) > 1:
-        return TrackMatchDecision(
-            track=track,
-            status=AMBIGUOUS,
-            spotify_uri="",
-            reason=(
+    if spotify_original_annotation_matches:
+        return _decision_from_candidates(
+            track,
+            spotify_original_annotation_matches,
+            search_queries,
+            matched_reason=SPOTIFY_ORIGINAL_ANNOTATION_MATCH_REASON,
+            ambiguous_reason=(
                 f"{len(spotify_original_annotation_matches)} candidates matched after removing "
                 "Spotify Original annotation"
             ),
-            candidate=None,
-            review_candidates=spotify_original_annotation_matches,
-            search_queries=search_queries,
+            match_strategy=SPOTIFY_ORIGINAL_ANNOTATION_MATCH_STRATEGY,
         )
 
     featured_credit_reason_prefix = one_sided_featured_credit_match_reason_prefix(track)
@@ -432,28 +403,18 @@ def choose_best_track_match(
     featured_credit_album_matches = tuple(
         candidate for candidate in candidates if candidate_matches_one_sided_featured_credit_track(track, candidate)
     )
-    if len(featured_credit_album_matches) == 1:
-        return TrackMatchDecision(
-            track=track,
-            status=MATCHED,
-            spotify_uri=featured_credit_album_matches[0].uri,
-            reason=f"{featured_credit_reason_prefix}; source artist, featured artist, and album matched",
-            candidate=featured_credit_album_matches[0],
-            review_candidates=(featured_credit_album_matches[0],),
-            search_queries=search_queries,
-        )
-    if len(featured_credit_album_matches) > 1:
-        return TrackMatchDecision(
-            track=track,
-            status=AMBIGUOUS,
-            spotify_uri="",
-            reason=(
+    if featured_credit_album_matches:
+        return _decision_from_candidates(
+            track,
+            featured_credit_album_matches,
+            search_queries,
+            matched_reason=(
+                f"{featured_credit_reason_prefix}; source artist, featured artist, and album matched"
+            ),
+            ambiguous_reason=(
                 f"{len(featured_credit_album_matches)} candidates matched {featured_credit_reason_tail} "
                 "and matching album"
             ),
-            candidate=None,
-            review_candidates=featured_credit_album_matches,
-            search_queries=search_queries,
         )
 
     featured_credit_artist_matches = tuple(
@@ -461,28 +422,18 @@ def choose_best_track_match(
         for candidate in candidates
         if candidate_matches_one_sided_featured_credit_track_and_artist(track, candidate)
     )
-    if len(featured_credit_artist_matches) == 1:
-        return TrackMatchDecision(
-            track=track,
-            status=MATCHED,
-            spotify_uri=featured_credit_artist_matches[0].uri,
-            reason=f"{featured_credit_reason_prefix}; source and featured artists matched; album differed",
-            candidate=featured_credit_artist_matches[0],
-            review_candidates=(featured_credit_artist_matches[0],),
-            search_queries=search_queries,
-        )
-    if len(featured_credit_artist_matches) > 1:
-        return TrackMatchDecision(
-            track=track,
-            status=AMBIGUOUS,
-            spotify_uri="",
-            reason=(
+    if featured_credit_artist_matches:
+        return _decision_from_candidates(
+            track,
+            featured_credit_artist_matches,
+            search_queries,
+            matched_reason=(
+                f"{featured_credit_reason_prefix}; source and featured artists matched; album differed"
+            ),
+            ambiguous_reason=(
                 f"{len(featured_credit_artist_matches)} candidates matched {featured_credit_reason_tail} "
                 "and matching source artist"
             ),
-            candidate=None,
-            review_candidates=featured_credit_artist_matches,
-            search_queries=search_queries,
         )
 
     leading_in_title_matches: tuple[SpotifyTrackCandidate, ...] = ()
@@ -492,28 +443,16 @@ def choose_best_track_match(
             for candidate in candidates
             if candidate_matches_leading_in_title_variant(track, candidate)
         )
-    if len(leading_in_title_matches) == 1:
-        return TrackMatchDecision(
-            track=track,
-            status=MATCHED,
-            spotify_uri=leading_in_title_matches[0].uri,
-            reason=f"{LEADING_IN_TITLE_MATCH_REASON_PREFIX}; artist and album matched",
-            candidate=leading_in_title_matches[0],
-            review_candidates=(leading_in_title_matches[0],),
-            search_queries=search_queries,
-        )
-    if len(leading_in_title_matches) > 1:
-        return TrackMatchDecision(
-            track=track,
-            status=AMBIGUOUS,
-            spotify_uri="",
-            reason=(
+    if leading_in_title_matches:
+        return _decision_from_candidates(
+            track,
+            leading_in_title_matches,
+            search_queries,
+            matched_reason=f"{LEADING_IN_TITLE_MATCH_REASON_PREFIX}; artist and album matched",
+            ambiguous_reason=(
                 f"{len(leading_in_title_matches)} candidates had Spotify's leading 'in' title variant "
                 "and matched artist and album"
             ),
-            candidate=None,
-            review_candidates=leading_in_title_matches,
-            search_queries=search_queries,
         )
 
     alphanumeric_spacing_matches: tuple[SpotifyTrackCandidate, ...] = ()
@@ -523,27 +462,16 @@ def choose_best_track_match(
             for candidate in candidates
             if candidate_matches_alphanumeric_spacing(track, candidate)
         )
-    if len(alphanumeric_spacing_matches) == 1:
-        candidate = alphanumeric_spacing_matches[0]
-        return TrackMatchDecision(
-            track=track,
-            status=MATCHED,
-            spotify_uri=candidate.uri,
-            reason=ALPHANUMERIC_SPACING_MATCH_REASON,
-            candidate=candidate,
-            review_candidates=(candidate,),
-            search_queries=search_queries,
+    if alphanumeric_spacing_matches:
+        return _decision_from_candidates(
+            track,
+            alphanumeric_spacing_matches,
+            search_queries,
+            matched_reason=ALPHANUMERIC_SPACING_MATCH_REASON,
+            ambiguous_reason=(
+                f"{len(alphanumeric_spacing_matches)} candidates matched after normalizing letter-number spacing"
+            ),
             match_strategy=ALPHANUMERIC_SPACING_MATCH_STRATEGY,
-        )
-    if len(alphanumeric_spacing_matches) > 1:
-        return TrackMatchDecision(
-            track=track,
-            status=AMBIGUOUS,
-            spotify_uri="",
-            reason=f"{len(alphanumeric_spacing_matches)} candidates matched after normalizing letter-number spacing",
-            candidate=None,
-            review_candidates=alphanumeric_spacing_matches,
-            search_queries=search_queries,
         )
 
     constrained_typo_matches: tuple[tuple[SpotifyTrackCandidate, int], ...] = ()
@@ -553,30 +481,18 @@ def choose_best_track_match(
             for candidate in candidates
             if (distance := constrained_title_typo_distance(track, candidate)) is not None
         )
-    if len(constrained_typo_matches) == 1:
-        candidate, distance = constrained_typo_matches[0]
-        return TrackMatchDecision(
-            track=track,
-            status=MATCHED,
-            spotify_uri=candidate.uri,
-            reason=(
+    if constrained_typo_matches:
+        typo_candidates = tuple(candidate for candidate, _distance in constrained_typo_matches)
+        _candidate, distance = constrained_typo_matches[0]
+        return _decision_from_candidates(
+            track,
+            typo_candidates,
+            search_queries,
+            matched_reason=(
                 f"{CONSTRAINED_TYPO_MATCH_REASON_PREFIX} (distance {distance}); "
                 "artist set and album matched"
             ),
-            candidate=candidate,
-            review_candidates=(candidate,),
-            search_queries=search_queries,
-        )
-    if len(constrained_typo_matches) > 1:
-        typo_candidates = tuple(candidate for candidate, _distance in constrained_typo_matches)
-        return TrackMatchDecision(
-            track=track,
-            status=AMBIGUOUS,
-            spotify_uri="",
-            reason=f"{len(typo_candidates)} candidates matched by constrained typo fallback",
-            candidate=None,
-            review_candidates=typo_candidates,
-            search_queries=search_queries,
+            ambiguous_reason=f"{len(typo_candidates)} candidates matched by constrained typo fallback",
         )
 
     version_substitute_matches: tuple[tuple[SpotifyTrackCandidate, str], ...] = ()
@@ -586,31 +502,19 @@ def choose_best_track_match(
             for candidate in candidates
             if (version_label := candidate_version_substitute_label(track, candidate)) is not None
         )
-    if len(version_substitute_matches) == 1:
-        candidate, version_label = version_substitute_matches[0]
-        return TrackMatchDecision(
-            track=track,
-            status=MATCHED,
-            spotify_uri=candidate.uri,
-            reason=(
+    if version_substitute_matches:
+        substitute_candidates = tuple(candidate for candidate, _version_label in version_substitute_matches)
+        _candidate, version_label = version_substitute_matches[0]
+        return _decision_from_candidates(
+            track,
+            substitute_candidates,
+            search_queries,
+            matched_reason=(
                 f"track matched using the {version_label} version substitute "
                 "after no ordinary title match"
             ),
-            candidate=candidate,
-            review_candidates=(candidate,),
-            search_queries=search_queries,
+            ambiguous_reason=f"{len(substitute_candidates)} candidates matched as version substitutes",
             match_strategy=VERSION_SUBSTITUTE_MATCH_STRATEGY,
-        )
-    if len(version_substitute_matches) > 1:
-        substitute_candidates = tuple(candidate for candidate, _version_label in version_substitute_matches)
-        return TrackMatchDecision(
-            track=track,
-            status=AMBIGUOUS,
-            spotify_uri="",
-            reason=f"{len(substitute_candidates)} candidates matched as version substitutes",
-            candidate=None,
-            review_candidates=substitute_candidates,
-            search_queries=search_queries,
         )
     return TrackMatchDecision(
         track=track,

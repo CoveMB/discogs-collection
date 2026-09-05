@@ -17,6 +17,31 @@ from publishers.spotify.matching import (
 )
 
 
+def source_track(
+    *,
+    track_name: str,
+    artist_name: str,
+    album_name: str,
+    spotify_search_query: str | None = None,
+    playlist_name: str = "Discogs - Test",
+    release_id: str = "111",
+    track_number: str = "1",
+) -> PlaylistTrack:
+    return PlaylistTrack(
+        playlist_name=playlist_name,
+        release_id=release_id,
+        album_name=album_name,
+        track_number=track_number,
+        track_name=track_name,
+        artist_name=artist_name,
+        spotify_search_query=(
+            spotify_search_query
+            if spotify_search_query is not None
+            else " ".join(value for value in (artist_name, track_name, album_name) if value)
+        ),
+    )
+
+
 class SpotifyMatchingTests(unittest.TestCase):
     def test_normalizes_equivalent_unicode_punctuation_as_separators(self):
         equivalent_values = (
@@ -40,14 +65,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertNotEqual(normalize_music_text("Signal♥Path"), normalize_music_text("SignalPath"))
 
     def test_accepts_candidate_with_equivalent_typographic_apostrophe(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Deep Techno",
-            release_id="36500992",
+        track = source_track(
             album_name="The Poet And The Muse",
-            track_number="7",
             track_name="Marcel’s Walk",
             artist_name="Mathys Lenne",
-            spotify_search_query="Mathys Lenne Marcel’s Walk The Poet And The Muse",
         )
         candidate = SpotifyTrackCandidate(
             uri="spotify:track:marcels-walk",
@@ -63,11 +84,8 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.reason, "track, artist, and album matched")
 
     def test_builds_structured_search_query_from_track_artist_and_album(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Breakbeat",
-            release_id="111",
+        track = source_track(
             album_name="Alpha Album",
-            track_number="1",
             track_name="Alpha One",
             artist_name="Alpha Artist",
             spotify_search_query="Alpha Artist Alpha One Alpha Album",
@@ -78,11 +96,8 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(query, 'track:"Alpha One" artist:"Alpha Artist" album:"Alpha Album"')
 
     def test_builds_search_query_ladder_from_track_artist_album_and_raw_query(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Breakbeat",
-            release_id="111",
+        track = source_track(
             album_name="Alpha EP",
-            track_number="1",
             track_name="Alpha One",
             artist_name="Alpha Artist, Beta Artist",
             spotify_search_query="Alpha Artist Alpha One Alpha EP",
@@ -103,11 +118,8 @@ class SpotifyMatchingTests(unittest.TestCase):
         )
 
     def test_search_query_ladder_includes_plain_artist_and_title_before_raw_query(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Deep Techno",
-            release_id="25308169",
+        track = source_track(
             album_name="False Hope",
-            track_number="7",
             track_name="Loosing Time",
             artist_name="Heap",
             spotify_search_query="Heap Loosing Time False Hope",
@@ -126,11 +138,8 @@ class SpotifyMatchingTests(unittest.TestCase):
         )
 
     def test_search_query_ladder_adds_original_mix_title_fallbacks_before_raw_query(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Deep Techno",
-            release_id="37196016",
+        track = source_track(
             album_name="A Thousand Faces",
-            track_number="1",
             track_name="Skull Shrine (Original Mix)",
             artist_name="Feral",
             spotify_search_query="Feral Skull Shrine (Original Mix) A Thousand Faces",
@@ -152,11 +161,8 @@ class SpotifyMatchingTests(unittest.TestCase):
         )
 
     def test_search_query_ladder_adds_featured_credit_title_fallbacks_before_raw_query(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Deep Techno",
-            release_id="37672899",
+        track = source_track(
             album_name="Carl Gari",
-            track_number="2",
             track_name="Swim feat. Polygonia",
             artist_name="Carl Gari",
             spotify_search_query="Carl Gari Swim feat. Polygonia Carl Gari",
@@ -193,11 +199,8 @@ class SpotifyMatchingTests(unittest.TestCase):
         )
         for track_name, base_title in cases:
             with self.subTest(track_name=track_name):
-                track = PlaylistTrack(
-                    playlist_name="Discogs - Test",
-                    release_id="111",
+                track = source_track(
                     album_name="Test Album",
-                    track_number="1",
                     track_name=track_name,
                     artist_name="Main Artist",
                     spotify_search_query=f"Main Artist {track_name} Test Album",
@@ -216,11 +219,8 @@ class SpotifyMatchingTests(unittest.TestCase):
             "Swim feat. Polygonia (Original Mix)",
         ):
             with self.subTest(track_name=track_name):
-                track = PlaylistTrack(
-                    playlist_name="Discogs - Deep Techno",
-                    release_id="37672899",
+                track = source_track(
                     album_name="Carl Gari",
-                    track_number="2",
                     track_name=track_name,
                     artist_name="Carl Gari",
                     spotify_search_query=f"Carl Gari {track_name} Carl Gari",
@@ -231,11 +231,8 @@ class SpotifyMatchingTests(unittest.TestCase):
                 self.assertNotIn('track:"Swim" artist:"Carl Gari"', queries)
 
     def test_search_query_ladder_does_not_strip_other_parenthetical_text(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Breakbeat",
-            release_id="111",
+        track = source_track(
             album_name="Alpha Album",
-            track_number="1",
             track_name="Alpha One (Club Mix)",
             artist_name="Alpha Artist",
             spotify_search_query="Alpha Artist Alpha One (Club Mix) Alpha Album",
@@ -246,11 +243,8 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertNotIn('track:"Alpha One" artist:"Alpha Artist"', queries)
 
     def test_search_query_ladder_adds_version_substitute_title_after_exact_queries(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Techno",
-            release_id="5157521",
+        track = source_track(
             album_name="Colt EP",
-            track_number="4",
             track_name="Airless (LIVE)",
             artist_name="Dense & Pika",
             spotify_search_query="Dense & Pika Airless (LIVE) Colt EP",
@@ -280,11 +274,8 @@ class SpotifyMatchingTests(unittest.TestCase):
             "( Original   Mix )",
         ):
             with self.subTest(suffix=suffix):
-                track = PlaylistTrack(
-                    playlist_name="Discogs - Deep Techno",
-                    release_id="37196016",
+                track = source_track(
                     album_name="A Thousand Faces",
-                    track_number="1",
                     track_name=f"Skull Shrine {suffix}",
                     artist_name="Feral",
                     spotify_search_query=f"Feral Skull Shrine {suffix} A Thousand Faces",
@@ -296,11 +287,8 @@ class SpotifyMatchingTests(unittest.TestCase):
                 self.assertIn("Feral Skull Shrine", queries)
 
     def test_falls_back_to_existing_search_query_when_structured_fields_are_missing(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Breakbeat",
-            release_id="111",
+        track = source_track(
             album_name="",
-            track_number="1",
             track_name="",
             artist_name="",
             spotify_search_query="Alpha Artist Alpha One Alpha Album",
@@ -311,14 +299,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(query, "Alpha Artist Alpha One Alpha Album")
 
     def test_accepts_single_candidate_matching_track_artist_and_album(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Breakbeat",
-            release_id="111",
+        track = source_track(
             album_name="Alpha Album",
-            track_number="1",
             track_name="Alpha One",
             artist_name="Alpha Artist",
-            spotify_search_query="Alpha Artist Alpha One Alpha Album",
         )
         candidate = SpotifyTrackCandidate(
             uri="spotify:track:alpha",
@@ -326,22 +310,24 @@ class SpotifyMatchingTests(unittest.TestCase):
             artists=("Alpha Artist",),
             album_name="Alpha Album",
         )
+        search_queries = ('track:"Alpha One" artist:"Alpha Artist"',)
 
-        decision = choose_best_track_match(track, (candidate,))
+        decision = choose_best_track_match(track, (candidate,), search_queries)
 
+        self.assertIs(decision.track, track)
         self.assertEqual(decision.status, "matched")
         self.assertEqual(decision.spotify_uri, "spotify:track:alpha")
         self.assertEqual(decision.reason, "track, artist, and album matched")
+        self.assertIs(decision.candidate, candidate)
+        self.assertEqual(decision.review_candidates, (candidate,))
+        self.assertEqual(decision.search_queries, search_queries)
+        self.assertEqual(decision.match_strategy, "")
 
     def test_accepts_spotify_title_with_leading_in_when_artist_and_album_match(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Deep Techno",
-            release_id="29905411",
+        track = source_track(
             album_name="Environment Control",
-            track_number="3",
             track_name="Dark Territory",
             artist_name="Polar Inertia",
-            spotify_search_query="Polar Inertia Dark Territory Environment Control",
         )
         candidate = SpotifyTrackCandidate(
             uri="spotify:track:dark-territory",
@@ -360,14 +346,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         )
 
     def test_leading_in_title_variant_requires_matching_artist_and_album(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Deep Techno",
-            release_id="29905411",
+        track = source_track(
             album_name="Environment Control",
-            track_number="3",
             track_name="Dark Territory",
             artist_name="Polar Inertia",
-            spotify_search_query="Polar Inertia Dark Territory Environment Control",
         )
         candidates = (
             SpotifyTrackCandidate(
@@ -392,14 +374,10 @@ class SpotifyMatchingTests(unittest.TestCase):
                 self.assertEqual(decision.spotify_uri, "")
 
     def test_leading_in_title_variant_requires_a_nonempty_album(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Deep Techno",
-            release_id="29905411",
+        track = source_track(
             album_name="",
-            track_number="3",
             track_name="Dark Territory",
             artist_name="Polar Inertia",
-            spotify_search_query="Polar Inertia Dark Territory",
         )
         candidate = SpotifyTrackCandidate(
             uri="spotify:track:dark-territory",
@@ -424,14 +402,10 @@ class SpotifyMatchingTests(unittest.TestCase):
 
         for source_title, spotify_title in cases:
             with self.subTest(source_title=source_title, spotify_title=spotify_title):
-                track = PlaylistTrack(
-                    playlist_name="Discogs - Deep Techno",
-                    release_id="29905411",
+                track = source_track(
                     album_name="Environment Control",
-                    track_number="3",
                     track_name=source_title,
                     artist_name="Polar Inertia",
-                    spotify_search_query=f"Polar Inertia {source_title} Environment Control",
                 )
                 candidate = SpotifyTrackCandidate(
                     uri="spotify:track:candidate",
@@ -446,14 +420,10 @@ class SpotifyMatchingTests(unittest.TestCase):
                 self.assertEqual(decision.spotify_uri, "")
 
     def test_exact_title_match_precedes_leading_in_title_variant(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Deep Techno",
-            release_id="29905411",
+        track = source_track(
             album_name="Environment Control",
-            track_number="3",
             track_name="Dark Territory",
             artist_name="Polar Inertia",
-            spotify_search_query="Polar Inertia Dark Territory Environment Control",
         )
         candidates = (
             SpotifyTrackCandidate(
@@ -477,14 +447,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.reason, "track, artist, and album matched")
 
     def test_marks_multiple_leading_in_title_variants_as_ambiguous(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Deep Techno",
-            release_id="29905411",
+        track = source_track(
             album_name="Environment Control",
-            track_number="3",
             track_name="Dark Territory",
             artist_name="Polar Inertia",
-            spotify_search_query="Polar Inertia Dark Territory Environment Control",
         )
         candidates = tuple(
             SpotifyTrackCandidate(
@@ -506,14 +472,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         )
 
     def test_can_defer_leading_in_title_variant_until_search_ladder_finishes(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Deep Techno",
-            release_id="29905411",
+        track = source_track(
             album_name="Environment Control",
-            track_number="3",
             track_name="Dark Territory",
             artist_name="Polar Inertia",
-            spotify_search_query="Polar Inertia Dark Territory Environment Control",
         )
         candidate = SpotifyTrackCandidate(
             uri="spotify:track:dark-territory",
@@ -532,14 +494,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.spotify_uri, "")
 
     def test_accepts_unique_candidate_matching_track_and_artist_when_album_differs(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Breakbeat",
-            release_id="111",
+        track = source_track(
             album_name="Discogs EP",
-            track_number="1",
             track_name="Alpha One",
             artist_name="Alpha Artist",
-            spotify_search_query="Alpha Artist Alpha One Discogs EP",
         )
         candidate = SpotifyTrackCandidate(
             uri="spotify:track:alpha",
@@ -555,14 +513,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.reason, "track and artist matched; album differed")
 
     def test_marks_multiple_track_and_artist_matches_as_ambiguous_when_album_differs(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Breakbeat",
-            release_id="111",
+        track = source_track(
             album_name="Discogs EP",
-            track_number="1",
             track_name="Alpha One",
             artist_name="Alpha Artist",
-            spotify_search_query="Alpha Artist Alpha One Discogs EP",
         )
         candidates = (
             SpotifyTrackCandidate(
@@ -586,14 +540,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.reason, "2 candidates matched track and artist")
 
     def test_deduplicates_candidates_by_spotify_uri_before_matching(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Breakbeat",
-            release_id="111",
+        track = source_track(
             album_name="Alpha Album",
-            track_number="1",
             track_name="Alpha One",
             artist_name="Alpha Artist",
-            spotify_search_query="Alpha Artist Alpha One Alpha Album",
         )
         duplicate_candidate = SpotifyTrackCandidate(
             uri="spotify:track:alpha",
@@ -608,14 +558,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.spotify_uri, "spotify:track:alpha")
 
     def test_accepts_featured_credit_relocated_to_spotify_artists(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Deep Techno",
-            release_id="37672899",
+        track = source_track(
             album_name="Carl Gari",
-            track_number="2",
             track_name="Swim feat. Polygonia",
             artist_name="Carl Gari",
-            spotify_search_query="Carl Gari Swim feat. Polygonia Carl Gari",
         )
         candidate = SpotifyTrackCandidate(
             uri="spotify:track:swim",
@@ -644,14 +590,10 @@ class SpotifyMatchingTests(unittest.TestCase):
 
         for track_name in ("Swim FEAT. Polygonia", "Swim   Feat.   Polygonia"):
             with self.subTest(track_name=track_name):
-                track = PlaylistTrack(
-                    playlist_name="Discogs - Deep Techno",
-                    release_id="37672899",
+                track = source_track(
                     album_name="Carl Gari",
-                    track_number="2",
                     track_name=track_name,
                     artist_name="Carl Gari",
-                    spotify_search_query=f"Carl Gari {track_name} Carl Gari",
                 )
 
                 decision = choose_best_track_match(track, (candidate,))
@@ -694,14 +636,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         )
         for track_name, spotify_title, source_artists, spotify_artists in cases:
             with self.subTest(track_name=track_name):
-                track = PlaylistTrack(
-                    playlist_name="Discogs - Test",
-                    release_id="111",
+                track = source_track(
                     album_name="Test Album",
-                    track_number="1",
                     track_name=track_name,
                     artist_name=source_artists,
-                    spotify_search_query=f"{source_artists} {track_name} Test Album",
                 )
                 candidate = SpotifyTrackCandidate(
                     uri="spotify:track:test",
@@ -716,17 +654,10 @@ class SpotifyMatchingTests(unittest.TestCase):
                 self.assertEqual(decision.spotify_uri, "spotify:track:test")
 
     def test_accepts_multiple_featured_artists_credited_separately(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Test",
-            release_id="111",
+        track = source_track(
             album_name="Test Album",
-            track_number="1",
             track_name="Where Are You Now (feat. Guest Six & Guest Seven)",
             artist_name="Guest Six, Guest Seven, Main Artist",
-            spotify_search_query=(
-                "Guest Six, Guest Seven, Main Artist Where Are You Now "
-                "(feat. Guest Six & Guest Seven) Test Album"
-            ),
         )
         for spotify_artists in (
             ("Main Artist", "Guest Six", "Guest Seven"),
@@ -758,17 +689,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(partial_decision.spotify_uri, "")
 
     def test_rejects_featured_credit_candidate_without_non_featured_source_artist(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Test",
-            release_id="111",
+        track = source_track(
             album_name="Test Album",
-            track_number="1",
             track_name="The Reason (feat. Guest Eight)",
             artist_name="Guest Eight, Main Artist",
-            spotify_search_query=(
-                "Guest Eight, Main Artist The Reason "
-                "(feat. Guest Eight) Test Album"
-            ),
         )
         candidate = SpotifyTrackCandidate(
             uri="spotify:track:test",
@@ -783,16 +707,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.spotify_uri, "")
 
     def test_rejects_featured_credit_when_source_has_no_non_featured_artist(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Test",
-            release_id="111",
+        track = source_track(
             album_name="Test Album",
-            track_number="1",
             track_name="The Reason (feat. Guest Eight)",
             artist_name="Guest Eight",
-            spotify_search_query=(
-                "Guest Eight The Reason (feat. Guest Eight) Test Album"
-            ),
         )
         candidate = SpotifyTrackCandidate(
             uri="spotify:track:test",
@@ -807,14 +725,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.spotify_uri, "")
 
     def test_accepts_relocated_featured_credit_when_album_differs(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Deep Techno",
-            release_id="37672899",
+        track = source_track(
             album_name="Carl Gari",
-            track_number="2",
             track_name="Swim feat. Polygonia",
             artist_name="Carl Gari",
-            spotify_search_query="Carl Gari Swim feat. Polygonia Carl Gari",
         )
         candidate = SpotifyTrackCandidate(
             uri="spotify:track:swim",
@@ -834,14 +748,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         )
 
     def test_rejects_relocated_featured_credit_without_both_spotify_artists(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Deep Techno",
-            release_id="37672899",
+        track = source_track(
             album_name="Carl Gari",
-            track_number="2",
             track_name="Swim feat. Polygonia",
             artist_name="Carl Gari",
-            spotify_search_query="Carl Gari Swim feat. Polygonia Carl Gari",
         )
 
         for artists in (("Carl Gari",), ("Carl Gari", "Different Artist"), ("Polygonia",)):
@@ -859,14 +769,10 @@ class SpotifyMatchingTests(unittest.TestCase):
                 self.assertEqual(decision.spotify_uri, "")
 
     def test_prefers_exact_featured_title_over_relocated_credit_candidate(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Deep Techno",
-            release_id="37672899",
+        track = source_track(
             album_name="Carl Gari",
-            track_number="2",
             track_name="Swim feat. Polygonia",
             artist_name="Carl Gari",
-            spotify_search_query="Carl Gari Swim feat. Polygonia Carl Gari",
         )
         candidates = (
             SpotifyTrackCandidate(
@@ -890,14 +796,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.reason, "track, artist, and album matched")
 
     def test_marks_multiple_relocated_featured_credit_candidates_as_ambiguous(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Deep Techno",
-            release_id="37672899",
+        track = source_track(
             album_name="Carl Gari",
-            track_number="2",
             track_name="Swim feat. Polygonia",
             artist_name="Carl Gari",
-            spotify_search_query="Carl Gari Swim feat. Polygonia Carl Gari",
         )
         candidates = tuple(
             SpotifyTrackCandidate(
@@ -919,14 +821,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         )
 
     def test_accepts_featured_credit_present_only_in_spotify_title(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Test",
-            release_id="111",
+        track = source_track(
             album_name="Test Album",
-            track_number="1",
             track_name="Signal Path",
             artist_name="Main Artist",
-            spotify_search_query="Main Artist Signal Path Test Album",
         )
         candidate = SpotifyTrackCandidate(
             uri="spotify:track:signal-path",
@@ -958,14 +856,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         )
         for source_title, spotify_title in cases:
             with self.subTest(spotify_title=spotify_title):
-                track = PlaylistTrack(
-                    playlist_name="Discogs - Test",
-                    release_id="111",
+                track = source_track(
                     album_name="Test Album",
-                    track_number="1",
                     track_name=source_title,
                     artist_name="Main Artist",
-                    spotify_search_query=f"Main Artist {source_title} Test Album",
                 )
                 candidate = SpotifyTrackCandidate(
                     uri="spotify:track:test",
@@ -980,14 +874,10 @@ class SpotifyMatchingTests(unittest.TestCase):
                 self.assertEqual(decision.spotify_uri, "spotify:track:test")
 
     def test_rejects_unsupported_featured_credit_forms_present_only_on_spotify(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Test",
-            release_id="111",
+        track = source_track(
             album_name="Test Album",
-            track_number="1",
             track_name="Signal Path",
             artist_name="Main Artist",
-            spotify_search_query="Main Artist Signal Path Test Album",
         )
         for spotify_title in (
             "Signal Path featuring Guest One",
@@ -1009,14 +899,10 @@ class SpotifyMatchingTests(unittest.TestCase):
                 self.assertEqual(decision.spotify_uri, "")
 
     def test_one_sided_featured_credit_fallback_does_not_reconcile_credits_on_both_titles(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Test",
-            release_id="111",
+        track = source_track(
             album_name="Test Album",
-            track_number="1",
             track_name="Signal Path feat. Guest One",
             artist_name="Main Artist",
-            spotify_search_query="Main Artist Signal Path feat. Guest One Test Album",
         )
         candidate = SpotifyTrackCandidate(
             uri="spotify:track:test",
@@ -1031,14 +917,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.spotify_uri, "")
 
     def test_accepts_spotify_only_multiple_featured_artists_when_all_are_credited(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Test",
-            release_id="111",
+        track = source_track(
             album_name="Test Album",
-            track_number="1",
             track_name="Where Are You Now",
             artist_name="Main Artist",
-            spotify_search_query="Main Artist Where Are You Now Test Album",
         )
         for spotify_artists in (
             ("Main Artist", "Guest One", "Guest Two"),
@@ -1058,14 +940,10 @@ class SpotifyMatchingTests(unittest.TestCase):
                 self.assertEqual(decision.spotify_uri, "spotify:track:test")
 
     def test_rejects_spotify_only_featured_credit_without_required_artists(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Test",
-            release_id="111",
+        track = source_track(
             album_name="Test Album",
-            track_number="1",
             track_name="Signal Path",
             artist_name="Main Artist",
-            spotify_search_query="Main Artist Signal Path Test Album",
         )
 
         for artists in (
@@ -1087,14 +965,10 @@ class SpotifyMatchingTests(unittest.TestCase):
                 self.assertEqual(decision.spotify_uri, "")
 
     def test_rejects_partial_spotify_only_multiple_featured_artist_credit(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Test",
-            release_id="111",
+        track = source_track(
             album_name="Test Album",
-            track_number="1",
             track_name="Where Are You Now",
             artist_name="Main Artist",
-            spotify_search_query="Main Artist Where Are You Now Test Album",
         )
         candidate = SpotifyTrackCandidate(
             uri="spotify:track:partial",
@@ -1109,14 +983,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.spotify_uri, "")
 
     def test_accepts_spotify_only_featured_credit_when_album_differs(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Test",
-            release_id="111",
+        track = source_track(
             album_name="Source Album",
-            track_number="1",
             track_name="Signal Path",
             artist_name="Main Artist",
-            spotify_search_query="Main Artist Signal Path Source Album",
         )
         candidate = SpotifyTrackCandidate(
             uri="spotify:track:signal-path",
@@ -1136,14 +1006,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         )
 
     def test_prefers_exact_title_over_spotify_only_featured_credit_candidate(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Test",
-            release_id="111",
+        track = source_track(
             album_name="Test Album",
-            track_number="1",
             track_name="Signal Path",
             artist_name="Main Artist",
-            spotify_search_query="Main Artist Signal Path Test Album",
         )
         candidates = (
             SpotifyTrackCandidate(
@@ -1167,14 +1033,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.reason, "track, artist, and album matched")
 
     def test_marks_multiple_spotify_only_featured_credit_candidates_as_ambiguous(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Test",
-            release_id="111",
+        track = source_track(
             album_name="Test Album",
-            track_number="1",
             track_name="Signal Path",
             artist_name="Main Artist",
-            spotify_search_query="Main Artist Signal Path Test Album",
         )
         candidates = tuple(
             SpotifyTrackCandidate(
@@ -1204,14 +1066,10 @@ class SpotifyMatchingTests(unittest.TestCase):
             "( Original   Mix )",
         ):
             with self.subTest(suffix=suffix):
-                track = PlaylistTrack(
-                    playlist_name="Discogs - Deep Techno",
-                    release_id="37196016",
+                track = source_track(
                     album_name="A Thousand Faces",
-                    track_number="1",
                     track_name=f"Skull Shrine {suffix}",
                     artist_name="Feral",
-                    spotify_search_query=f"Feral Skull Shrine {suffix} A Thousand Faces",
                 )
                 candidate = SpotifyTrackCandidate(
                     uri="spotify:track:skull-shrine",
@@ -1230,14 +1088,10 @@ class SpotifyMatchingTests(unittest.TestCase):
                 )
 
     def test_prefers_original_mix_fallback_candidate_with_matching_album(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Deep Techno",
-            release_id="37196016",
+        track = source_track(
             album_name="A Thousand Faces",
-            track_number="1",
             track_name="Skull Shrine (Original Mix)",
             artist_name="Feral",
-            spotify_search_query="Feral Skull Shrine (Original Mix) A Thousand Faces",
         )
         candidates = (
             SpotifyTrackCandidate(
@@ -1264,14 +1118,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         )
 
     def test_prefers_exact_annotated_title_over_original_mix_fallback(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Deep Techno",
-            release_id="37196016",
+        track = source_track(
             album_name="A Thousand Faces",
-            track_number="1",
             track_name="Skull Shrine (Original Mix)",
             artist_name="Feral",
-            spotify_search_query="Feral Skull Shrine (Original Mix) A Thousand Faces",
         )
         candidates = (
             SpotifyTrackCandidate(
@@ -1295,14 +1145,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.reason, "track, artist, and album matched")
 
     def test_marks_multiple_original_mix_fallback_candidates_as_ambiguous(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Deep Techno",
-            release_id="37196016",
+        track = source_track(
             album_name="A Thousand Faces",
-            track_number="1",
             track_name="Skull Shrine (Original Mix)",
             artist_name="Feral",
-            spotify_search_query="Feral Skull Shrine (Original Mix) A Thousand Faces",
         )
         candidates = (
             SpotifyTrackCandidate(
@@ -1337,14 +1183,10 @@ class SpotifyMatchingTests(unittest.TestCase):
             "Skull Shrine - Orginal Mix",
         ):
             with self.subTest(candidate_title=candidate_title):
-                track = PlaylistTrack(
-                    playlist_name="Discogs - Deep Techno",
-                    release_id="37196016",
+                track = source_track(
                     album_name="A Thousand Faces",
-                    track_number="1",
                     track_name="Skull Shrine",
                     artist_name="Feral",
-                    spotify_search_query="Feral Skull Shrine A Thousand Faces",
                 )
                 candidate = SpotifyTrackCandidate(
                     uri="spotify:track:skull-shrine",
@@ -1364,14 +1206,10 @@ class SpotifyMatchingTests(unittest.TestCase):
                 self.assertEqual(decision.match_strategy, "spotify_original_annotation")
 
     def test_spotify_original_annotation_requires_exact_artist_set_and_album(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Deep Techno",
-            release_id="37196016",
+        track = source_track(
             album_name="A Thousand Faces",
-            track_number="1",
             track_name="Skull Shrine",
             artist_name="Feral",
-            spotify_search_query="Feral Skull Shrine A Thousand Faces",
         )
         candidates = (
             SpotifyTrackCandidate(
@@ -1400,14 +1238,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.spotify_uri, "")
 
     def test_prefers_exact_title_over_spotify_original_annotation_fallback(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Deep Techno",
-            release_id="37196016",
+        track = source_track(
             album_name="A Thousand Faces",
-            track_number="1",
             track_name="Skull Shrine",
             artist_name="Feral",
-            spotify_search_query="Feral Skull Shrine A Thousand Faces",
         )
         candidates = (
             SpotifyTrackCandidate(
@@ -1430,14 +1264,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.reason, "track, artist, and album matched")
 
     def test_marks_multiple_spotify_original_annotation_candidates_as_ambiguous(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Deep Techno",
-            release_id="37196016",
+        track = source_track(
             album_name="A Thousand Faces",
-            track_number="1",
             track_name="Skull Shrine",
             artist_name="Feral",
-            spotify_search_query="Feral Skull Shrine A Thousand Faces",
         )
         candidates = tuple(
             SpotifyTrackCandidate(
@@ -1457,16 +1287,13 @@ class SpotifyMatchingTests(unittest.TestCase):
             decision.reason,
             "2 candidates matched after removing Spotify Original annotation",
         )
+        self.assertEqual(decision.match_strategy, "")
 
     def test_rejects_other_spotify_version_annotations_for_unannotated_source(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Deep Techno",
-            release_id="37196016",
+        track = source_track(
             album_name="A Thousand Faces",
-            track_number="1",
             track_name="Skull Shrine",
             artist_name="Feral",
-            spotify_search_query="Feral Skull Shrine A Thousand Faces",
         )
         for candidate_title in (
             "Skull Shrine - Remix",
@@ -1489,14 +1316,10 @@ class SpotifyMatchingTests(unittest.TestCase):
     def test_rejects_unannotated_candidate_for_other_parenthetical_text(self):
         for source_title in ("Alpha One (Club Mix)", "Poison Shyness (Anti-Social)"):
             with self.subTest(source_title=source_title):
-                track = PlaylistTrack(
-                    playlist_name="Discogs - Breakbeat",
-                    release_id="111",
+                track = source_track(
                     album_name="Alpha Album",
-                    track_number="1",
                     track_name=source_title,
                     artist_name="Alpha Artist",
-                    spotify_search_query=f"Alpha Artist {source_title} Alpha Album",
                 )
                 candidate = SpotifyTrackCandidate(
                     uri="spotify:track:alpha",
@@ -1511,14 +1334,10 @@ class SpotifyMatchingTests(unittest.TestCase):
                 self.assertEqual(decision.spotify_uri, "")
 
     def test_accepts_case_only_version_label_change_as_an_exact_match(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Techno",
-            release_id="5157521",
+        track = source_track(
             album_name="Colt EP",
-            track_number="4",
             track_name="Airless (LIVE)",
             artist_name="Dense & Pika",
-            spotify_search_query="Dense & Pika Airless (LIVE) Colt EP",
         )
         candidate = SpotifyTrackCandidate(
             uri="spotify:track:airless-live",
@@ -1557,14 +1376,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         for source_title, spotify_title, spotify_artists, version_label in cases:
             with self.subTest(source_title=source_title, spotify_title=spotify_title):
                 source_artist = spotify_artists[0]
-                track = PlaylistTrack(
-                    playlist_name="Discogs - Techno",
-                    release_id="111",
+                track = source_track(
                     album_name="Discogs Album",
-                    track_number="1",
                     track_name=source_title,
                     artist_name=source_artist,
-                    spotify_search_query=f"{source_artist} {source_title} Discogs Album",
                 )
                 candidate = SpotifyTrackCandidate(
                     uri="spotify:track:substitute",
@@ -1584,14 +1399,10 @@ class SpotifyMatchingTests(unittest.TestCase):
                 self.assertEqual(decision.match_strategy, "version_substitute")
 
     def test_exact_title_precedes_version_substitute(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Techno",
-            release_id="5157521",
+        track = source_track(
             album_name="Colt EP",
-            track_number="4",
             track_name="Airless (Live)",
             artist_name="Dense & Pika",
-            spotify_search_query="Dense & Pika Airless (Live) Colt EP",
         )
         candidates = (
             SpotifyTrackCandidate(
@@ -1615,14 +1426,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.reason, "track, artist, and album matched")
 
     def test_can_defer_version_substitute_until_search_ladder_finishes(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Techno",
-            release_id="5083040",
+        track = source_track(
             album_name="First Contact",
-            track_number="1",
             track_name="First Contact",
             artist_name="Outline",
-            spotify_search_query="Outline First Contact",
         )
         candidate = SpotifyTrackCandidate(
             uri="spotify:track:remastered",
@@ -1641,14 +1448,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.spotify_uri, "")
 
     def test_marks_multiple_version_substitutes_as_ambiguous(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Techno",
-            release_id="5083040",
+        track = source_track(
             album_name="First Contact",
-            track_number="1",
             track_name="First Contact",
             artist_name="Outline",
-            spotify_search_query="Outline First Contact",
         )
         candidates = tuple(
             SpotifyTrackCandidate(
@@ -1668,14 +1471,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.review_candidates, candidates)
 
     def test_does_not_substitute_one_explicit_version_for_another(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Techno",
-            release_id="111",
+        track = source_track(
             album_name="Alpha Album",
-            track_number="1",
             track_name="Alpha One (Live)",
             artist_name="Alpha Artist",
-            spotify_search_query="Alpha Artist Alpha One Live Alpha Album",
         )
         candidate = SpotifyTrackCandidate(
             uri="spotify:track:remastered",
@@ -1690,14 +1489,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.spotify_uri, "")
 
     def test_accepts_letter_number_spacing_with_matching_album_and_source_artist_subset(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Techno",
-            release_id="35661301",
+        track = source_track(
             album_name="Chroma000",
-            track_number="2",
             track_name="Chroma002 L.A.V.A",
             artist_name="B.D.B",
-            spotify_search_query="B.D.B Chroma002 L.A.V.A Chroma000",
         )
         candidate = SpotifyTrackCandidate(
             uri="spotify:track:chroma-002",
@@ -1717,14 +1512,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.match_strategy, "alphanumeric_spacing")
 
     def test_letter_number_spacing_fallback_requires_matching_album_and_all_source_artists(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Techno",
-            release_id="35661301",
+        track = source_track(
             album_name="Chroma000",
-            track_number="2",
             track_name="Chroma002 L.A.V.A",
             artist_name="B.D.B, BICEP",
-            spotify_search_query="B.D.B BICEP Chroma002 L.A.V.A Chroma000",
         )
         candidates = (
             SpotifyTrackCandidate(
@@ -1749,14 +1540,10 @@ class SpotifyMatchingTests(unittest.TestCase):
                 self.assertEqual(decision.spotify_uri, "")
 
     def test_marks_multiple_letter_number_spacing_candidates_as_ambiguous(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Techno",
-            release_id="35661301",
+        track = source_track(
             album_name="Chroma000",
-            track_number="2",
             track_name="Chroma002 L.A.V.A",
             artist_name="B.D.B",
-            spotify_search_query="B.D.B Chroma002 L.A.V.A Chroma000",
         )
         candidates = tuple(
             SpotifyTrackCandidate(
@@ -1779,14 +1566,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.review_candidates, candidates)
 
     def test_marks_multiple_matching_candidates_as_ambiguous(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Breakbeat",
-            release_id="111",
+        track = source_track(
             album_name="Alpha Album",
-            track_number="1",
             track_name="Alpha One",
             artist_name="Alpha Artist",
-            spotify_search_query="Alpha Artist Alpha One Alpha Album",
         )
         candidates = (
             SpotifyTrackCandidate(
@@ -1802,12 +1585,18 @@ class SpotifyMatchingTests(unittest.TestCase):
                 album_name="Alpha Album",
             ),
         )
+        search_queries = ("first query", "second query")
 
-        decision = choose_best_track_match(track, candidates)
+        decision = choose_best_track_match(track, candidates, search_queries)
 
+        self.assertIs(decision.track, track)
         self.assertEqual(decision.status, "ambiguous")
         self.assertEqual(decision.spotify_uri, "")
         self.assertEqual(decision.reason, "2 candidates matched track, artist, and album")
+        self.assertIsNone(decision.candidate)
+        self.assertEqual(decision.review_candidates, candidates)
+        self.assertEqual(decision.search_queries, search_queries)
+        self.assertEqual(decision.match_strategy, "")
 
     def test_accepts_tightly_constrained_title_typos(self):
         cases = (
@@ -1818,14 +1607,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         )
         for source_title, spotify_title, expected_distance in cases:
             with self.subTest(source_title=source_title, spotify_title=spotify_title):
-                track = PlaylistTrack(
-                    playlist_name="Discogs - Test",
-                    release_id="111",
+                track = source_track(
                     album_name="Test Album",
-                    track_number="1",
                     track_name=source_title,
                     artist_name="Main Artist",
-                    spotify_search_query=f"Main Artist {source_title} Test Album",
                 )
                 candidate = SpotifyTrackCandidate(
                     uri="spotify:track:test",
@@ -1845,14 +1630,10 @@ class SpotifyMatchingTests(unittest.TestCase):
                 )
 
     def test_constrained_typo_fallback_requires_exact_artist_set_and_album(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Test",
-            release_id="111",
+        track = source_track(
             album_name="Test Album",
-            track_number="1",
             track_name="Reson",
             artist_name="Main Artist, Second Artist",
-            spotify_search_query="Main Artist, Second Artist Reson Test Album",
         )
         rejected_candidates = (
             SpotifyTrackCandidate(
@@ -1906,14 +1687,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         )
         for source_title, spotify_title in cases:
             with self.subTest(source_title=source_title, spotify_title=spotify_title):
-                track = PlaylistTrack(
-                    playlist_name="Discogs - Test",
-                    release_id="111",
+                track = source_track(
                     album_name="Test Album",
-                    track_number="1",
                     track_name=source_title,
                     artist_name="Main Artist",
-                    spotify_search_query=f"Main Artist {source_title} Test Album",
                 )
                 candidate = SpotifyTrackCandidate(
                     uri="spotify:track:test",
@@ -1928,14 +1705,10 @@ class SpotifyMatchingTests(unittest.TestCase):
                 self.assertEqual(decision.spotify_uri, "")
 
     def test_marks_multiple_constrained_typo_candidates_as_ambiguous(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Test",
-            release_id="111",
+        track = source_track(
             album_name="Test Album",
-            track_number="1",
             track_name="Reson",
             artist_name="Main Artist",
-            spotify_search_query="Main Artist Reson Test Album",
         )
         candidates = (
             SpotifyTrackCandidate(
@@ -1968,14 +1741,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         )
         for source_artist, source_album, candidate_artists in cases:
             with self.subTest(source_artist=source_artist, source_album=source_album):
-                track = PlaylistTrack(
-                    playlist_name="Discogs - Test",
-                    release_id="111",
+                track = source_track(
                     album_name=source_album,
-                    track_number="1",
                     track_name="Loosing Time",
                     artist_name=source_artist,
-                    spotify_search_query="Loosing Time",
                 )
                 candidate = SpotifyTrackCandidate(
                     uri="spotify:track:losing-time",
@@ -1990,14 +1759,10 @@ class SpotifyMatchingTests(unittest.TestCase):
                 self.assertEqual(decision.spotify_uri, "")
 
     def test_deduplicates_constrained_typo_candidates_by_spotify_uri(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Test",
-            release_id="111",
+        track = source_track(
             album_name="Test Album",
-            track_number="1",
             track_name="Loosing Time",
             artist_name="Main Artist",
-            spotify_search_query="Main Artist Loosing Time Test Album",
         )
         candidate = SpotifyTrackCandidate(
             uri="spotify:track:losing-time",
@@ -2012,14 +1777,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.spotify_uri, "spotify:track:losing-time")
 
     def test_can_disable_constrained_typo_fallback_while_search_ladder_continues(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Test",
-            release_id="111",
+        track = source_track(
             album_name="Test Album",
-            track_number="1",
             track_name="Loosing Time",
             artist_name="Main Artist",
-            spotify_search_query="Main Artist Loosing Time Test Album",
         )
         candidate = SpotifyTrackCandidate(
             uri="spotify:track:losing-time",
@@ -2038,14 +1799,10 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.spotify_uri, "")
 
     def test_rejects_candidates_that_do_not_match_track_artist_and_album(self):
-        track = PlaylistTrack(
-            playlist_name="Discogs - Breakbeat",
-            release_id="111",
+        track = source_track(
             album_name="Alpha Album",
-            track_number="1",
             track_name="Alpha One",
             artist_name="Alpha Artist",
-            spotify_search_query="Alpha Artist Alpha One Alpha Album",
         )
         candidate = SpotifyTrackCandidate(
             uri="spotify:track:wrong",
@@ -2053,12 +1810,16 @@ class SpotifyMatchingTests(unittest.TestCase):
             artists=("Alpha Artist",),
             album_name="Alpha Album",
         )
+        search_queries = ("first query", "second query")
 
-        decision = choose_best_track_match(track, (candidate,))
+        decision = choose_best_track_match(track, (candidate,), search_queries)
 
         self.assertEqual(decision.status, "unmatched")
         self.assertEqual(decision.spotify_uri, "")
         self.assertEqual(decision.reason, "no candidates matched track, artist, and album")
+        self.assertIsNone(decision.candidate)
+        self.assertEqual(decision.review_candidates, (candidate,))
+        self.assertEqual(decision.search_queries, search_queries)
 
 
 if __name__ == "__main__":
