@@ -247,7 +247,7 @@ def build_strict_playlist_rows(
     lookup_tracklist: Callable[[Mapping[str, str]], ReleaseTracklistLookup],
 ) -> tuple[dict[str, str], ...]:
     records: list[exporter.ReleaseExportRecord] = []
-    for row_number, release_id in enumerate(definition.release_ids, start=1):
+    for release_id in definition.release_ids:
         row = {
             RELEASE_ID_COLUMN: release_id,
             "Artist": "",
@@ -258,7 +258,7 @@ def build_strict_playlist_rows(
         if not lookup.tracks or any(not track.title.strip() for track in lookup.tracks):
             note = next((note for note in lookup.notes if note.strip()), "no Discogs tracklist found")
             raise ValueError(f"Release ID {release_id}: no usable Discogs tracks: {note}")
-        records.append(exporter.ReleaseExportRecord(row_number=row_number, row=row, lookup=lookup))
+        records.append(exporter.ReleaseExportRecord(row=row, lookup=lookup))
 
     output_rows, fallback_count = exporter.build_playlist_output_rows(records)
     if fallback_count:

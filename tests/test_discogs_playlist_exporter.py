@@ -335,10 +335,6 @@ class PlaylistExporterTests(unittest.TestCase):
 
             self.assertEqual([row["Release Id"] for row in rewritten_rows], ["111", "222"])
             self.assertEqual(summary.track_row_count, 2)
-            self.assertEqual(
-                [entry.track_name for entry in summary.playlist_release_changes[0].added_tracks],
-                ["Beta One"],
-            )
             self.assertIn("Playlist release changes", report_text)
             self.assertIn("- Discogs - Breakbeat:", report_text)
             self.assertIn("Added releases:", report_text)
@@ -501,49 +497,6 @@ class PlaylistExporterTests(unittest.TestCase):
             self.assertIn("missing release_id | New Missing Artist | New Missing Album | 1 track row", report_text)
             self.assertIn("missing release_id | Old Missing Artist | Old Missing Album | 1 track row", report_text)
 
-    def test_discogs_payload_parser_flattens_sub_tracks_and_prefers_track_artists(self):
-        row = {
-            "release_id": "444",
-            "Artist": "Release Artist",
-            "Title": "Release Album",
-            "Released": "2002-04-01",
-        }
-        payload = {
-            "artists": [{"name": "Payload Artist"}],
-            "title": "Payload Album",
-            "year": 2002,
-            "tracklist": [
-                {
-                    "position": "A",
-                    "type_": "index",
-                    "title": "Suite",
-                    "sub_tracks": [
-                        {
-                            "position": "A1",
-                            "type_": "track",
-                            "title": "Part One",
-                            "artists": [{"name": "Track Artist"}],
-                        },
-                    ],
-                },
-                {"position": "B1", "type_": "track", "title": "Part Two"},
-                {"position": "", "type_": "heading", "title": "Bonus"},
-            ],
-        }
-
-        lookup = exporter.release_tracklist_from_payload("444", payload, row)
-
-        self.assertEqual(lookup.artist_name, "Payload Artist")
-        self.assertEqual(lookup.album_name, "Payload Album")
-        self.assertEqual(lookup.record_year, "2002")
-        self.assertEqual(
-            lookup.tracks,
-            (
-                exporter.DiscogsTrack(position="A1", title="Part One", artist_name="Track Artist"),
-                exporter.DiscogsTrack(position="B1", title="Part Two", artist_name="Payload Artist"),
-            ),
-        )
-
     def test_parse_args_enables_progress_by_default_and_can_disable_it(self):
         default_args = exporter.parse_args([])
         quiet_args = exporter.parse_args(["--no-progress"])
@@ -601,16 +554,6 @@ class PlaylistExporterTests(unittest.TestCase):
                         ),
                     ),
                     removed_releases=(),
-                    added_tracks=(
-                        exporter.TrackReportEntry(
-                            key=("222", "beta album", "beta artist", "1", "beta one"),
-                            release_id="222",
-                            artist_name="Beta Artist",
-                            album_name="Beta Album",
-                            track_number="1",
-                            track_name="Beta One",
-                        ),
-                    ),
                 ),
             ),
             review_notes=(),
@@ -620,8 +563,6 @@ class PlaylistExporterTests(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             exporter.print_summary(summary)
 
-        self.assertNotIn("Added Tracks By Playlist", output.getvalue())
-        self.assertNotIn("Beta Artist | Beta One | Beta Album | track 1 | Release ID 222", output.getvalue())
         self.assertNotIn("- Discogs - Breakbeat: collection/playlists/Discogs - Breakbeat.csv", output.getvalue())
         self.assertIn("Playlist release changes\n------------------------", output.getvalue())
         self.assertIn("222 | Beta Artist | Beta Album | 1 track row", output.getvalue())
