@@ -46,7 +46,6 @@ class SpotifyPlaylist:
     owner_id: str = ""
     public: bool | None = None
     collaborative: bool = False
-    snapshot_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -143,14 +142,14 @@ class SpotifyPlaylistPublishClient(SpotifyPlaylistPlanningClient, Protocol):
         playlist_id: str,
         uris: Sequence[str],
         position: int | None = None,
-    ) -> object: ...
+    ) -> None: ...
 
     def replace_playlist_items(
         self,
         access_token: str,
         playlist_id: str,
         uris: Sequence[str],
-    ) -> object: ...
+    ) -> None: ...
 
 
 class SpotifyClient:
@@ -356,8 +355,7 @@ class SpotifyClient:
         playlist_id: str,
         uris: Sequence[str],
         position: int | None = None,
-    ) -> tuple[str, ...]:
-        snapshots: list[str] = []
+    ) -> None:
         for batch in chunk_values(tuple(uris), 100):
             body: dict[str, object] = {"uris": list(batch)}
             if position is not None:
@@ -371,17 +369,16 @@ class SpotifyClient:
             response = self.request_with_rate_limit_retries(request, operation_name="spotify_playlist_add_items")
             if response.status != 201:
                 raise SpotifyApiError(f"Spotify playlist add items failed with status {response.status}: {response.body}")
-            snapshots.append(parse_snapshot_id(response.body))
+            json.loads(response.body or "{}")
             if position is not None:
                 position += len(batch)
-        return tuple(snapshots)
 
     def replace_playlist_items(
         self,
         access_token: str,
         playlist_id: str,
         uris: Sequence[str],
-    ) -> str:
+    ) -> None:
         if len(uris) > 100:
             raise ValueError("Spotify playlist replace accepts at most 100 URIs per request")
         request = HttpRequest(
@@ -393,33 +390,7 @@ class SpotifyClient:
         response = self.request_with_rate_limit_retries(request, operation_name="spotify_playlist_replace_items")
         if response.status != 200:
             raise SpotifyApiError(f"Spotify playlist replace items failed with status {response.status}: {response.body}")
-        return parse_snapshot_id(response.body)
-
-    def remove_playlist_items(
-        self,
-        access_token: str,
-        playlist_id: str,
-        items: Sequence[SpotifyPlaylistItem],
-        snapshot_id: str = "",
-    ) -> str:
-        items_payload = playlist_item_remove_payload(tuple(items))
-        if not items_payload:
-            return snapshot_id
-        if len(items_payload) > 100:
-            raise ValueError("Spotify playlist remove accepts at most 100 URI groups per request")
-        body: dict[str, object] = {"items": items_payload}
-        if snapshot_id:
-            body["snapshot_id"] = snapshot_id
-        request = HttpRequest(
-            method="DELETE",
-            url=f"{SPOTIFY_API_ROOT}/playlists/{urllib.parse.quote(playlist_id)}/items",
-            headers=spotify_json_headers(access_token),
-            body=json.dumps(body).encode("utf-8"),
-        )
-        response = self.request_with_rate_limit_retries(request, operation_name="spotify_playlist_remove_items")
-        if response.status != 200:
-            raise SpotifyApiError(f"Spotify playlist remove items failed with status {response.status}: {response.body}")
-        return parse_snapshot_id(response.body)
+        json.loads(response.body or "{}")
 
     def request_with_rate_limit_retries(self, request: HttpRequest, operation_name: str = "spotify_search") -> HttpResponse:
         max_retries = max(0, self.retry_policy.max_rate_limit_retries)
@@ -590,7 +561,6 @@ def parse_playlist_object(payload: object) -> SpotifyPlaylist | None:
         owner_id=clean_cell(owner.get("id")) if isinstance(owner, dict) else "",
         public=public_value if isinstance(public_value, bool) else None,
         collaborative=bool(payload.get("collaborative")) if isinstance(payload.get("collaborative"), bool) else False,
-        snapshot_id=clean_cell(payload.get("snapshot_id")),
     )
 
 
@@ -666,11 +636,6 @@ def parse_playlist_item_track(track: object, added_at: str = "", position: int =
     )
 
 
-def parse_snapshot_id(body: str) -> str:
-    payload = json.loads(body or "{}")
-    return clean_cell(payload.get("snapshot_id")) if isinstance(payload, dict) else ""
-
-
 def parse_current_user_id(body: str) -> str:
     payload = json.loads(body or "{}")
     return clean_cell(payload.get("id")) if isinstance(payload, dict) else ""
@@ -678,19 +643,6 @@ def parse_current_user_id(body: str) -> str:
 
 def chunk_values(values: Sequence[str], batch_size: int) -> tuple[tuple[str, ...], ...]:
     return tuple(tuple(values[index : index + batch_size]) for index in range(0, len(values), batch_size))
-
-
-def playlist_item_remove_payload(items: Sequence[SpotifyPlaylistItem]) -> list[dict[str, object]]:
-    positions_by_uri: dict[str, list[int]] = {}
-    for item in items:
-        uri = clean_cell(item.uri)
-        if not uri:
-            continue
-        positions_by_uri.setdefault(uri, []).append(item.position)
-    return [
-        {"uri": uri, "positions": sorted(positions)}
-        for uri, positions in positions_by_uri.items()
-    ]
 
 
 def urllib_transport(request: HttpRequest) -> HttpResponse:

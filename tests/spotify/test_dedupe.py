@@ -24,7 +24,6 @@ class FakeSpotifyDedupeClient:
             for playlist_id, items in (playlist_items_by_id or {}).items()
         }
         self.current_user_id = current_user_id
-        self.remove_calls = []
         self.replace_calls = []
         self.add_calls = []
         self.item_fetch_calls = []
@@ -39,23 +38,12 @@ class FakeSpotifyDedupeClient:
         self.item_fetch_calls.append(playlist_id)
         return tuple(self.playlist_items_by_id.get(playlist_id, ()))
 
-    def remove_playlist_items(self, access_token, playlist_id, items, snapshot_id=""):
-        self.remove_calls.append((playlist_id, tuple(items), snapshot_id))
-        removed_positions = {item.position for item in items}
-        self.playlist_items_by_id[playlist_id] = [
-            item
-            for item in self.playlist_items_by_id.get(playlist_id, ())
-            if item.position not in removed_positions
-        ]
-        return f"{snapshot_id}-after-remove"
-
     def replace_playlist_items(self, access_token, playlist_id, uris):
         self.replace_calls.append((playlist_id, tuple(uris)))
         self.playlist_items_by_id[playlist_id] = list(
             SpotifyPlaylistItem(uri=uri, name="", artists=(), album_name="", position=position)
             for position, uri in enumerate(uris)
         )
-        return "snapshot-after-replace"
 
     def add_playlist_items(self, access_token, playlist_id, uris):
         self.add_calls.append((playlist_id, tuple(uris)))
@@ -65,25 +53,30 @@ class FakeSpotifyDedupeClient:
             for offset, uri in enumerate(uris)
         )
         self.playlist_items_by_id[playlist_id] = list(existing_items + appended_items)
-        return ("snapshot-after-add",) if uris else ()
-
-
-class SpotifyAllUriRemoveDedupeClient(FakeSpotifyDedupeClient):
-    def remove_playlist_items(self, access_token, playlist_id, items, snapshot_id=""):
-        self.remove_calls.append((playlist_id, tuple(items), snapshot_id))
-        removed_uris = {item.uri for item in items}
-        self.playlist_items_by_id[playlist_id] = [
-            item
-            for item in self.playlist_items_by_id.get(playlist_id, ())
-            if item.uri not in removed_uris
-        ]
-        return f"{snapshot_id}-after-remove"
 
 
 class FailingAddSpotifyDedupeClient(FakeSpotifyDedupeClient):
     def add_playlist_items(self, access_token, playlist_id, uris):
         self.add_calls.append((playlist_id, tuple(uris)))
         raise SpotifyApiError("append after replace failed")
+
+
+class PostWriteMismatchSpotifyDedupeClient(FakeSpotifyDedupeClient):
+    def get_playlist_items(self, access_token, playlist_id):
+        items = super().get_playlist_items(access_token, playlist_id)
+        if self.item_fetch_calls.count(playlist_id) != 3:
+            return items
+        wrong_items = (
+            SpotifyPlaylistItem(
+                uri="spotify:track:wrong",
+                name="Wrong",
+                artists=(),
+                album_name="",
+                position=0,
+            ),
+        )
+        self.playlist_items_by_id[playlist_id] = list(wrong_items)
+        return wrong_items
 
 
 class SpotifyDedupeTests(unittest.TestCase):
@@ -106,7 +99,6 @@ class SpotifyDedupeTests(unittest.TestCase):
                         owner_id="current-user",
                         public=False,
                         collaborative=False,
-                        snapshot_id="snapshot-house",
                     ),
                     SpotifyPlaylist(
                         playlist_id="playlist-other-owner",
@@ -169,7 +161,8 @@ class SpotifyDedupeTests(unittest.TestCase):
             self.assertEqual(summary.track_count, 2)
             self.assertEqual(summary.duplicate_count, 1)
             self.assertEqual(summary.removed_count, 0)
-            self.assertEqual(client.remove_calls, [])
+            self.assertEqual(client.replace_calls, [])
+            self.assertEqual(client.add_calls, [])
             report_text = report_path.read_text(encoding="utf-8")
             self.assertIn("Spotify managed playlist dedupe dry-run report", report_text)
             self.assertIn("Eligible playlists: 1", report_text)
@@ -463,7 +456,7 @@ class SpotifyDedupeTests(unittest.TestCase):
     def test_apply_replaces_playlist_with_deduped_final_uri_order(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             report_path = Path(temporary_directory) / "reports" / "dedupe.txt"
-            client = SpotifyAllUriRemoveDedupeClient(
+            client = FakeSpotifyDedupeClient(
                 playlists=(
                     SpotifyPlaylist(
                         playlist_id="playlist-house",
@@ -471,7 +464,6 @@ class SpotifyDedupeTests(unittest.TestCase):
                         url="",
                         owner_id="current-user",
                         public=False,
-                        snapshot_id="snapshot-house",
                     ),
                 ),
                 playlist_items_by_id={
@@ -518,13 +510,76 @@ class SpotifyDedupeTests(unittest.TestCase):
 
             self.assertEqual(summary.duplicate_count, 1)
             self.assertEqual(summary.removed_count, 1)
-            self.assertEqual(client.remove_calls, [])
             self.assertEqual(client.replace_calls, [("playlist-house", ("spotify:track:alpha", "spotify:track:beta"))])
             self.assertEqual(client.add_calls, [])
             self.assertEqual(
                 [item.uri for item in client.playlist_items_by_id["playlist-house"]],
                 ["spotify:track:alpha", "spotify:track:beta"],
             )
+
+    def test_apply_fails_when_refetched_playlist_does_not_match_replacement(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            report_path = Path(temporary_directory) / "reports" / "dedupe.txt"
+            client = PostWriteMismatchSpotifyDedupeClient(
+                playlists=(
+                    SpotifyPlaylist(
+                        playlist_id="playlist-house",
+                        name="Discogs - House",
+                        url="",
+                        owner_id="current-user",
+                        public=False,
+                    ),
+                ),
+                playlist_items_by_id={
+                    "playlist-house": (
+                        SpotifyPlaylistItem(
+                            uri="spotify:track:alpha",
+                            name="Alpha",
+                            artists=("Alpha Artist",),
+                            album_name="Alpha Album",
+                            position=0,
+                        ),
+                        SpotifyPlaylistItem(
+                            uri="spotify:track:alpha",
+                            name="Alpha",
+                            artists=("Alpha Artist",),
+                            album_name="Alpha Album",
+                            position=1,
+                        ),
+                        SpotifyPlaylistItem(
+                            uri="spotify:track:beta",
+                            name="Beta",
+                            artists=("Beta Artist",),
+                            album_name="Beta Album",
+                            position=2,
+                        ),
+                    )
+                },
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "Discogs - House: Spotify playlist replacement verification failed; expected 2 item\\(s\\), found 1",
+            ):
+                dedupe_spotify_managed_playlists(
+                    spotify_client=client,
+                    access_token="access-token",
+                    report_path=report_path,
+                    publisher_config=PublisherConfig(
+                        default_publisher="spotify",
+                        playlist_prefix="Discogs - ",
+                        playlist_suffix="",
+                    ),
+                    apply=True,
+                )
+            report_text = report_path.read_text(encoding="utf-8")
+
+        self.assertEqual(
+            tuple(item.uri for item in client.playlist_items_by_id["playlist-house"]),
+            ("spotify:track:wrong",),
+        )
+        self.assertIn("Run status: failed during apply", report_text)
+        self.assertIn("Duplicate tracks removed: 0", report_text)
 
     def test_playlist_selector_apply_removes_only_selected_playlist_duplicates(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -537,7 +592,6 @@ class SpotifyDedupeTests(unittest.TestCase):
                         url="",
                         owner_id="current-user",
                         public=False,
-                        snapshot_id="snapshot-house",
                     ),
                     SpotifyPlaylist(
                         playlist_id="playlist-techno",
@@ -545,7 +599,6 @@ class SpotifyDedupeTests(unittest.TestCase):
                         url="",
                         owner_id="current-user",
                         public=False,
-                        snapshot_id="snapshot-techno",
                     ),
                 ),
                 playlist_items_by_id={
@@ -575,7 +628,6 @@ class SpotifyDedupeTests(unittest.TestCase):
 
             self.assertEqual(summary.duplicate_count, 1)
             self.assertEqual(summary.removed_count, 1)
-            self.assertEqual(client.remove_calls, [])
             self.assertEqual([call[0] for call in client.replace_calls], ["playlist-techno"])
             self.assertEqual([item.position for item in client.playlist_items_by_id["playlist-house"]], [0, 1])
             self.assertEqual([item.uri for item in client.playlist_items_by_id["playlist-techno"]], ["spotify:track:techno"])
@@ -591,7 +643,6 @@ class SpotifyDedupeTests(unittest.TestCase):
                         url="",
                         owner_id="current-user",
                         public=False,
-                        snapshot_id="snapshot-house",
                     ),
                 ),
                 playlist_items_by_id={
@@ -638,7 +689,6 @@ class SpotifyDedupeTests(unittest.TestCase):
 
         self.assertEqual(summary.duplicate_count, 2)
         self.assertEqual(summary.removed_count, 2)
-        self.assertEqual(client.remove_calls, [])
         self.assertEqual(client.replace_calls, [("playlist-house", ("spotify:track:alpha",))])
         self.assertEqual([item.position for item in client.playlist_items_by_id["playlist-house"]], [0])
 
@@ -675,7 +725,6 @@ class SpotifyDedupeTests(unittest.TestCase):
                         url="",
                         owner_id="current-user",
                         public=False,
-                        snapshot_id="snapshot-house",
                     ),
                 ),
                 playlist_items_by_id={"playlist-house": tuple(playlist_items)},
@@ -695,7 +744,6 @@ class SpotifyDedupeTests(unittest.TestCase):
                 )
             report_text = report_path.read_text(encoding="utf-8")
 
-        self.assertEqual(client.remove_calls, [])
         self.assertEqual(len(client.replace_calls), 1)
         self.assertEqual(len(client.replace_calls[0][1]), 100)
         self.assertEqual(len(client.add_calls), 1)

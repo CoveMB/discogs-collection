@@ -43,14 +43,14 @@ class SpotifyDedupeClient(SpotifyPlaylistReadClient, Protocol):
         access_token: str,
         playlist_id: str,
         uris: Sequence[str],
-    ) -> object: ...
+    ) -> None: ...
 
     def add_playlist_items(
         self,
         access_token: str,
         playlist_id: str,
         uris: Sequence[str],
-    ) -> object: ...
+    ) -> None: ...
 
 
 @dataclass(frozen=True)
