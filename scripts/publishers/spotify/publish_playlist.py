@@ -514,7 +514,6 @@ def publish_spotify_playlists(
                         decision=decision,
                         match_source=match_source,
                         publisher_sync_mode=publisher_sync_mode,
-                        apply=False,
                         existing_identity_keys=existing_identity_keys,
                         existing_incomplete_spotify_uris=existing_incomplete_spotify_uris,
                         seen_source_identity_keys=seen_source_identity_keys,
@@ -717,9 +716,9 @@ def publish_spotify_playlists(
     if apply and publisher_sync_mode == APPEND_SYNC_MODE:
         save_spotify_publish_state(resolved_publish_state_cache_path, publish_state)
     replace_validation_error: ValueError | None = None
-    if apply and not (publisher_sync_mode == APPEND_SYNC_MODE):
+    if apply and publisher_sync_mode == REPLACE_SYNC_MODE:
         try:
-            validate_replace_apply_decisions(tuple(decisions), publisher_sync_mode)
+            validate_replace_apply_decisions(tuple(decisions))
         except ValueError as error:
             replace_validation_error = error
     summary = write_publish_summary(
@@ -736,7 +735,7 @@ def publish_spotify_playlists(
     )
     if replace_validation_error is not None:
         raise replace_validation_error
-    if apply and not (publisher_sync_mode == APPEND_SYNC_MODE):
+    if apply and publisher_sync_mode == REPLACE_SYNC_MODE:
         applied_decisions, applied_final_items, applied_playlist_contexts, spotify_playlists = apply_planned_playlist_writes(
             spotify_client=write_client,
             access_token=access_token,
@@ -745,7 +744,6 @@ def publish_spotify_playlists(
             playlist_contexts=tuple(playlist_contexts),
             planned_write_uris_by_playlist=planned_write_uris_by_playlist,
             spotify_playlists=spotify_playlists,
-            publisher_sync_mode=publisher_sync_mode,
             report_path=report_path,
             cache_path=match_cache_path,
             match_cache=match_cache,
@@ -1232,35 +1230,12 @@ def append_publish_reason(known_to_publisher: bool) -> str:
     return "Spotify artist, album, and track is newly seen and will be appended to playlist"
 
 
-def resolve_track_match(
-    track: PlaylistTrack,
-    spotify_client: SpotifyTrackSearchClient,
-    access_token: str,
-    search_limit: int,
-    match_cache: dict[str, dict[str, object]],
-    timestamp: str,
-    refresh_match_cache: bool = False,
-) -> tuple[TrackMatchDecision, str, int]:
-    if not refresh_match_cache:
-        cached_match = cached_track_match(track, match_cache, seen_at=timestamp)
-        if cached_match:
-            return cached_match.decision, MATCH_SOURCE_CACHE, 0
-    search_result = search_spotify_track(
-        track=track,
-        spotify_client=spotify_client,
-        access_token=access_token,
-        search_limit=search_limit,
-    )
-    return search_result.decision, MATCH_SOURCE_SEARCH, search_result.search_count
-
-
 def build_publish_decision(
     playlist_name: str,
     target_playlist_name: str,
     decision: TrackMatchDecision,
     match_source: str,
     publisher_sync_mode: str,
-    apply: bool,
     existing_identity_keys: set[str],
     existing_incomplete_spotify_uris: set[str],
     seen_source_identity_keys: set[str],
@@ -1289,10 +1264,10 @@ def build_publish_decision(
         status = ALREADY_PRESENT
         reason = "Spotify URI already exists in playlist with incomplete metadata"
     elif publisher_sync_mode == APPEND_SYNC_MODE:
-        status = ADDED if apply else WOULD_ADD
+        status = WOULD_ADD
         reason = "Spotify artist, album, and track will be appended to playlist"
     else:
-        status = INCLUDED if apply else WOULD_INCLUDE
+        status = WOULD_INCLUDE
         reason = "Spotify artist, album, and track will be included in replacement playlist"
     reason = publish_reason_with_match_details(reason, decision)
     return PlaylistPublishDecision(
@@ -1345,10 +1320,7 @@ def publish_reason_with_original_mix_match_details(
 
 def validate_replace_apply_decisions(
     decisions: Sequence[PlaylistPublishDecision],
-    publisher_sync_mode: str,
 ) -> None:
-    if publisher_sync_mode != REPLACE_SYNC_MODE:
-        return
     blocking_decisions = [
         decision
         for decision in decisions
@@ -1420,7 +1392,6 @@ def apply_playlist_writes(
     access_token: str,
     context: PlaylistPublishContext,
     planned_write_uris: tuple[str, ...],
-    publisher_sync_mode: str,
 ) -> PlaylistPublishContext:
     playlist_id = context.playlist_id
     if not playlist_id and planned_write_uris:
@@ -1433,32 +1404,25 @@ def apply_playlist_writes(
         playlist_id = playlist.playlist_id
     if not playlist_id:
         return context
-    if publisher_sync_mode == APPEND_SYNC_MODE:
+    first_batch = planned_write_uris[:100]
+    remaining_batches = planned_write_uris[100:]
+    spotify_client.replace_playlist_items(
+        access_token=access_token,
+        playlist_id=playlist_id,
+        uris=first_batch,
+    )
+    try:
         spotify_client.add_playlist_items(
             access_token=access_token,
             playlist_id=playlist_id,
-            uris=planned_write_uris,
+            uris=remaining_batches,
         )
-    else:
-        first_batch = planned_write_uris[:100]
-        remaining_batches = planned_write_uris[100:]
-        spotify_client.replace_playlist_items(
-            access_token=access_token,
-            playlist_id=playlist_id,
-            uris=first_batch,
-        )
-        try:
-            spotify_client.add_playlist_items(
-                access_token=access_token,
-                playlist_id=playlist_id,
-                uris=remaining_batches,
-            )
-        except (SpotifyApiError, ValueError) as error:
-            raise ValueError(
-                f"replace mode partially replaced {context.target_playlist_name}; "
-                f"sent first {len(first_batch)} URI(s), but appending remaining "
-                f"{len(remaining_batches)} URI(s) failed: {error}"
-            ) from error
+    except (SpotifyApiError, ValueError) as error:
+        raise ValueError(
+            f"replace mode partially replaced {context.target_playlist_name}; "
+            f"sent first {len(first_batch)} URI(s), but appending remaining "
+            f"{len(remaining_batches)} URI(s) failed: {error}"
+        ) from error
     return PlaylistPublishContext(
         playlist_name=context.playlist_name,
         target_playlist_name=context.target_playlist_name,
@@ -1564,22 +1528,6 @@ def validate_playlist_fieldnames(path: Path, fieldnames: Sequence[str]) -> None:
     missing_columns = missing_tunemymusic_columns(fieldnames)
     if missing_columns:
         raise ValueError(f"{path}: missing playlist CSV columns: {', '.join(missing_columns)}")
-
-
-def existing_final_playlist_items(playlist_name: str, existing_items: Sequence[SpotifyPlaylistItem]) -> tuple[FinalPlaylistItem, ...]:
-    return tuple(
-        FinalPlaylistItem(
-            playlist_name=playlist_name,
-            position=index,
-            status="existing",
-            spotify_uri=item.uri,
-            track_name=item.name,
-            artist_names=item.artists,
-            album_name=item.album_name,
-            source_track=None,
-        )
-        for index, item in enumerate(existing_items, start=1)
-    )
 
 
 def replace_final_items_for_playlist(
@@ -1803,7 +1751,6 @@ def apply_planned_playlist_writes(
     playlist_contexts: tuple[PlaylistPublishContext, ...],
     planned_write_uris_by_playlist: Mapping[str, tuple[str, ...]],
     spotify_playlists: Sequence[SpotifyPlaylist],
-    publisher_sync_mode: str,
     report_path: Path,
     cache_path: Path,
     match_cache: Mapping[str, Mapping[str, object]],
@@ -1828,7 +1775,6 @@ def apply_planned_playlist_writes(
                 access_token=access_token,
                 context=context,
                 planned_write_uris=planned_write_uris_by_playlist.get(context.target_playlist_name, ()),
-                publisher_sync_mode=publisher_sync_mode,
             )
         except (SpotifyApiError, ValueError) as error:
             current_contexts[index] = replace(
@@ -1842,7 +1788,7 @@ def apply_planned_playlist_writes(
                 playlist_contexts=tuple(current_contexts),
                 report_path=report_path,
                 apply=True,
-                publisher_sync_mode=publisher_sync_mode,
+                publisher_sync_mode=REPLACE_SYNC_MODE,
                 cache_hit_count=cache_hit_count,
                 search_count=search_count,
                 searched_row_count=searched_row_count,
@@ -1860,7 +1806,7 @@ def apply_planned_playlist_writes(
             playlist_contexts=tuple(current_contexts),
             report_path=report_path,
             apply=True,
-            publisher_sync_mode=publisher_sync_mode,
+            publisher_sync_mode=REPLACE_SYNC_MODE,
             cache_hit_count=cache_hit_count,
             search_count=search_count,
             searched_row_count=searched_row_count,
