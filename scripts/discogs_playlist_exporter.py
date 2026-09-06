@@ -67,7 +67,6 @@ class PlaylistExportFile:
 
 
 ReleaseReportKey = tuple[str, str, str]
-TrackReportKey = tuple[str, str, str, str, str]
 
 
 @dataclass(frozen=True)
@@ -80,22 +79,11 @@ class ReleaseReportEntry:
 
 
 @dataclass(frozen=True)
-class TrackReportEntry:
-    key: TrackReportKey
-    release_id: str
-    artist_name: str
-    album_name: str
-    track_number: str
-    track_name: str
-
-
-@dataclass(frozen=True)
 class PlaylistReleaseChange:
     playlist_name: str
     path: Path
     added_releases: tuple[ReleaseReportEntry, ...]
     removed_releases: tuple[ReleaseReportEntry, ...]
-    added_tracks: tuple[TrackReportEntry, ...] = ()
     notes: tuple[str, ...] = ()
 
 
@@ -116,7 +104,6 @@ class PlaylistExportSummary:
 
 @dataclass(frozen=True)
 class ReleaseExportRecord:
-    row_number: int
     row: Mapping[str, str]
     lookup: ReleaseTracklistLookup | None
 
@@ -247,21 +234,21 @@ def build_release_export_record(
     if not release_id:
         reason = "release_id is missing"
         review_notes.append(f"Row {row_number}: {reason}")
-        return ReleaseExportRecord(row_number=row_number, row=row, lookup=None)
+        return ReleaseExportRecord(row=row, lookup=None)
 
     try:
         lookup = lookup_tracklist(row)
     except Exception as error:  # noqa: BLE001 - export a reviewable fallback instead of dropping the row.
         reason = f"tracklist lookup failed: {type(error).__name__}: {error}"
         review_notes.append(f"Release ID {release_id}: {reason}")
-        return ReleaseExportRecord(row_number=row_number, row=row, lookup=None)
+        return ReleaseExportRecord(row=row, lookup=None)
 
     if not lookup.tracks:
         reason = first_note_or_default(lookup.notes, "no Discogs tracklist found")
         review_notes.append(f"Release ID {release_id}: {reason}")
-        return ReleaseExportRecord(row_number=row_number, row=row, lookup=lookup)
+        return ReleaseExportRecord(row=row, lookup=lookup)
 
-    return ReleaseExportRecord(row_number=row_number, row=row, lookup=lookup)
+    return ReleaseExportRecord(row=row, lookup=lookup)
 
 
 def first_note_or_default(notes: Sequence[str], default: str) -> str:
@@ -383,47 +370,6 @@ def compare_release_entries(
     return added, removed
 
 
-def track_report_key(row: Mapping[str, str]) -> TrackReportKey:
-    return (
-        clean_cell(row.get("Release Id", "")),
-        clean_cell(row.get("Album Name", "")).casefold(),
-        clean_cell(row.get("Artist Name", "")).casefold(),
-        clean_cell(row.get("Track Number", "")),
-        clean_cell(row.get("Track Name", "")).casefold(),
-    )
-
-
-def track_report_entry_from_row(key: TrackReportKey, row: Mapping[str, str]) -> TrackReportEntry:
-    return TrackReportEntry(
-        key=key,
-        release_id=clean_cell(row.get("Release Id", "")),
-        artist_name=clean_cell(row.get("Artist Name", "")),
-        album_name=clean_cell(row.get("Album Name", "")),
-        track_number=clean_cell(row.get("Track Number", "")),
-        track_name=clean_cell(row.get("Track Name", "")),
-    )
-
-
-def track_report_entries_from_rows(rows: Sequence[Mapping[str, str]]) -> tuple[TrackReportEntry, ...]:
-    entries: list[TrackReportEntry] = []
-    seen_keys: set[TrackReportKey] = set()
-    for row in rows:
-        key = track_report_key(row)
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-        entries.append(track_report_entry_from_row(key, row))
-    return tuple(entries)
-
-
-def compare_track_entries(
-    previous_entries: Sequence[TrackReportEntry],
-    current_entries: Sequence[TrackReportEntry],
-) -> tuple[TrackReportEntry, ...]:
-    previous_keys = {entry.key for entry in previous_entries}
-    return tuple(entry for entry in current_entries if entry.key not in previous_keys)
-
-
 def read_existing_playlist_rows_for_report(path: Path, review_notes: list[str]) -> tuple[list[dict[str, str]], tuple[str, ...]]:
     if not path.exists():
         return [], ()
@@ -457,19 +403,13 @@ def build_playlist_release_change(
     if notes:
         added_releases: tuple[ReleaseReportEntry, ...] = ()
         removed_releases: tuple[ReleaseReportEntry, ...] = ()
-        added_tracks: tuple[TrackReportEntry, ...] = ()
     else:
         added_releases, removed_releases = compare_release_entries(previous_entries, current_entries)
-        added_tracks = compare_track_entries(
-            previous_entries=track_report_entries_from_rows(previous_rows),
-            current_entries=track_report_entries_from_rows(current_rows),
-        )
     return PlaylistReleaseChange(
         playlist_name=playlist_name,
         path=path,
         added_releases=added_releases,
         removed_releases=removed_releases,
-        added_tracks=added_tracks,
         notes=tuple(notes),
     )
 
