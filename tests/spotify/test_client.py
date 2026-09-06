@@ -272,26 +272,6 @@ class SpotifyClientTests(unittest.TestCase):
             ),
         )
 
-    def test_lists_current_user_playlists_reads_snapshot_id(self):
-        def transport(request):
-            return HttpResponse(
-                status=200,
-                headers={},
-                body=(
-                    '{"items":[{"id":"playlist-1","name":"Discogs - House",'
-                    '"snapshot_id":"snapshot-alpha",'
-                    '"owner":{"id":"current-user"},"public":false,"collaborative":false,'
-                    '"external_urls":{"spotify":"https://open.spotify.com/playlist/playlist-1"}}],'
-                    '"next":null}'
-                ),
-            )
-
-        client = SpotifyClient(transport=transport)
-
-        playlists = client.list_current_user_playlists(access_token="access-token")
-
-        self.assertEqual(playlists[0].snapshot_id, "snapshot-alpha")
-
     def test_get_playlist_items_reads_tracks_across_pages(self):
         captured_requests = []
         responses = [
@@ -501,18 +481,18 @@ class SpotifyClientTests(unittest.TestCase):
 
         def transport(request):
             captured_requests.append(request)
-            return HttpResponse(status=201, headers={}, body='{"snapshot_id":"snapshot"}')
+            return HttpResponse(status=201, headers={}, body="{}")
 
         client = SpotifyClient(transport=transport)
         uris = tuple(f"spotify:track:{index}" for index in range(101))
 
-        snapshots = client.add_playlist_items(
+        result = client.add_playlist_items(
             access_token="access-token",
             playlist_id="playlist-1",
             uris=uris,
         )
 
-        self.assertEqual(snapshots, ("snapshot", "snapshot"))
+        self.assertIsNone(result)
         self.assertEqual([request.method for request in captured_requests], ["POST", "POST"])
         self.assertEqual(captured_requests[0].url, "https://api.spotify.com/v1/playlists/playlist-1/items")
         self.assertEqual(len(json.loads(captured_requests[0].body.decode("utf-8"))["uris"]), 100)
@@ -525,7 +505,7 @@ class SpotifyClientTests(unittest.TestCase):
 
         def transport(request):
             captured_requests.append(request)
-            return HttpResponse(status=201, headers={}, body='{"snapshot_id":"snapshot"}')
+            return HttpResponse(status=201, headers={}, body="{}")
 
         client = SpotifyClient(transport=transport)
 
@@ -549,17 +529,17 @@ class SpotifyClientTests(unittest.TestCase):
 
         def transport(request):
             captured_requests.append(request)
-            return HttpResponse(status=200, headers={}, body='{"snapshot_id":"snapshot"}')
+            return HttpResponse(status=200, headers={}, body="{}")
 
         client = SpotifyClient(transport=transport)
 
-        snapshot = client.replace_playlist_items(
+        result = client.replace_playlist_items(
             access_token="access-token",
             playlist_id="playlist-1",
             uris=("spotify:track:alpha", "spotify:track:beta"),
         )
 
-        self.assertEqual(snapshot, "snapshot")
+        self.assertIsNone(result)
         self.assertEqual(captured_requests[0].method, "PUT")
         self.assertEqual(captured_requests[0].url, "https://api.spotify.com/v1/playlists/playlist-1/items")
         self.assertEqual(
@@ -567,39 +547,67 @@ class SpotifyClientTests(unittest.TestCase):
             ["spotify:track:alpha", "spotify:track:beta"],
         )
 
-    def test_remove_playlist_items_sends_uri_positions_and_snapshot(self):
-        captured_requests = []
-
+    def test_add_playlist_items_raises_spotify_api_error_for_non_201(self):
         def transport(request):
-            captured_requests.append(request)
-            return HttpResponse(status=200, headers={}, body='{"snapshot_id":"snapshot-after-remove"}')
+            return HttpResponse(status=400, headers={}, body="fixed body")
 
         client = SpotifyClient(transport=transport)
 
-        snapshot_id = client.remove_playlist_items(
-            access_token="access-token",
-            playlist_id="playlist-1",
-            items=(
-                SpotifyPlaylistItem(uri="spotify:track:alpha", name="Alpha", artists=(), album_name="", position=3),
-                SpotifyPlaylistItem(uri="spotify:track:alpha", name="Alpha", artists=(), album_name="", position=5),
-                SpotifyPlaylistItem(uri="spotify:track:beta", name="Beta", artists=(), album_name="", position=8),
-            ),
-            snapshot_id="snapshot-before-remove",
+        with self.assertRaises(SpotifyApiError) as raised:
+            client.add_playlist_items(
+                access_token="access-token",
+                playlist_id="playlist-1",
+                uris=("spotify:track:alpha",),
+            )
+
+        self.assertEqual(
+            str(raised.exception),
+            "Spotify playlist add items failed with status 400: fixed body",
         )
 
-        self.assertEqual(snapshot_id, "snapshot-after-remove")
-        self.assertEqual(captured_requests[0].method, "DELETE")
-        self.assertEqual(captured_requests[0].url, "https://api.spotify.com/v1/playlists/playlist-1/items")
+    def test_replace_playlist_items_raises_spotify_api_error_for_non_200(self):
+        def transport(request):
+            return HttpResponse(status=400, headers={}, body="fixed body")
+
+        client = SpotifyClient(transport=transport)
+
+        with self.assertRaises(SpotifyApiError) as raised:
+            client.replace_playlist_items(
+                access_token="access-token",
+                playlist_id="playlist-1",
+                uris=("spotify:track:alpha",),
+            )
+
         self.assertEqual(
-            json.loads(captured_requests[0].body.decode("utf-8")),
-            {
-                "items": [
-                    {"uri": "spotify:track:alpha", "positions": [3, 5]},
-                    {"uri": "spotify:track:beta", "positions": [8]},
-                ],
-                "snapshot_id": "snapshot-before-remove",
-            },
+            str(raised.exception),
+            "Spotify playlist replace items failed with status 400: fixed body",
         )
+
+    def test_add_playlist_items_preserves_success_response_json_validation(self):
+        def transport(request):
+            return HttpResponse(status=201, headers={}, body="not json")
+
+        client = SpotifyClient(transport=transport)
+
+        with self.assertRaises(json.JSONDecodeError):
+            client.add_playlist_items(
+                access_token="access-token",
+                playlist_id="playlist-1",
+                uris=("spotify:track:alpha",),
+            )
+
+    def test_replace_playlist_items_preserves_success_response_json_validation(self):
+        def transport(request):
+            return HttpResponse(status=200, headers={}, body="not json")
+
+        client = SpotifyClient(transport=transport)
+
+        with self.assertRaises(json.JSONDecodeError):
+            client.replace_playlist_items(
+                access_token="access-token",
+                playlist_id="playlist-1",
+                uris=("spotify:track:alpha",),
+            )
 
     def test_search_tracks_honors_retry_after_before_retrying_rate_limit(self):
         responses = [

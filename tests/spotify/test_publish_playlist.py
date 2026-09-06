@@ -150,7 +150,6 @@ class PublishingSpotifyClient(FakeSpotifyClient):
             playlist_items = self.playlist_items_by_id.setdefault(playlist_id, [])
             insert_position = max(0, min(position, len(playlist_items)))
             playlist_items[insert_position:insert_position] = new_items
-        return ("snapshot-add",) if uris else ()
 
     def replace_playlist_items(self, access_token, playlist_id, uris):
         self.replace_calls.append((playlist_id, tuple(uris)))
@@ -158,7 +157,6 @@ class PublishingSpotifyClient(FakeSpotifyClient):
             self.playlist_item_for_uri(uri)
             for uri in uris
         ]
-        return "snapshot-replace"
 
     def playlist_item_for_uri(self, uri):
         candidate = self.candidates_by_uri.get(uri)
@@ -180,7 +178,7 @@ class StrictPositionPublishingSpotifyClient(PublishingSpotifyClient):
                 'Spotify playlist add items failed with status 400: '
                 '{"error": {"status": 400, "message": "Index out of bounds" } }'
             )
-        return super().add_playlist_items(access_token, playlist_id, uris, position=position)
+        super().add_playlist_items(access_token, playlist_id, uris, position=position)
 
 
 class AlbumPublishingSpotifyClient(PublishingSpotifyClient):
@@ -242,7 +240,7 @@ class FailingSecondPlaylistPublishClient(PublishingSpotifyClient):
     def add_playlist_items(self, access_token, playlist_id, uris, position=None):
         if playlist_id == "playlist-techno":
             raise SpotifyApiError("Spotify playlist add items failed with status 500: temporary failure")
-        return super().add_playlist_items(access_token, playlist_id, uris, position=position)
+        super().add_playlist_items(access_token, playlist_id, uris, position=position)
 
 
 class SearchErrorPublishingClient(PublishingSpotifyClient):
@@ -256,7 +254,7 @@ class FailingReplaceRemainderPublishClient(PublishingSpotifyClient):
     def add_playlist_items(self, access_token, playlist_id, uris, position=None):
         if self.replace_calls:
             raise SpotifyApiError("Spotify playlist add items failed with status 500: temporary failure")
-        return super().add_playlist_items(access_token, playlist_id, uris, position=position)
+        super().add_playlist_items(access_token, playlist_id, uris, position=position)
 
 
 class FailingFirstAppendBatchClient(PublishingSpotifyClient):
@@ -300,7 +298,6 @@ class FailingFirstAppendBatchClient(PublishingSpotifyClient):
                 raise SpotifyApiError("Spotify playlist add items failed with status 429: Too many requests")
             if position is not None:
                 position += len(batch)
-        return ("snapshot-add",) if uris else ()
 
     def playlist_item_for_uri(self, uri):
         candidate = self.candidates_by_uri[uri]
