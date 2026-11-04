@@ -9,6 +9,7 @@ SCRIPTS_DIRECTORY = PROJECT_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 
 from publishers.spotify.client import (
+    HttpRequest,
     HttpResponse,
     SpotifyAlbumCandidate,
     SpotifyAlbumTrack,
@@ -24,6 +25,199 @@ from publishers.spotify.client import (
 
 
 class SpotifyClientTests(unittest.TestCase):
+    def test_continuous_first_429_unwinds_without_retry_or_payload_leak(self):
+        from publishers.spotify import client as module
+        from publishers.spotify.request_control import SpotifyRequestControl
+        from tests.spotify.test_request_control import FakeClock
+        self.assertTrue(hasattr(module, "SpotifyRateLimitPauseError"))
+        clock = FakeClock()
+        control = SpotifyRequestControl(1, continuous=True, monotonic=clock.monotonic,
+                                        wall_time=lambda: 1700000000, sleep=clock.sleep)
+        calls = []
+        def transport(request):
+            calls.append(request)
+            return HttpResponse(429, {"Retry-After": "7200"}, '{"secret":"BODY_SENTINEL"}')
+        client = SpotifyClient(transport=transport, request_control=control, sleep=clock.sleep)
+        with self.assertRaises(module.SpotifyRateLimitPauseError) as caught:
+            client.search_tracks("TOKEN_SENTINEL", "QUERY_SENTINEL")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(clock.sleeps, [])
+        self.assertEqual(caught.exception.info.retry_after_seconds, 7200)
+        for sentinel in ("TOKEN_SENTINEL", "QUERY_SENTINEL", "BODY_SENTINEL"):
+            self.assertNotIn(sentinel, str(caught.exception))
+
+    def test_continuous_terminal_responses_are_sanitized_and_not_retried(self):
+        from publishers.spotify.request_control import SpotifyRequestControl
+        for response in (HttpResponse(500, {}, "BODY_SENTINEL"), HttpResponse(200, {}, "BODY_SENTINEL"),
+                         HttpResponse(200, {}, "[]"), HttpResponse(200, {}, "{}"),
+                         HttpResponse(200, {}, '{"tracks":{"items":[{}]}}')):
+            calls = []
+            def transport(request):
+                calls.append(request)
+                return response
+            client = SpotifyClient(transport=transport, request_control=SpotifyRequestControl(1, continuous=True))
+            with self.assertRaises(SpotifyApiError) as caught:
+                client.search_tracks("TOKEN_SENTINEL", "QUERY_SENTINEL")
+            self.assertEqual(len(calls), 1)
+            for sentinel in ("BODY_SENTINEL", "TOKEN_SENTINEL", "QUERY_SENTINEL"):
+                self.assertNotIn(sentinel, str(caught.exception))
+        calls = []
+        def failure(request):
+            calls.append(request)
+            raise OSError("TRANSPORT_SENTINEL")
+        client = SpotifyClient(transport=failure, request_control=SpotifyRequestControl(1, continuous=True))
+        with self.assertRaises(SpotifyApiError) as caught:
+            client.add_playlist_items("TOKEN_SENTINEL", "playlist", ["spotify:track:alpha"])
+        self.assertNotIn("TRANSPORT_SENTINEL", str(caught.exception))
+        self.assertEqual(len(calls), 1)
+
+    def test_unexpected_success_status_is_sanitized_and_not_retried(self):
+        from publishers.spotify.request_control import SpotifyRequestControl
+        client = SpotifyClient(transport=lambda request: HttpResponse(200, {}, '{"secret":"BODY_SENTINEL"}'), request_control=SpotifyRequestControl(1, continuous=True))
+        with self.assertRaises(SpotifyApiError) as caught:
+            client.create_playlist("TOKEN_SENTINEL", "Synthetic")
+        self.assertNotIn("BODY_SENTINEL", str(caught.exception))
+        self.assertEqual(client.request_control.request_count, 1)
+
+    def test_retry_policy_falls_back_for_nonfinite_headers(self):
+        policy = SpotifyRetryPolicy()
+        for value in ("nan", "inf", "-inf", "1e309"):
+            with self.subTest(value=value):
+                self.assertEqual(policy.rate_limit_wait_seconds({"rEtRy-AfTeR": value}), 60.0)
+
+    def test_request_starts_are_spaced_at_transport(self):
+        from publishers.spotify.request_control import SpotifyRequestControl
+        from tests.spotify.test_request_control import FakeClock
+
+        clock = FakeClock()
+        control = SpotifyRequestControl(1.0, monotonic=clock.monotonic, sleep=clock.sleep)
+        requests = []
+        starts = []
+        responses = [
+            HttpResponse(200, {}, '{"tracks":{"items":[]}}'),
+            HttpResponse(200, {}, '{"items":[],"next":"page-two"}'),
+            HttpResponse(200, {}, '{"items":[],"next":null}'),
+            HttpResponse(200, {}, '{"items":[],"next":"page-two"}'),
+            HttpResponse(200, {}, '{"items":[],"next":null}'),
+            HttpResponse(200, {}, '{"id":"owner"}'),
+            HttpResponse(200, {}, '{"items":[],"next":"page-two"}'),
+            HttpResponse(200, {}, '{"items":[],"next":null}'),
+            HttpResponse(201, {}, '{"id":"playlist","name":"Synthetic"}'),
+            HttpResponse(201, {}, '{}'),
+            HttpResponse(201, {}, '{}'),
+            HttpResponse(200, {}, '{}'),
+        ]
+
+        def transport(request):
+            requests.append(request)
+            starts.append(clock.now)
+            return responses.pop(0)
+
+        client = SpotifyClient(transport=transport, sleep=clock.sleep, request_control=control)
+        client.search_tracks("synthetic-token", "synthetic query")
+        client.get_album_tracks("synthetic-token", "album")
+        client.list_current_user_playlists("synthetic-token")
+        client.get_current_user_id("synthetic-token")
+        client.get_playlist_items("synthetic-token", "playlist")
+        client.create_playlist("synthetic-token", "Synthetic")
+        client.add_playlist_items("synthetic-token", "playlist", [f"spotify:track:{index}" for index in range(101)], position=2)
+        client.replace_playlist_items("synthetic-token", "playlist", ["spotify:track:replacement"])
+
+        self.assertEqual(starts, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+        self.assertEqual(control.request_count, 12)
+        self.assertEqual([request.method for request in requests], ["GET"] * 8 + ["POST"] * 3 + ["PUT"])
+        self.assertIn("offset=50", requests[2].url)
+        self.assertIn("offset=50", requests[4].url)
+        self.assertIn("offset=50", requests[7].url)
+        first_add = json.loads(requests[9].body)
+        last_add = json.loads(requests[10].body)
+        self.assertEqual(len(first_add["uris"]), 100)
+        self.assertEqual(first_add["position"], 2)
+        self.assertEqual(last_add, {"uris": ["spotify:track:100"], "position": 102})
+
+    def test_retry_wait_overlaps_pacing_and_counts_every_attempt(self):
+        from publishers.spotify.request_control import SpotifyRequestControl
+        from tests.spotify.test_request_control import FakeClock
+
+        for header, expected_starts in (("4", [0.0, 4.0]), ("0.5", [0.0, 1.0])):
+            with self.subTest(header=header):
+                clock = FakeClock()
+                control = SpotifyRequestControl(1.0, monotonic=clock.monotonic, sleep=clock.sleep)
+                starts = []
+                responses = [HttpResponse(429, {"rEtRy-AfTeR": header}, ""), HttpResponse(200, {}, '{"tracks":{"items":[]}}')]
+
+                def transport(request):
+                    starts.append(clock.now)
+                    return responses.pop(0)
+
+                client = SpotifyClient(transport=transport, sleep=clock.sleep, request_control=control)
+                client.search_tracks("token", "query")
+                self.assertEqual(starts, expected_starts)
+                self.assertEqual(control.request_count, 2)
+
+    def test_default_retry_budget_has_four_attempts_and_three_fallback_waits(self):
+        from publishers.spotify.request_control import SpotifyRequestControl
+        from tests.spotify.test_request_control import FakeClock
+
+        for header in (None, "", "0", "-1", "nan", "inf", "-inf", "1e309", "not-seconds"):
+            with self.subTest(header=header):
+                clock = FakeClock()
+                control = SpotifyRequestControl(1.0, monotonic=clock.monotonic, sleep=clock.sleep)
+                starts = []
+
+                def transport(request):
+                    starts.append(clock.now)
+                    return HttpResponse(429, {} if header is None else {"Retry-After": header}, "")
+
+                client = SpotifyClient(transport=transport, sleep=clock.sleep, request_control=control)
+                with self.assertRaises(SpotifyRateLimitRetriesExhaustedError):
+                    client.search_tracks("token", "query")
+                self.assertEqual(starts, [0, 60, 120, 180])
+                self.assertEqual(clock.sleeps, [60, 60, 60])
+                self.assertEqual(control.request_count, 4)
+
+    def test_retry_wait_limit_includes_exactly_480_seconds(self):
+        for delay, expected_waits in (("480", [480.0]), ("480.1", []), ("9999", [])):
+            with self.subTest(delay=delay):
+                responses = [HttpResponse(429, {"Retry-After": delay}, ""), HttpResponse(200, {}, '{"tracks":{"items":[]}}')]
+                sleeps = []
+                client = SpotifyClient(transport=lambda request: responses.pop(0), sleep=sleeps.append)
+                if expected_waits:
+                    client.search_tracks("token", "query")
+                else:
+                    with self.assertRaises(SpotifyRateLimitDeferredError):
+                        client.search_tracks("token", "query")
+                self.assertEqual(sleeps, expected_waits)
+
+    def test_transport_failure_is_counted_without_retry(self):
+        def transport(request):
+            raise OSError("synthetic transport failure")
+
+        client = SpotifyClient(transport=transport)
+        with self.assertRaises(OSError):
+            client.search_tracks("token", "query")
+        self.assertEqual(client.request_control.request_count, 1)
+
+    def test_error_responses_and_malformed_success_are_counted_without_retry(self):
+        for response, error in (
+            (HttpResponse(0, {}, "synthetic timeout"), SpotifyApiError),
+            (HttpResponse(500, {}, "synthetic server failure"), SpotifyApiError),
+            (HttpResponse(200, {}, "malformed JSON"), ValueError),
+        ):
+            with self.subTest(status=response.status):
+                client = SpotifyClient(transport=lambda request: response)
+                with self.assertRaises(error):
+                    client.search_tracks("token", "query")
+                self.assertEqual(client.request_control.request_count, 1)
+
+    def test_invalid_retry_header_is_not_echoed_to_debug_output(self):
+        lines = []
+        responses = [HttpResponse(429, {"Retry-After": "private-header-sentinel"}, "private-body-sentinel"), HttpResponse(200, {}, '{"tracks":{"items":[]}}')]
+        client = SpotifyClient(transport=lambda request: responses.pop(0), sleep=lambda seconds: None, debug_log=lines.append)
+        client.search_tracks("private-token-sentinel", "private-query-sentinel")
+        self.assertNotIn("private-", "\n".join(lines))
+        self.assertIn("retry_after=(unusable)", "\n".join(lines))
+
     def test_search_tracks_sends_structured_query_as_spotify_q_parameter(self):
         captured_requests = []
 
@@ -868,6 +1062,152 @@ class SpotifyClientTests(unittest.TestCase):
         )
         self.assertNotIn("Alpha One", "\n".join(debug_lines))
         self.assertNotIn("access-token", "\n".join(debug_lines))
+
+
+class RenewableSpotifyClientTests(unittest.TestCase):
+    def test_provider_overrides_stale_endpoint_token_at_transport(self):
+        requests = []
+
+        class Provider:
+            def get_access_token(self, force_refresh=False):
+                return "fresh"
+
+        def transport(request):
+            requests.append(request)
+            return HttpResponse(200, {}, '{"id":"owner"}')
+
+        client = SpotifyClient(transport=transport)
+        client.token_provider = Provider()
+        client.get_current_user_id("stale")
+        self.assertEqual(requests[0].headers["Authorization"], "Bearer fresh")
+
+    def test_refresh_after_pacing_records_actual_dispatch_and_preserves_omitted_fields(self):
+        import tempfile
+        from pathlib import Path
+        from publishers.spotify.env import SpotifySettings
+        from publishers.spotify.session import SpotifySession
+        from publishers.spotify.token_cache import SpotifyToken, load_spotify_token, save_spotify_token
+        from publishers.spotify.request_control import SpotifyRequestControl
+        from tests.spotify.test_request_control import FakeClock
+
+        clock = FakeClock()
+        starts = []
+        tokens = []
+        refresh_starts = []
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SpotifySettings("client", "http://localhost/callback", Path(directory) / "token.json")
+            original = SpotifyToken("old", "refresh", 61, "scope", "Bearer")
+            save_spotify_token(settings.token_cache_path, original)
+
+            def token_transport(request):
+                refresh_starts.append(clock.now)
+                clock.sleep(2)
+                return HttpResponse(200, {}, '{"access_token":"fresh","expires_in":3600}')
+
+            session = SpotifySession(settings, original, ("scope",), wall_time=clock.monotonic, token_transport=token_transport)
+
+            def transport(request):
+                starts.append(clock.now)
+                tokens.append(request.headers["Authorization"])
+                saved = load_spotify_token(settings.token_cache_path)
+                assert saved is not None
+                self.assertEqual(request.headers["Authorization"], "Bearer " + saved.access_token)
+                self.assertEqual(saved.refresh_token, "refresh")
+                self.assertEqual(saved.scope, "scope")
+                return HttpResponse(200, {}, '{"id":"owner"}')
+
+            control = SpotifyRequestControl(1, monotonic=clock.monotonic, sleep=clock.sleep)
+            client = SpotifyClient(transport=transport, request_control=control, token_provider=session)
+            for _ in range(3):
+                client.get_current_user_id("ignored")
+            self.assertEqual(starts, [0, 3, 4])
+            self.assertEqual(refresh_starts, [1])
+            self.assertEqual(tokens, ["Bearer old", "Bearer fresh", "Bearer fresh"])
+            self.assertEqual(control.request_count, 3)
+            self.assertEqual(session.refresh_count, 1)
+
+    def test_one_forced_refresh_for_get_and_rejected_post_with_paced_retry(self):
+        from publishers.spotify.client import SpotifyAuthenticationError
+        from publishers.spotify.request_control import SpotifyRequestControl
+        from tests.spotify.test_request_control import FakeClock
+
+        for method in ("GET", "POST"):
+            for statuses in ((401, 200), (401, 401), (403,), (429, 401, 200), (401, 429, 401)):
+                with self.subTest(method=method, statuses=statuses):
+                    clock = FakeClock()
+                    refreshes = []
+                    requests = []
+                    starts = []
+                    remaining = list(statuses)
+
+                    class Provider:
+                        def get_access_token(self, force_refresh=False):
+                            refreshes.append(force_refresh)
+                            return "fresh" if any(refreshes) else "old"
+
+                    def transport(request):
+                        requests.append(request)
+                        starts.append(clock.now)
+                        return HttpResponse(remaining.pop(0), {"Retry-After": "2"}, '{"secret":"response-secret"}')
+
+                    control = SpotifyRequestControl(1, monotonic=clock.monotonic, sleep=clock.sleep)
+                    client = SpotifyClient(transport=transport, sleep=clock.sleep, request_control=control, token_provider=Provider())
+                    request = HttpRequest(method, "https://api.spotify.com/v1/example", {"Authorization":"Bearer ignored", "Content-Type":"application/json"}, b'{"uris":["spotify:track:a"]}' if method == "POST" else None)
+                    if statuses[-1] != 200:
+                        with self.assertRaises(SpotifyAuthenticationError) as caught:
+                            client.request_with_rate_limit_retries(request)
+                        self.assertNotIn("response-secret", str(caught.exception))
+                    else:
+                        self.assertEqual(client.request_with_rate_limit_retries(request).status, 200)
+                    self.assertEqual(len(requests), len(statuses))
+                    self.assertEqual(sum(refreshes), 0 if statuses == (403,) else 1)
+                    self.assertEqual(control.request_count, len(statuses))
+                    self.assertTrue(all(b-a >= 1 for a,b in zip(starts, starts[1:])))
+                    self.assertTrue(all(r.body == request.body and r.headers["Content-Type"] == "application/json" for r in requests))
+                    self.assertEqual(requests[0].headers["Authorization"], "Bearer old")
+                    if 401 in statuses and len(statuses) > 1:
+                        self.assertEqual(requests[-1].headers["Authorization"], "Bearer fresh")
+
+    def test_uncertain_write_is_never_replayed_and_provider_none_stays_compatible(self):
+        for failure in (HttpResponse(500, {}, ""), TimeoutError("uncertain"), HttpResponse(401, {}, ""), HttpResponse(403, {}, "")):
+            with self.subTest(failure=failure):
+                requests = []
+
+                def transport(request):
+                    requests.append(request)
+                    if isinstance(failure, Exception):
+                        raise failure
+                    return failure
+
+                client = SpotifyClient(transport=transport)
+                request = HttpRequest("POST", "https://api.spotify.com/v1/example", {"Authorization":"Bearer raw"}, b"body")
+                if isinstance(failure, Exception):
+                    with self.assertRaises(TimeoutError):
+                        client.request_with_rate_limit_retries(request)
+                else:
+                    self.assertEqual(client.request_with_rate_limit_retries(request), failure)
+                self.assertEqual(requests, [request])
+
+    def test_provider_does_not_retry_transport_or_server_write_failure(self):
+        class Provider:
+            def get_access_token(self, force_refresh=False):
+                if force_refresh:
+                    raise AssertionError("Uncertain writes must not force refresh")
+                return "fresh"
+
+        for failure in (HttpResponse(500, {}, ""), TimeoutError("uncertain")):
+            requests = []
+
+            def transport(request):
+                requests.append(request)
+                if isinstance(failure, Exception):
+                    raise failure
+                return failure
+
+            client = SpotifyClient(transport=transport, token_provider=Provider())
+            with self.assertRaises((SpotifyApiError, TimeoutError)):
+                client.add_playlist_items("ignored", "target", ("spotify:track:one",))
+            self.assertEqual(len(requests), 1)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,11 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from publishers.spotify.request_control import SpotifyRequestControl
+    from publishers.spotify.session import SpotifySession
 
 from publishers.spotify.matching import PlaylistTrack, SpotifyTrackCandidate, TrackMatchDecision
 
@@ -25,6 +30,14 @@ MATCH_SOURCE_ALBUM = "album"
 MATCH_SOURCE_SEARCH = "search"
 
 InfoLog = Callable[[str], None]
+
+
+@dataclass(frozen=True)
+class SpotifyAlbumAttemptKey:
+    source_tracks: tuple[PlaylistTrack, ...]
+    fallback_track_candidates: tuple[SpotifyTrackCandidate, ...]
+    search_limit: int
+    matcher_version: int
 
 
 @dataclass(frozen=True)
@@ -87,6 +100,28 @@ class SpotifyPublishSummary:
     decisions: tuple[PlaylistPublishDecision, ...]
     final_items: tuple[FinalPlaylistItem, ...]
     playlist_contexts: tuple[PlaylistPublishContext, ...]
+    request_count: int | None = None
+    token_refresh_count: int | None = None
+    run_state: Literal["processing", "waiting", "complete", "needs_action", "interrupted", "failed"] = "processing"
+    pause_reason: str = ""
+    resume_at: str | None = None
+    rate_limit_count: int | None = None
+    quota_count: int | None = None
+    completed_pass_count: int | None = None
+    wait_seconds: float | None = None
+    stop_reason: Literal["complete", "search_budget"] = "complete"
+    resume_progress_made: bool = False
+
+
+@dataclass
+class SpotifyPublishInvocation:
+    """Invocation-owned report/account state; contains no retry policy."""
+
+    request_control: SpotifyRequestControl
+    session: SpotifySession | None = None
+    completed_pass_count: int = 0
+    current_user_id: str | None = None
+    latest_summary: SpotifyPublishSummary | None = None
 
 
 @dataclass(frozen=True)
