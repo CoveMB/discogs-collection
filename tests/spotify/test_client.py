@@ -25,6 +25,38 @@ from publishers.spotify.client import (
 
 
 class SpotifyClientTests(unittest.TestCase):
+    def test_continuous_pause_survives_debug_log_failure_but_not_ctrl_c(self):
+        from publishers.spotify.client import SpotifyRateLimitPauseError
+        from publishers.spotify.request_control import SpotifyRequestControl
+        from tests.spotify.test_request_control import FakeClock
+
+        for failure in (OSError("LOG_SENTINEL"), KeyboardInterrupt()):
+            with self.subTest(failure=type(failure).__name__):
+                clock = FakeClock()
+                control = SpotifyRequestControl(1, continuous=True, monotonic=clock.monotonic,
+                                                wall_time=lambda: 1700000000, sleep=clock.sleep)
+                lines = []
+                def log(message):
+                    lines.append(message)
+                    if "_response" in message:
+                        raise failure
+                client = SpotifyClient(
+                    transport=lambda request: HttpResponse(429, {"Retry-After": "7200"}, '{"error":{"reason":"QUOTA_EXCEEDED"}}'),
+                    request_control=control, debug_log=log,
+                )
+                expected = KeyboardInterrupt if isinstance(failure, KeyboardInterrupt) else SpotifyRateLimitPauseError
+                with self.assertRaises(expected) as caught:
+                    client.search_tracks("TOKEN_SENTINEL", "QUERY_SENTINEL")
+                self.assertEqual(control.request_count, 1)
+                self.assertEqual(clock.sleeps, [])
+                self.assertEqual(len(lines), 2)
+                if isinstance(caught.exception, KeyboardInterrupt):
+                    self.assertIsInstance(caught.exception.__cause__, SpotifyRateLimitPauseError)
+                if isinstance(caught.exception, SpotifyRateLimitPauseError):
+                    self.assertEqual(caught.exception.info.retry_after_seconds, 7200)
+                    self.assertIn("2023-11-15T00:13:20+00:00", control.pause_description(caught.exception.info))
+                    self.assertNotIn("LOG_SENTINEL", str(caught.exception))
+
     def test_continuous_first_429_unwinds_without_retry_or_payload_leak(self):
         from publishers.spotify import client as module
         from publishers.spotify.request_control import SpotifyRequestControl

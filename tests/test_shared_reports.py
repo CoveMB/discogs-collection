@@ -1,5 +1,6 @@
 import io
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -14,6 +15,25 @@ from shared.reports import format_report_section, print_report_section  # noqa: 
 
 
 class ReportTests(unittest.TestCase):
+    def test_text_report_replaces_existing_content_with_utf8_lines(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "nested" / "report.txt"
+            reports.write_text_report(path, ["old content"])
+            reports.write_text_report(path, (line for line in ("Résumé", "Next line")))
+            self.assertEqual(path.read_bytes(), "Résumé\nNext line".encode("utf-8"))
+            self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_failed_text_report_replace_retains_previous_bytes_and_cleans_temporary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.txt"
+            path.write_text("previous deadline")
+            error = OSError("replacement unavailable")
+            with patch.object(Path, "replace", side_effect=error), self.assertRaises(OSError) as caught:
+                reports.write_text_report(path, ["new content"])
+            self.assertIs(caught.exception, error)
+            self.assertEqual(path.read_text(), "previous deadline")
+            self.assertEqual(list(path.parent.iterdir()), [path])
+
     def test_script_report_path_uses_timestamp_then_script_name(self):
         script_report_path = reports.script_report_path
         self.assertIsNotNone(script_report_path)

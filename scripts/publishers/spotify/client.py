@@ -435,7 +435,16 @@ class SpotifyClient:
                     raise
                 raise SpotifyApiError(f"Spotify transport failed during {operation_name}; request outcome may be uncertain") from None
             pause = self.request_control.on_response(response.status, response.headers, response.body, operation_name)
-            self.log_debug(format_debug_response(attempt_number, response, operation_name=operation_name))
+            try:
+                self.log_debug(format_debug_response(attempt_number, response, operation_name=operation_name))
+            except KeyboardInterrupt as error:
+                if pause is not None:
+                    raise error from SpotifyRateLimitPauseError(pause)
+                raise
+            except Exception:
+                if pause is None:
+                    raise
+                raise SpotifyRateLimitPauseError(pause) from None
             if pause is not None:
                 raise SpotifyRateLimitPauseError(pause)
             if self.token_provider is not None and response.status in {401, 403}:

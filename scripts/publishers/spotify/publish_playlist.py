@@ -698,9 +698,11 @@ def publish_spotify_playlists(
                         if progress:
                             try:
                                 progress.update(processed_track_count)
-                            except (Exception, KeyboardInterrupt):
+                            except (Exception, KeyboardInterrupt) as cleanup_error:
                                 if row_error is None:
                                     raise
+                                if isinstance(cleanup_error, KeyboardInterrupt) and isinstance(row_error, SpotifyRateLimitPauseError):
+                                    raise cleanup_error from row_error
                                 row_error.args = (f"{row_error}; progress display update failed",)
 
                 if publisher_sync_mode == APPEND_SYNC_MODE:
@@ -803,9 +805,11 @@ def publish_spotify_playlists(
             if progress:
                 try:
                     progress.finish()
-                except (Exception, KeyboardInterrupt):
+                except (Exception, KeyboardInterrupt) as cleanup_error:
                     if primary_error is None:
                         raise
+                    if isinstance(cleanup_error, KeyboardInterrupt) and isinstance(primary_error, SpotifyRateLimitPauseError):
+                        raise cleanup_error from primary_error
                     primary_error.args = (f"{primary_error}; progress display cleanup failed",)
     except (Exception, KeyboardInterrupt) as error:
         checkpoint_failures: list[str] = []
@@ -821,6 +825,13 @@ def publish_spotify_playlists(
                 checkpoint_failures.append("publish state checkpoint failed")
         if isinstance(error, KeyboardInterrupt):
             run_status = f"interrupted - stopped after {len(decisions)} of {total_tracks} tracks"
+            if isinstance(error.__cause__, SpotifyRateLimitPauseError) and request_control is not None:
+                description = request_control.pause_description(error.__cause__.info)
+                run_status += "; " + description
+                try:
+                    print("Interrupted: " + description, file=sys.stderr)
+                except (Exception, KeyboardInterrupt):
+                    pass  # A broken diagnostic stream must not replace Ctrl-C.
         elif isinstance(error, SpotifyRateLimitPauseError):
             run_status = "waiting - " + (request_control.pause_description(error.info) if request_control else str(error))
         elif isinstance(error, SpotifyAuthenticationError):
@@ -2160,7 +2171,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_MAX_NEW_SEARCHES_PER_RUN,
         help=(
             "Maximum uncached Spotify searches per run. "
-            "Defaults to 500. Use 0 to search without a per-run cap."
+            "With --continuous, the limit applies to each pass. "
+            "Defaults to 500. Use 0 to remove the cap."
         ),
     )
     parser.add_argument("--publisher-sync-mode", choices=PUBLISHER_SYNC_MODES, default=APPEND_SYNC_MODE, help="Publisher sync mode. append adds missing tracks; replace replaces playlist contents. Defaults to append.")

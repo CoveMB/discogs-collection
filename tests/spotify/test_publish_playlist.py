@@ -7194,17 +7194,84 @@ class SpotifyContinuousPublishingTests(unittest.TestCase):
             raise KeyboardInterrupt("stopped")
         self.on_sleep = interrupt
         real_writer = self.module.write_publish_report
+        real_open = io.open
+        prior_report = []
+        prior_files = []
+        partial_writes = []
+        def failing_open(*args, **kwargs):
+            output = real_open(*args, **kwargs)
+            real_write = output.write
+            def partial_write(text):
+                real_write(text[:20])
+                output.flush()
+                partial_writes.append(text[:20])
+                raise OSError("report disk unavailable")
+            output.write = partial_write
+            return output
         def report(path, summary):
             if summary.run_state == "interrupted":
-                raise OSError("report disk unavailable")
+                prior_report.append(path.read_bytes())
+                prior_files.extend(path.parent.iterdir())
+                with patch("io.open", side_effect=failing_open):
+                    real_writer(path, summary)
+                return
             real_writer(path, summary)
         with patch.object(self.module, "write_publish_report", side_effect=report), patch("sys.stderr", new_callable=io.StringIO) as errors, self.assertRaises(KeyboardInterrupt):
             self.run_publish()
         self.assertEqual(len(self.requests), 1)
         self.assertEqual(self.control.wait_seconds, 3)
+        self.assertEqual(len(partial_writes), 1)
+        self.assertEqual(self.args.report.read_bytes(), prior_report[0])
+        self.assertEqual(set(self.args.report.parent.iterdir()), set(prior_files))
         self.assertIn("2023-11-15T00:13:20+00:00", self.args.report.read_text())
         self.assertIn("2023-11-15T00:13:20+00:00", errors.getvalue())
         self.assertIn("report", errors.getvalue())
+
+    def test_ctrl_c_during_pause_progress_update_stops_before_resume(self):
+        self.assert_pause_cleanup_interrupt_stops("update")
+
+    def test_ctrl_c_during_pause_progress_finish_stops_before_resume(self):
+        self.assert_pause_cleanup_interrupt_stops("finish")
+
+    def test_ctrl_c_during_pause_response_logging_retains_deadline(self):
+        self.assert_pause_cleanup_interrupt_stops("log_debug")
+
+    def assert_pause_cleanup_interrupt_stops(self, method):
+        from publishers.spotify.client import HttpResponse
+        original_run = self.module.run_spotify_publish_from_args
+        self.args.progress = True
+        paused = False
+        interrupted = False
+        def response(request, parsed, query):
+            nonlocal paused
+            if parsed.path == "/v1/search" and not paused:
+                paused = True
+                return HttpResponse(429, {"Retry-After": "7200"}, "{}")
+            return None
+        def cleanup(*args, **kwargs):
+            nonlocal interrupted
+            if paused and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt()
+        self.before_transport = response
+        with (
+            patch.object(self.client if method == "log_debug" else ProgressReporter, method, side_effect=cleanup),
+            patch.object(self.module, "parse_args", return_value=self.args),
+            patch.object(self.module, "run_spotify_publish_from_args", side_effect=lambda args, **kwargs: original_run(args, publisher_config=PublisherConfig("spotify", "", ""), spotify_client=self.client, **kwargs)),
+            patch("sys.stdout", new_callable=io.StringIO),
+            patch("sys.stderr", new_callable=io.StringIO) as errors,
+        ):
+            result = self.module.main([])
+        self.assertEqual(result, 130)
+        self.assertTrue(interrupted)
+        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(self.control.wait_seconds, 0)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.reports[-1].run_state, "interrupted")
+
+        self.assertIn("2023-11-15T00:13:22+00:00", self.args.report.read_text())
+        self.assertIn("2023-11-15T00:13:22+00:00", errors.getvalue())
+
 
     def test_search_api_failure_stops_once_without_search_storm(self):
         from publishers.spotify.client import HttpResponse
