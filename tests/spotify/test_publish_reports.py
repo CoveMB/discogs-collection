@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -15,13 +16,30 @@ from publishers.spotify.matching import (
 )
 from publishers.spotify.publish_reports import (
     best_diagnostic_candidate,
+    build_publish_summary,
     format_publish_review_details,
     rank_diagnostic_candidates,
+    write_publish_report,
 )
 from publishers.spotify.publish_types import MATCH_SOURCE_SEARCH, PlaylistPublishDecision
 
 
 class PublishReportDiagnosticTests(unittest.TestCase):
+    def test_request_count_distinguishes_measured_zero_from_unavailable(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            report_path = Path(temporary_directory) / "report.txt"
+            for count, expected in ((None, "unavailable"), (0, "0"), (7, "7")):
+                with self.subTest(count=count):
+                    summary = build_publish_summary(
+                        decisions=(), final_items=(), playlist_contexts=(),
+                        report_path=report_path, apply=False, publisher_sync_mode="append",
+                        cache_hit_count=0, search_count=2, request_count=count,
+                    )
+                    write_publish_report(report_path, summary)
+                    self.assertEqual(summary.request_count, count)
+                    self.assertIn(f"Web API attempts: {expected}\n", report_path.read_text())
+                    self.assertIn("Spotify searches: 2\n", report_path.read_text())
+
     def test_best_diagnostic_candidate_uses_identity_evidence_not_api_order(self):
         track = playlist_track(
             track_name="Reson",

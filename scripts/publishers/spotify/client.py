@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 from publishers.spotify.matching import SpotifyTrackCandidate
 from publishers.spotify.release_matching import SpotifyAlbumCandidate, SpotifyAlbumTrack
+from publishers.spotify.request_control import SpotifyRateLimitInfo, SpotifyRequestControl, parse_retry_after
 from shared.debug_log import DebugLog
 from shared.text import clean_cell
 
@@ -79,6 +81,21 @@ Transport = Callable[[HttpRequest], HttpResponse]
 
 class SpotifyApiError(RuntimeError):
     pass
+
+
+class SpotifyRateLimitPauseError(SpotifyApiError):
+    def __init__(self, info: SpotifyRateLimitInfo):
+        self.info = info
+        self.checkpoint_failed = False
+        super().__init__(f"Spotify {info.kind} during {info.operation_name}; publisher pause required")
+
+
+class SpotifyAuthenticationError(SpotifyApiError):
+    """Authentication requires a new invocation with explicit user action."""
+
+
+class AccessTokenProvider(Protocol):
+    def get_access_token(self, force_refresh: bool = False) -> str: ...
 
 
 class SpotifyAlbumLookupError(SpotifyApiError):
@@ -159,11 +176,15 @@ class SpotifyClient:
         sleep: Callable[[float], None] = time.sleep,
         retry_policy: SpotifyRetryPolicy | None = None,
         debug_log: DebugLog | None = None,
+        request_control: SpotifyRequestControl | None = None,
+        token_provider: AccessTokenProvider | None = None,
     ):
         self.transport = transport or urllib_transport
         self.sleep = sleep
         self.retry_policy = retry_policy or SpotifyRetryPolicy()
         self.debug_log = debug_log
+        self.request_control = request_control or SpotifyRequestControl(sleep=sleep)
+        self.token_provider = token_provider
 
     def search_tracks(
         self,
@@ -394,13 +415,51 @@ class SpotifyClient:
 
     def request_with_rate_limit_retries(self, request: HttpRequest, operation_name: str = "spotify_search") -> HttpResponse:
         max_retries = max(0, self.retry_policy.max_rate_limit_retries)
-        for attempt_number in range(1, max_retries + 2):
+        attempt_number = 0
+        rate_limit_retries = 0
+        refreshed_after_unauthorized = False
+        force_refresh = False
+        while True:
+            self.request_control.before_request()
+            if self.token_provider is not None:
+                token = self.token_provider.get_access_token(force_refresh=force_refresh)
+                request = replace(request, headers={**request.headers, "Authorization": f"Bearer {token}"})
+                force_refresh = False
+            attempt_number += 1
             self.log_debug(f"{operation_name}_request attempt={attempt_number}")
-            response = self.transport(request)
-            self.log_debug(format_debug_response(attempt_number, response, operation_name=operation_name))
+            self.request_control.record_request_start()
+            try:
+                response = self.transport(request)
+            except (OSError, http.client.HTTPException, UnicodeError):
+                if not self.request_control.continuous:
+                    raise
+                raise SpotifyApiError(f"Spotify transport failed during {operation_name}; request outcome may be uncertain") from None
+            pause = self.request_control.on_response(response.status, response.headers, response.body, operation_name)
+            try:
+                self.log_debug(format_debug_response(attempt_number, response, operation_name=operation_name))
+            except KeyboardInterrupt as error:
+                if pause is not None:
+                    raise error from SpotifyRateLimitPauseError(pause)
+                raise
+            except Exception:
+                if pause is None:
+                    raise
+                raise SpotifyRateLimitPauseError(pause) from None
+            if pause is not None:
+                raise SpotifyRateLimitPauseError(pause)
+            if self.token_provider is not None and response.status in {401, 403}:
+                if response.status == 401 and not refreshed_after_unauthorized:
+                    refreshed_after_unauthorized = True
+                    force_refresh = True
+                    continue
+                raise SpotifyAuthenticationError(
+                    f"Spotify authentication failed with status {response.status}; reauthorize before restarting."
+                )
             if response.status != 429:
+                if self.request_control.continuous:
+                    self.validate_continuous_response(response, operation_name)
                 return response
-            if attempt_number > max_retries:
+            if rate_limit_retries >= max_retries:
                 wait_seconds = self.retry_policy.rate_limit_wait_seconds(response.headers)
                 raise SpotifyRateLimitRetriesExhaustedError(wait_seconds)
             wait_seconds = self.retry_policy.rate_limit_wait_seconds(response.headers)
@@ -416,7 +475,56 @@ class SpotifyClient:
                 f"attempt={attempt_number} max_retries={max_retries} wait_seconds={wait_seconds}"
             )
             self.sleep(wait_seconds)
-        raise RuntimeError("Spotify request retry loop ended unexpectedly")
+            rate_limit_retries += 1
+
+    def validate_continuous_response(self, response: HttpResponse, operation_name: str) -> None:
+        try:
+            payload = json.loads(response.body)
+        except (ValueError, TypeError):
+            payload = None
+        expected_status = 201 if operation_name in {"spotify_playlist_create", "spotify_playlist_add_items"} else 200
+        if response.status != expected_status:
+            error = payload.get("error") if isinstance(payload, dict) else None
+            if (response.status == 400 and operation_name == "spotify_search"
+                    and isinstance(error, dict)
+                    and error.get("message") == "Query exceeds maximum length of 250 characters"):
+                raise SpotifyApiError("Spotify search failed with status 400: Query exceeds maximum length of 250 characters")
+            raise SpotifyApiError(f"Spotify {operation_name} failed with status {response.status}")
+        if not isinstance(payload, dict):
+            raise SpotifyApiError(f"Malformed Spotify success response during {operation_name}; request outcome may be uncertain")
+        page = payload
+        if operation_name in {"spotify_search", "spotify_album_search"}:
+            page = payload.get("tracks" if operation_name == "spotify_search" else "albums")
+        if operation_name in {"spotify_search", "spotify_album_search", "spotify_album_tracks",
+                              "spotify_playlist_list", "spotify_playlist_items"}:
+            if not isinstance(page, dict) or not isinstance(page.get("items"), list):
+                raise SpotifyApiError(f"Malformed Spotify page during {operation_name}")
+            item_count = len(page["items"])
+            parsed_count = item_count
+            if operation_name == "spotify_search":
+                parsed_count = len(parse_search_track_candidates(response.body))
+            elif operation_name == "spotify_album_search":
+                parsed_count = len(parse_search_album_candidates(response.body))
+            elif operation_name == "spotify_album_tracks":
+                parsed_count = len(parse_album_track_page(payload))
+            elif operation_name == "spotify_playlist_list":
+                parsed_count = len(parse_playlist_page(payload))
+            elif operation_name == "spotify_playlist_items":
+                for item in page["items"]:
+                    if not isinstance(item, dict) or not any(field in item for field in ("item", "track")):
+                        raise SpotifyApiError("Malformed Spotify playlist item during spotify_playlist_items")
+                    if any(item.get(field) is not None and not isinstance(item[field], dict)
+                           for field in ("item", "track")):
+                        raise SpotifyApiError("Malformed Spotify playlist item during spotify_playlist_items")
+                    media = playlist_item_media_payload(item)
+                    if media is None:
+                        continue
+                    if isinstance(media, dict) and clean_cell(media.get("type")).casefold() not in {"", "track"}:
+                        continue
+                    if parse_playlist_item_track(media) is None:
+                        raise SpotifyApiError("Malformed Spotify playlist item during spotify_playlist_items")
+            if parsed_count != item_count:
+                raise SpotifyApiError(f"Malformed Spotify items during {operation_name}")
 
     def log_debug(self, message: str) -> None:
         if self.debug_log:
@@ -673,14 +781,6 @@ def urllib_transport(request: HttpRequest) -> HttpResponse:
         )
 
 
-def parse_retry_after(value: object) -> float:
-    try:
-        retry_after = float(str(value or "").strip())
-    except ValueError:
-        return 0.0
-    return max(0.0, retry_after)
-
-
 def format_wait_seconds(seconds: float) -> str:
     seconds = float(seconds)
     if seconds.is_integer():
@@ -718,7 +818,11 @@ def header_value(headers: Mapping[str, str], name: str) -> str:
 
 
 def display_header_value(headers: Mapping[str, str], name: str) -> str:
-    return header_value(headers, name) or "(none)"
+    value = header_value(headers, name)
+    if not value:
+        return "(none)"
+    seconds = parse_retry_after(value)
+    return format_wait_seconds(seconds) if seconds > 0 else "(unusable)"
 
 
 def format_debug_response(attempt_number: int, response: HttpResponse, operation_name: str = "spotify_search") -> str:

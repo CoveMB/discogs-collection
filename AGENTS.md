@@ -8,7 +8,29 @@ genre metadata from Discogs, maps those terms to local playlist labels, exports
 TuneMyMusic-style master CSV files per playlist, and creates split CSVs for
 playlist import batches. The optional Spotify publisher starts from those
 playlist CSVs, can publish matched tracks to Spotify, and still supports
-explicit dry-run previews. Optional Spotify tooling can also dedupe
+explicit dry-run previews. The standalone publisher supports optional finite,
+non-negative request spacing, defaults to no added delay, and reports actual
+Web API attempts separately from searches. It retains bounded retries and
+existing wrapper defaults. Opt-in standalone continuous append (including
+dry-run) reuses one session and request-control object across capped passes
+and receipt-based cooldowns, reloads the pinned input selection and current
+remote state, and stops on changed accounts, invalid inputs, terminal errors
+or failed persistence. It honors valid cooldowns including hours; quota
+exhaustion without a usable reset time requires user action. Continuous mode
+rejects replace, refresh-match-cache and raw-token overrides. Invocation
+reports distinguish processing state, completed passes, requests, 429/quota
+responses, startup/session refreshes and cooldown wait time from final-pass
+source coverage. It is a foreground process requiring manual restart after
+process death, with no pending-request replay. Normal publisher sessions renew authentication before
+requests, save rotated tokens before use, and stop on terminal authentication
+failure with best-effort checkpoints and preserved partial-write reports.
+Publishing saves matches after album resolutions, every 25 completed
+row decisions and append checkpoints. Errors and Ctrl-C preserve available
+completed work without flushing pending writes; Ctrl-C returns 130. Secondary
+persistence failures do not hide the primary stop, and reports retain confirmed
+versus uncertain write details. Raw
+tokens bypass renewal; reports distinguish publishing-session refresh attempts
+from Web API attempts. Optional Spotify tooling can also dedupe
 repo-managed publisher playlists by exact Spotify track URI. A manual-match
 importer validates override rows against generated playlist masters, previews
 by default without calling Spotify or writing the match cache, writes only in

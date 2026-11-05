@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from pathlib import Path
+from typing import Literal
 
 from publishers.spotify.matching import (
     AMBIGUOUS,
@@ -48,6 +49,10 @@ def build_publish_summary(
     search_count: int,
     searched_row_count: int = 0,
     run_status: str = "complete",
+    request_count: int | None = None,
+    token_refresh_count: int | None = None,
+    stop_reason: Literal["complete", "search_budget"] = "complete",
+    resume_progress_made: bool = False,
 ) -> SpotifyPublishSummary:
     playlist_names = {context.target_playlist_name for context in playlist_contexts}
     return SpotifyPublishSummary(
@@ -56,6 +61,10 @@ def build_publish_summary(
         run_status=run_status,
         cache_hit_count=cache_hit_count,
         search_count=search_count,
+        request_count=request_count,
+        token_refresh_count=token_refresh_count,
+        stop_reason=stop_reason,
+        resume_progress_made=resume_progress_made,
         searched_row_count=searched_row_count,
         matched_count=sum(1 for decision in decisions if decision.spotify_uri),
         ambiguous_count=sum(1 for decision in decisions if decision.status == AMBIGUOUS),
@@ -84,11 +93,22 @@ def write_publish_report(path: Path, summary: SpotifyPublishSummary) -> None:
             "Summary",
             [
                 f"- Run status: {summary.run_status}",
+                f"- Run state: {summary.run_state}",
+                f"- Pass stop reason: {summary.stop_reason}",
+                *([f"- Pause reason: {summary.pause_reason}"] if summary.pause_reason else []),
+                *([f"- Resume at: {summary.resume_at} UTC"] if summary.resume_at else []),
+                *([f"- Invocation 429 responses: {summary.rate_limit_count if summary.rate_limit_count is not None else 'unavailable'}",
+                   f"- Invocation quota responses: {summary.quota_count if summary.quota_count is not None else 'unavailable'}",
+                   f"- Invocation completed passes: {summary.completed_pass_count}",
+                   f"- Invocation cooldown wait seconds: {summary.wait_seconds:g}"]
+                  if summary.wait_seconds is not None else []),
                 f"- Publisher sync mode: {summary.publisher_sync_mode}",
                 f"- Playlists: {summary.playlist_count}",
                 f"- Tracks: {summary.track_count}",
                 f"- Cache hits: {summary.cache_hit_count}",
                 f"- Spotify searches: {summary.search_count}",
+                f"- Web API attempts: {summary.request_count if summary.request_count is not None else 'unavailable'}",
+                f"- Token refresh attempts: {summary.token_refresh_count if summary.token_refresh_count is not None else 'unavailable'}",
                 f"- Rows searched with ladder: {summary.searched_row_count}",
                 f"- Cached matched tracks: {cached_matched_publish_decision_count(summary.decisions)}",
                 f"- Cached ambiguous tracks: {count_publish_decisions(summary.decisions, MATCH_SOURCE_CACHE, {AMBIGUOUS})}",

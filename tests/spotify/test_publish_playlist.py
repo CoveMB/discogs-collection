@@ -549,6 +549,7 @@ def publish_summary_stub(**overrides):
         "track_count": 0,
         "cache_hit_count": 0,
         "search_count": 0,
+        "request_count": None,
         "searched_row_count": 0,
         "matched_count": 0,
         "already_present_count": 0,
@@ -566,6 +567,14 @@ def publish_summary_stub(**overrides):
 
 
 class SpotifyPublishPlaylistTests(unittest.TestCase):
+    def setUp(self):
+        config_patcher = patch(
+            "publishers.spotify.publish_playlist.load_or_create_publisher_config",
+            return_value=PublisherConfig("spotify", "", ""),
+        )
+        config_patcher.start()
+        self.addCleanup(config_patcher.stop)
+
     def test_publish_reason_keeps_spotify_original_annotation_match_evidence(self):
         track = PlaylistTrack(
             playlist_name="Techno",
@@ -4376,7 +4385,9 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             report_text = report_path.read_text(encoding="utf-8")
 
         self.assertEqual([len(batch) for _, batch, _ in client.add_calls], [100])
-        self.assertIn("Run status: checkpoint - append progress saved after 100 searches; run still in progress", report_text)
+        self.assertIn("Run status: failed - publisher error after 100 of 101 tracks", report_text)
+        self.assertIn("Added tracks: 100", report_text)
+        self.assertIn("pending writes were not sent", report_text)
         self.assertNotIn("Run status: complete", report_text)
 
     def test_replace_mode_exact_search_budget_writes_complete_replacement(self):
@@ -5127,7 +5138,8 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertNotIn("Run status: complete", report_text)
         self.assertIn("Discogs - House | 111 | 1 | Alpha Artist | Alpha One | added | spotify:track:alpha", report_text)
         self.assertIn("Discogs - Techno | 222 | 1 | Beta Artist | Beta One | would_add | spotify:track:beta", report_text)
-        self.assertIn("publishing failed: Spotify playlist add items failed with status 500: temporary failure", report_text)
+        self.assertIn("publishing failed: playlist append stopped", report_text)
+        self.assertIn("remote outcome may be uncertain", report_text)
 
     def test_publish_replace_dry_run_reports_replaced_final_state_without_writes(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -5507,6 +5519,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         with (
             patch("publishers.spotify.publish_playlist.load_spotify_settings", return_value=settings),
             patch("publishers.spotify.publish_playlist.get_spotify_access_token", return_value=token.access_token) as get_access_token,
+            patch("publishers.spotify.publish_playlist.load_existing_token", return_value=token),
             patch("publishers.spotify.publish_playlist.publish_spotify_playlists") as publish,
             patch("sys.stdout", new_callable=io.StringIO),
         ):
@@ -5539,6 +5552,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         with (
             patch("publishers.spotify.publish_playlist.load_spotify_settings", return_value=settings),
             patch("publishers.spotify.publish_playlist.get_spotify_access_token", return_value=token.access_token),
+            patch("publishers.spotify.publish_playlist.load_existing_token", return_value=token),
             patch("publishers.spotify.publish_playlist.publish_spotify_playlists") as publish,
             patch("sys.stdout", new_callable=io.StringIO),
         ):
@@ -5574,6 +5588,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             with (
                 patch("publishers.spotify.publish_playlist.load_spotify_settings", return_value=settings),
                 patch("publishers.spotify.publish_playlist.get_spotify_access_token", return_value=token.access_token),
+                patch("publishers.spotify.publish_playlist.load_existing_token", return_value=token),
                 patch("publishers.spotify.publish_playlist.publish_spotify_playlists") as publish,
                 patch("sys.stdout", new_callable=io.StringIO) as stdout,
             ):
@@ -5627,6 +5642,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             with (
                 patch("publishers.spotify.publish_playlist.load_spotify_settings", return_value=settings),
                 patch("publishers.spotify.publish_playlist.get_spotify_access_token", return_value=token.access_token),
+                patch("publishers.spotify.publish_playlist.load_existing_token", return_value=token),
                 patch("publishers.spotify.publish_playlist.publish_spotify_playlists", side_effect=publish_side_effect),
                 patch("sys.stderr", stderr),
                 patch("sys.stdout", new_callable=io.StringIO),
@@ -5676,6 +5692,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             with (
                 patch("publishers.spotify.publish_playlist.load_spotify_settings", return_value=settings),
                 patch("publishers.spotify.publish_playlist.get_spotify_access_token", return_value=token.access_token),
+                patch("publishers.spotify.publish_playlist.load_existing_token", return_value=token),
                 patch("publishers.spotify.publish_playlist.publish_spotify_playlists", side_effect=publish_side_effect),
                 patch("sys.stderr", stderr),
                 patch("sys.stdout", new_callable=io.StringIO),
@@ -5728,6 +5745,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             with (
                 patch("publishers.spotify.publish_playlist.load_spotify_settings", return_value=settings),
                 patch("publishers.spotify.publish_playlist.get_spotify_access_token", return_value=token.access_token),
+                patch("publishers.spotify.publish_playlist.load_existing_token", return_value=token),
                 patch("publishers.spotify.publish_playlist.publish_spotify_playlists", side_effect=publish_side_effect),
                 patch("sys.stderr", stderr),
                 patch("sys.stdout", new_callable=io.StringIO),
@@ -5778,6 +5796,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             with (
                 patch("publishers.spotify.publish_playlist.load_spotify_settings", return_value=settings),
                 patch("publishers.spotify.publish_playlist.get_spotify_access_token", return_value=token.access_token),
+                patch("publishers.spotify.publish_playlist.load_existing_token", return_value=token),
                 patch("publishers.spotify.publish_playlist.publish_spotify_playlists", side_effect=publish_side_effect),
                 patch("sys.stdout", new_callable=io.StringIO),
             ):
@@ -5921,6 +5940,1624 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             args = publish_playlist.parse_args([])
 
         self.assertEqual(args.report, Path("reports/2026-06-10_14-30-00_publish_playlist.txt"))
+
+
+class DurableAppendCheckpointTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.master = self.directory / "Synthetic" / "Synthetic.csv"
+        self.cache = self.directory / "matches.json"
+        self.state = self.directory / "state.json"
+        self.report = self.directory / "report.txt"
+
+    def prepare_tracks(self, count):
+        rows = [playlist_row(str(index), "Album", f"Track {index}", "Artist") for index in range(1, count + 1)]
+        write_playlist_master(self.master, rows)
+        return PublishingSpotifyClient({
+            f'track:"Track {index}" artist:"Artist" album:"Album"': (
+                SpotifyTrackCandidate(f"spotify:track:{index}", f"Track {index}", ("Artist",), "Album"),
+            ) for index in range(1, count + 1)
+        })
+
+    def publish(self, client, **kwargs):
+        return publish_spotify_playlists(
+            self.directory, self.report, client, "synthetic-token",
+            playlist_master_paths=(self.master,), match_cache_path=self.cache,
+            publish_state_cache_path=self.state, publisher_config=PublisherConfig("spotify", "", ""),
+            max_new_searches_per_run=0, **kwargs,
+        )
+
+    def test_negative_decisions_are_durable_before_row_26(self):
+        client = self.prepare_tracks(26)
+        snapshot = []
+
+        def search(access_token, query, limit=10):
+            if "Track 26" in query:
+                snapshot.append(json.loads(self.cache.read_text()) if self.cache.exists() else None)
+                raise KeyboardInterrupt()
+            return ()
+
+        with patch.object(client, "search_tracks", side_effect=search), self.assertRaises(KeyboardInterrupt):
+            self.publish(client)
+        self.assertIsNotNone(snapshot[0], "25 completed negative decisions must already be on disk")
+        matches = snapshot[0]["matches"]
+        self.assertEqual({record["release_id"] for record in matches.values()}, {str(index) for index in range(1, 26)})
+        self.assertEqual({record["match_status"] for record in matches.values()}, {"unmatched"})
+        self.assertEqual(client.created_playlists, [])
+        self.assertEqual(client.add_calls, [])
+
+    def test_album_decisions_are_durable_before_next_release_search(self):
+        rows = [playlist_row("album", "Album", f"Track {index}", "Artist", str(index)) for index in range(1, 4)]
+        rows.append(playlist_row("next", "Next Album", "Next Track", "Next Artist"))
+        write_playlist_master(self.master, rows)
+        client = AlbumPublishingSpotifyClient(
+            (SpotifyAlbumCandidate("album", "spotify:album:album", "Album", ("Artist",), 3),),
+            {"album": tuple(SpotifyAlbumTrack(f"spotify:track:{index}", f"Track {index}", ("Artist",), 1, index, True) for index in range(1, 4))},
+        )
+        snapshot = []
+
+        def search(access_token, query, limit=10):
+            snapshot.append(json.loads(self.cache.read_text()) if self.cache.exists() else None)
+            raise KeyboardInterrupt()
+
+        with patch.object(client, "search_tracks", side_effect=search), self.assertRaises(KeyboardInterrupt):
+            self.publish(client)
+        self.assertIsNotNone(snapshot[0], "completed album resolution must already be on disk")
+        self.assertEqual({record["spotify_uri"] for record in snapshot[0]["matches"].values()}, {"spotify:track:1", "spotify:track:2", "spotify:track:3"})
+        self.assertEqual(client.add_calls, [])
+        self.assertIn("interrupted", self.report.read_text())
+
+    def test_startup_api_failure_writes_report_without_mutations(self):
+        for method in ("list_current_user_playlists", "get_current_user_id", "get_playlist_items"):
+            with self.subTest(method=method):
+                client = self.prepare_tracks(1)
+                client.playlists.append(SpotifyPlaylist("existing", "Synthetic", "", "current-user", False))
+                error = SpotifyApiError("synthetic startup failure")
+                with patch.object(client, method, side_effect=error), self.assertRaises(SpotifyApiError) as caught:
+                    self.publish(client)
+                self.assertIs(caught.exception, error)
+                self.assertTrue(self.report.exists(), "startup failures need a current report")
+                self.assertIn("failed", self.report.read_text())
+                self.assertIn("Tracks: 0", self.report.read_text())
+                self.assertEqual(client.searches, [])
+                self.assertEqual(client.add_calls, [])
+
+    def test_interruption_keeps_matches_and_confirmed_batch_without_flushing_pending(self):
+        for completed in (1, 101):
+            with self.subTest(completed=completed):
+                # Distinct cache files prevent a previous subcase from hiding search work.
+                self.cache = self.directory / f"matches-{completed}.json"
+                self.state = self.directory / f"state-{completed}.json"
+                client = self.prepare_tracks(completed + 1)
+                real_search = client.search_tracks
+                error = KeyboardInterrupt()
+
+                def search(access_token, query, limit=10):
+                    if f'Track {completed + 1}"' in query:
+                        raise error
+                    return real_search(access_token, query, limit)
+
+                with patch.object(client, "search_tracks", side_effect=search), self.assertRaises(KeyboardInterrupt) as caught:
+                    self.publish(client)
+                self.assertIs(caught.exception, error)
+                self.assertTrue(self.cache.exists())
+                self.assertEqual(len(json.loads(self.cache.read_text())["matches"]), completed)
+                self.assertEqual([len(uris) for _, uris, _ in client.add_calls], [100] if completed == 101 else [])
+                report = self.report.read_text()
+                self.assertIn("interrupted", report)
+                self.assertIn("pending writes were not sent", report)
+                self.assertIn(f"Added tracks: {100 if completed == 101 else 0}", report)
+                if completed == 101:
+                    tracks = json.loads(self.state.read_text())["playlists"]["Synthetic"]["tracks"]
+                    self.assertEqual({record["spotify_uri"] for record in tracks.values()}, {f"spotify:track:{index}" for index in range(1, 101)})
+
+    def test_atomic_checkpoint_failure_preserves_old_bytes_and_stops_search(self):
+        from publishers.spotify.match_cache import save_spotify_track_match_cache
+
+        client = self.prepare_tracks(26)
+        save_spotify_track_match_cache(self.cache, {})
+        original = self.cache.read_bytes()
+        original_replace = Path.replace
+        error = OSError("synthetic disk failure")
+
+        def replace_file(source, destination):
+            if Path(destination) == self.cache:
+                raise error
+            return original_replace(source, destination)
+
+        with patch.object(Path, "replace", replace_file), self.assertRaises(OSError) as caught:
+            self.publish(client)
+        self.assertIs(caught.exception, error)
+        self.assertEqual(self.cache.read_bytes(), original)
+        self.assertEqual(len(client.searches), 25)
+        self.assertEqual(client.add_calls, [])
+        self.assertEqual(client.created_playlists, [])
+        self.assertIn("match cache checkpoint failed", self.report.read_text())
+        self.assertIn("failed", self.report.read_text())
+
+    def test_final_save_interruption_is_reported_and_best_effort_save_retried(self):
+        from publishers.spotify import publish_playlist
+
+        client = self.prepare_tracks(1)
+        original_save = publish_playlist.save_spotify_track_match_cache
+        attempts = []
+        error = KeyboardInterrupt()
+
+        def save(path, cache):
+            attempts.append(len(cache))
+            if len(attempts) == 1:
+                raise error
+            original_save(path, cache)
+
+        with patch.object(publish_playlist, "save_spotify_track_match_cache", side_effect=save), self.assertRaises(KeyboardInterrupt) as caught:
+            self.publish(client, apply=False)
+        self.assertIs(caught.exception, error)
+        self.assertEqual(attempts, [1, 1])
+        self.assertEqual(len(json.loads(self.cache.read_text())["matches"]), 1)
+        self.assertIn("interrupted", self.report.read_text())
+        self.assertEqual(client.add_calls, [])
+
+    def test_secondary_save_interruptions_preserve_primary_error_and_attempt_report(self):
+        from publishers.spotify import publish_playlist
+
+        client = self.prepare_tracks(1)
+        for secondary in (OSError("private-secret"), KeyboardInterrupt()):
+            with self.subTest(secondary=type(secondary).__name__):
+                error = SpotifyApiError("primary startup failure")
+                with (
+                    patch.object(client, "list_current_user_playlists", side_effect=error),
+                    patch.object(publish_playlist, "save_spotify_track_match_cache", side_effect=secondary),
+                    patch.object(publish_playlist, "save_spotify_publish_state", side_effect=secondary),
+                    self.assertRaises(SpotifyApiError) as caught,
+                ):
+                    try:
+                        self.publish(client)
+                    except KeyboardInterrupt:
+                        self.fail("secondary interruption replaced the primary API failure")
+                self.assertIs(caught.exception, error)
+                report = self.report.read_text()
+                self.assertIn("match cache checkpoint failed", report)
+                self.assertIn("publish state checkpoint failed", report)
+                self.assertNotIn("private-secret", report + str(error))
+
+    def test_report_failure_never_replaces_primary_interruption(self):
+        from publishers.spotify import publish_playlist
+
+        client = self.prepare_tracks(1)
+        error = KeyboardInterrupt()
+        with (
+            patch.object(client, "search_tracks", side_effect=error),
+            patch.object(publish_playlist, "write_publish_report", side_effect=OSError("report-secret")),
+            self.assertRaises(KeyboardInterrupt) as caught,
+        ):
+            self.publish(client)
+        self.assertIs(caught.exception, error)
+        self.assertIn("report write failed", str(error))
+        self.assertNotIn("report-secret", str(error))
+        self.assertEqual(client.add_calls, [])
+
+    def test_uncertain_second_append_retains_confirmed_state_and_specific_report(self):
+        client = self.prepare_tracks(105)
+        real_add = client.add_playlist_items
+        attempts = []
+        error = SpotifyRateLimitDeferredError(9999, 480)
+
+        def add(access_token, playlist_id, uris, position=None):
+            attempts.append(tuple(uris))
+            if len(attempts) == 2:
+                # Simulate a remote write whose outcome the caller never confirms.
+                real_add(access_token, playlist_id, uris, position)
+                raise error
+            real_add(access_token, playlist_id, uris, position)
+
+        with patch.object(client, "add_playlist_items", side_effect=add), self.assertRaises(SpotifyRateLimitDeferredError) as caught:
+            self.publish(client)
+        self.assertIs(caught.exception, error)
+        self.assertEqual([len(uris) for uris in attempts], [100, 5])
+        self.assertEqual(len(client.playlist_items_by_id["created-1"]), 105)
+        state = json.loads(self.state.read_text())["playlists"]["Synthetic"]["tracks"]
+        self.assertEqual({record["spotify_uri"] for record in state.values()}, {f"spotify:track:{index}" for index in range(1, 101)})
+        report = self.report.read_text()
+        self.assertIn("Added tracks: 100", report)
+        self.assertIn("publishing failed", report)
+        self.assertIn("uncertain", report)
+        self.assertNotIn("no playlist writes were attempted", report)
+
+    def test_uncertain_create_stops_once_with_honest_report(self):
+        client = self.prepare_tracks(1)
+        real_create = client.create_playlist
+        error = SpotifyApiError("synthetic unreadable success")
+
+        def create(access_token, name, public=False, description=""):
+            real_create(access_token, name, public, description)
+            raise error
+
+        with patch.object(client, "create_playlist", side_effect=create), self.assertRaises(SpotifyApiError) as caught:
+            self.publish(client)
+        self.assertIs(caught.exception, error)
+        self.assertEqual(len(client.created_playlists), 1)
+        self.assertEqual(client.add_calls, [])
+        self.assertIn("creation", self.report.read_text())
+        self.assertIn("uncertain", self.report.read_text())
+        self.assertNotIn("no playlist writes were attempted", self.report.read_text())
+
+    def test_failed_cache_load_does_not_overwrite_invalid_input(self):
+        client = self.prepare_tracks(1)
+        self.cache.write_text("invalid cache sentinel")
+        with self.assertRaises(ValueError):
+            self.publish(client)
+        self.assertEqual(self.cache.read_text(), "invalid cache sentinel")
+        self.assertEqual(client.searches, [])
+        self.assertTrue(self.report.exists())
+        self.assertIn("failed", self.report.read_text())
+
+    def test_replace_interruption_preserves_partial_detail_and_primary_error(self):
+        from publishers.spotify import publish_playlist
+
+        client = self.prepare_tracks(101)
+        error = KeyboardInterrupt()
+        real_save = publish_playlist.save_spotify_track_match_cache
+
+        def save(path, cache):
+            if client.replace_calls:
+                raise OSError("private-secondary-sentinel")
+            real_save(path, cache)
+
+        with (
+            patch.object(client, "add_playlist_items", side_effect=error),
+            patch.object(publish_playlist, "save_spotify_track_match_cache", side_effect=save),
+            self.assertRaises(KeyboardInterrupt) as caught,
+        ):
+            self.publish(client, publisher_sync_mode="replace")
+        self.assertIs(caught.exception, error)
+        self.assertEqual(len(client.replace_calls), 1)
+        self.assertEqual(len(client.replace_calls[0][1]), 100)
+        report = self.report.read_text()
+        self.assertIn("interrupted", report)
+        self.assertIn("sent first 100 URI(s)", report)
+        self.assertIn("match cache checkpoint failed", report)
+        self.assertNotIn("private-secondary-sentinel", report)
+
+    def test_progress_finish_interruption_updates_complete_report(self):
+        client = self.prepare_tracks(1)
+        progress = ProgressReporter(label="Synthetic", stream=io.StringIO())
+        error = KeyboardInterrupt()
+        with patch.object(progress, "finish", side_effect=error), self.assertRaises(KeyboardInterrupt) as caught:
+            try:
+                raise ValueError("a caller is handling an unrelated earlier error")
+            except ValueError:
+                self.publish(client, progress=progress, apply=False)
+        self.assertIs(caught.exception, error)
+        self.assertIn("interrupted", self.report.read_text())
+        self.assertNotIn("Run status: complete", self.report.read_text())
+
+    def test_row_progress_failure_preserves_primary_search_stop(self):
+        client = self.prepare_tracks(1)
+        progress = ProgressReporter(label="Synthetic", stream=io.StringIO())
+        error = SpotifyRateLimitDeferredError(9999, 480)
+        with (
+            patch.object(client, "search_tracks", side_effect=error),
+            patch.object(progress, "update", side_effect=KeyboardInterrupt()),
+            self.assertRaises(SpotifyRateLimitDeferredError) as caught,
+        ):
+            try:
+                self.publish(client, progress=progress)
+            except KeyboardInterrupt:
+                self.fail("progress cleanup replaced the primary rate-limit stop")
+        self.assertIs(caught.exception, error)
+        self.assertIn("rate limit", self.report.read_text())
+
+    def test_progress_cleanup_failure_does_not_hide_primary_stop(self):
+        client = self.prepare_tracks(1)
+        progress = ProgressReporter(label="Synthetic", stream=io.StringIO())
+        error = SpotifyApiError("primary failure")
+        with (
+            patch.object(client, "list_current_user_playlists", side_effect=error),
+            patch.object(progress, "finish", side_effect=KeyboardInterrupt()),
+            self.assertRaises(SpotifyApiError) as caught,
+        ):
+            self.publish(client, progress=progress)
+        self.assertIs(caught.exception, error)
+        self.assertIn("failed", self.report.read_text())
+        self.assertEqual(client.add_calls, [])
+
+    def test_filesystem_error_surfaces_failed_checkpoints_even_when_report_is_stale(self):
+        import argparse
+        import errno
+        from publishers.spotify import publish_playlist
+
+        client = self.prepare_tracks(1)
+        self.report.write_text("previous report sentinel")
+        error = OSError(errno.ENOSPC, "synthetic disk full", "synthetic-cache.json")
+        caught_errors = []
+
+        def run(*args, **kwargs):
+            try:
+                return self.publish(client)
+            except OSError as caught:
+                caught_errors.append(caught)
+                raise
+
+        with (
+            patch.object(publish_playlist, "parse_args", return_value=argparse.Namespace(report=self.report, debug_log=None)),
+            patch.object(publish_playlist, "run_spotify_publish_from_args", side_effect=run),
+            patch.object(client, "list_current_user_playlists", side_effect=error),
+            patch.object(publish_playlist, "save_spotify_track_match_cache", side_effect=OSError("secondary-private-sentinel")),
+            patch.object(publish_playlist, "write_publish_report", side_effect=OSError("secondary-report-sentinel")),
+            patch("sys.stderr", new_callable=io.StringIO) as output,
+        ):
+            result = publish_playlist.main([])
+        self.assertEqual(result, 1)
+        self.assertEqual(caught_errors, [error])
+        self.assertIs(caught_errors[0], error)
+        self.assertEqual(error.errno, errno.ENOSPC)
+        self.assertEqual(error.filename, "synthetic-cache.json")
+        self.assertIn("synthetic disk full", output.getvalue())
+        self.assertIn("match cache checkpoint failed", output.getvalue())
+        self.assertIn("publish report write failed", output.getvalue())
+        self.assertNotIn("secondary-private-sentinel", output.getvalue())
+        self.assertNotIn("secondary-report-sentinel", output.getvalue())
+        self.assertEqual(self.report.read_text(), "previous report sentinel")
+        self.assertEqual(client.add_calls, [])
+        self.assertEqual(client.created_playlists, [])
+
+    def test_main_ctrl_c_returns_130_with_current_report(self):
+        from publishers.spotify import publish_playlist
+
+        client = self.prepare_tracks(2)
+        original_search = client.search_tracks
+
+        def search(access_token, query, limit=10):
+            if "Track 2" in query:
+                raise KeyboardInterrupt()
+            return original_search(access_token, query, limit)
+
+        args = publish_playlist.build_spotify_publisher_namespace(
+            env_file=self.directory / "absent.env", playlist_output_dir=self.directory,
+            report=self.report, token_cache=self.directory / "token.json", match_cache=self.cache,
+            publish_state_cache=self.state, publisher_config=self.directory / "publisher.json", progress=False,
+        )
+        args.access_token = "synthetic-token"
+        original_run = publish_playlist.run_spotify_publish_from_args
+        with (
+            patch.object(publish_playlist, "parse_args", return_value=args),
+            patch.object(publish_playlist, "load_spotify_settings", return_value=SpotifySettings("client", "http://localhost/callback", args.token_cache)),
+            patch.object(publish_playlist, "load_or_create_publisher_config", return_value=PublisherConfig("spotify", "", "")),
+            patch.object(client, "search_tracks", side_effect=search),
+            patch("sys.stderr", new_callable=io.StringIO) as output,
+        ):
+            with patch.object(publish_playlist, "run_spotify_publish_from_args", side_effect=lambda args, **kwargs: original_run(args, spotify_client=client, **kwargs)):
+                try:
+                    result = publish_playlist.main([])
+                except KeyboardInterrupt:
+                    self.fail("CLI must return 130 after preserving progress")
+        self.assertEqual(result, 130)
+        self.assertIn("interrupted", output.getvalue().lower())
+        self.assertIn(str(self.report), output.getvalue())
+        self.assertIn("interrupted", self.report.read_text())
+        self.assertEqual(len(json.loads(self.cache.read_text())["matches"]), 1)
+        self.assertEqual(client.add_calls, [])
+
+
+class RenewablePublisherTests(unittest.TestCase):
+    def test_incomplete_refresh_response_preserves_completed_match_and_stops_once(self):
+        from http.client import IncompleteRead
+        from publishers.spotify.client import HttpResponse, SpotifyAuthenticationError, SpotifyClient
+        from publishers.spotify.session import SpotifySession
+        from publishers.spotify.token_cache import save_spotify_token
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            master = directory / "Synthetic" / "Synthetic.csv"
+            write_playlist_master(master, [playlist_row(str(index), "Album", f"Track {index}", "Artist") for index in range(3)])
+            settings = SpotifySettings("client", "http://localhost/callback", directory / "token.json")
+            token = SpotifyToken("old-secret", "refresh-secret", 1061, " ".join(DEFAULT_AUTHORIZE_SCOPES), "Bearer")
+            save_spotify_token(settings.token_cache_path, token)
+            now = [1000.0]
+            requests = []
+            token_requests = []
+
+            def token_transport(request):
+                token_requests.append(request)
+                raise IncompleteRead(b"response-secret", 100)
+
+            session = SpotifySession(settings, token, DEFAULT_AUTHORIZE_SCOPES, wall_time=lambda: now[0], token_transport=token_transport)
+
+            def transport(request):
+                requests.append(request)
+                if "/search?" in request.url:
+                    now[0] = 1002
+                    return HttpResponse(200, {}, '{"tracks":{"items":[{"uri":"spotify:track:0","name":"Track 0","artists":[{"name":"Artist"}],"album":{"name":"Album"}}]}}')
+                return HttpResponse(200, {}, '{"items":[],"id":"owner"}')
+
+            client = SpotifyClient(transport=transport, token_provider=session)
+            with self.assertRaises(SpotifyAuthenticationError) as caught:
+                publish_spotify_playlists(directory, directory / "report.txt", client, "ignored", playlist_master_paths=(master,), match_cache_path=directory / "matches.json", publish_state_cache_path=directory / "state.json", publisher_config=PublisherConfig("spotify", "", ""), request_control=client.request_control, spotify_session=session)
+            with self.assertRaises(SpotifyAuthenticationError) as repeated:
+                session.get_access_token()
+            self.assertIs(caught.exception, repeated.exception)
+            self.assertEqual(len(requests), 3)
+            self.assertTrue(all(request.method == "GET" for request in requests))
+            self.assertEqual(len(token_requests), 1)
+            matches = json.loads((directory / "matches.json").read_text())["matches"]
+            self.assertEqual(list(matches), ["0|1|artist|album|track 0"])
+            report = (directory / "report.txt").read_text()
+            self.assertIn("needs action", report)
+            self.assertIn("Tracks: 1", report)
+            self.assertIn("Token refresh attempts: 1", report)
+            self.assertIn("Web API attempts: 3", report)
+            self.assertIn("pending writes were not sent", report)
+            self.assertNotIn("secret", report + str(caught.exception))
+
+    def test_raw_override_on_reused_concrete_client_bypasses_provider(self):
+        from publishers.spotify import publish_playlist
+        from publishers.spotify.client import HttpResponse, SpotifyClient
+
+        class Provider:
+            def get_access_token(self, force_refresh=False):
+                raise AssertionError("Raw-token runs must bypass renewal")
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            requests = []
+
+            def transport(request):
+                requests.append(request)
+                return HttpResponse(200, {}, '{"items":[],"id":"owner"}')
+
+            client = SpotifyClient(transport=transport, token_provider=Provider())
+            args = publish_playlist.build_spotify_publisher_namespace(env_file=directory / "env", playlist_output_dir=directory, report=directory / "report.txt", token_cache=directory / "token.json", match_cache=directory / "matches.json", publish_state_cache=directory / "state.json", publisher_config=directory / "publisher.json", progress=False, access_token="raw")
+            with patch.object(publish_playlist, "load_spotify_settings", return_value=SpotifySettings("client", "http://localhost/callback")), patch.object(publish_playlist, "get_access_token_for_run") as startup:
+                summary = publish_playlist.run_spotify_publish_from_args(args, playlist_master_paths=(), publisher_config=PublisherConfig("spotify", "", ""), spotify_client=client)
+            startup.assert_not_called()
+            self.assertEqual([request.headers["Authorization"] for request in requests], ["Bearer raw", "Bearer raw"])
+            self.assertIsNone(summary.token_refresh_count)
+
+    def test_revoked_live_session_stops_cli_once_with_report_and_refresh_count(self):
+        from publishers.spotify import publish_playlist
+        from publishers.spotify.client import HttpResponse, SpotifyClient
+        from publishers.spotify.session import SpotifySession
+        from publishers.spotify.token_cache import save_spotify_token
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            master = directory / "Synthetic" / "Synthetic.csv"
+            write_playlist_master(master, [playlist_row(str(index), "Album", f"Track {index}", "Artist") for index in range(3)])
+            settings = SpotifySettings("client", "http://localhost/callback", directory / "token.json")
+            token = SpotifyToken("old-secret", "refresh-secret", 1061, " ".join(DEFAULT_AUTHORIZE_SCOPES), "Bearer")
+            save_spotify_token(settings.token_cache_path, token)
+            now = [1000.0]
+            requests = []
+            token_requests = []
+
+            def token_transport(request):
+                token_requests.append(request)
+                return HttpResponse(400, {}, '{"error":"invalid_grant","description":"response-secret"}')
+
+            session = SpotifySession(settings, token, DEFAULT_AUTHORIZE_SCOPES, wall_time=lambda: now[0], token_transport=token_transport)
+
+            def transport(request):
+                requests.append(request)
+                now[0] = 1002
+                return HttpResponse(200, {}, '{"items":[],"id":"owner"}')
+
+            original_init = SpotifyClient.__init__
+
+            def initialize_client(instance, debug_log=None):
+                original_init(instance, transport=transport, debug_log=debug_log)
+
+            args = publish_playlist.build_spotify_publisher_namespace(env_file=directory / "env", playlist_output_dir=directory, report=directory / "report.txt", token_cache=settings.token_cache_path, match_cache=directory / "matches.json", publish_state_cache=directory / "state.json", publisher_config=directory / "publisher.json", progress=False)
+            with (
+                patch.object(publish_playlist, "parse_args", return_value=args),
+                patch.object(publish_playlist, "load_spotify_settings", return_value=settings),
+                patch.object(publish_playlist, "get_access_token_for_run", return_value="old-secret") as startup,
+                patch.object(publish_playlist, "SpotifySession", return_value=session),
+                patch.object(SpotifyClient, "__init__", initialize_client),
+                patch("sys.stderr", new_callable=io.StringIO) as errors,
+                patch("sys.stdout", new_callable=io.StringIO),
+            ):
+                self.assertEqual(publish_playlist.main([]), 1)
+            startup.assert_called_once()
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(len(token_requests), 1)
+            report = args.report.read_text()
+            self.assertIn("needs action", report)
+            self.assertIn("Token refresh attempts: 1", report)
+            self.assertIn("Web API attempts: 1", report)
+            self.assertIn("Token refresh attempts: 1", errors.getvalue())
+            self.assertIn(str(args.report), errors.getvalue())
+            self.assertNotIn("secret", report + errors.getvalue())
+            self.assertEqual(json.loads(args.match_cache.read_text())["matches"], {})
+
+    def test_replace_authentication_preserves_partial_report_and_primary_failure(self):
+        from publishers.spotify import publish_playlist
+        from publishers.spotify.client import SpotifyAuthenticationError
+
+        for save_failure in (False, True):
+            with self.subTest(save_failure=save_failure), tempfile.TemporaryDirectory() as directory_name:
+                directory = Path(directory_name)
+                master = directory / "Synthetic" / "Synthetic.csv"
+                write_playlist_master(master, [playlist_row(str(index), "Album", f"Track {index}", "Artist") for index in range(101)])
+                client = PublishingSpotifyClient({f'track:"Track {index}" artist:"Artist" album:"Album"': (SpotifyTrackCandidate(f"spotify:track:{index}", f"Track {index}", ("Artist",), "Album"),) for index in range(101)})
+                error = SpotifyAuthenticationError("Reauthorize")
+                real_save = publish_playlist.save_spotify_track_match_cache
+
+                def save_cache(path, cache):
+                    if save_failure and client.replace_calls:
+                        raise OSError("save-secret")
+                    real_save(path, cache)
+
+                with (
+                    patch.object(client, "add_playlist_items", side_effect=error),
+                    patch.object(publish_playlist, "save_spotify_track_match_cache", side_effect=save_cache),
+                    self.assertRaises(SpotifyAuthenticationError),
+                ):
+                    publish_spotify_playlists(directory, directory / "report.txt", client, "raw", playlist_master_paths=(master,), match_cache_path=directory / "matches.json", publish_state_cache_path=directory / "state.json", publisher_config=PublisherConfig("spotify", "", ""), publisher_sync_mode="replace")
+                report = (directory / "report.txt").read_text()
+                self.assertIn("needs action", report)
+                self.assertIn("sent first 100 URI(s)", report)
+                self.assertEqual(len(client.replace_calls), 1)
+                if save_failure:
+                    self.assertIn("match cache checkpoint failed", report)
+                self.assertNotIn("save-secret", report)
+
+    def test_album_authentication_propagates_without_a_match_verdict(self):
+        from publishers.spotify.client import SpotifyAuthenticationError
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            master = directory / "Synthetic" / "Synthetic.csv"
+            write_playlist_master(master, [playlist_row("111", "Album", f"Track {index}", "Artist", track_number=str(index)) for index in range(1, 4)])
+            client = AlbumPublishingSpotifyClient((), {})
+            with patch.object(client, "search_albums", side_effect=SpotifyAuthenticationError("Reauthorize")) as search, self.assertRaises(SpotifyAuthenticationError):
+                publish_spotify_playlists(directory, directory / "report.txt", client, "raw", playlist_master_paths=(master,), match_cache_path=directory / "matches.json", publish_state_cache_path=directory / "state.json", apply=False)
+            search.assert_called_once()
+            self.assertEqual(client.searches, [])
+            self.assertEqual(json.loads((directory / "matches.json").read_text())["matches"], {})
+            self.assertIn("needs action", (directory / "report.txt").read_text())
+
+    def test_authentication_stops_startup_search_creation_and_second_batch_once(self):
+        from publishers.spotify.client import SpotifyAuthenticationError
+        from publishers.spotify.publish_state import load_spotify_publish_state
+
+        for stage in ("inventory", "user", "search", "create", "second_batch"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory_name:
+                directory = Path(directory_name)
+                master = directory / "Synthetic" / "Synthetic.csv"
+                count = 105 if stage == "second_batch" else 3
+                rows = [playlist_row(str(index), "Album", f"Track {index}", "Artist") for index in range(count)]
+                write_playlist_master(master, rows)
+                calls = []
+                error = SpotifyAuthenticationError("Reauthorize before restarting")
+
+                class Client(PublishingSpotifyClient):
+                    def list_current_user_playlists(self, access_token):
+                        calls.append("inventory")
+                        if stage == "inventory":
+                            raise error
+                        return super().list_current_user_playlists(access_token)
+
+                    def get_current_user_id(self, access_token):
+                        calls.append("user")
+                        if stage == "user":
+                            raise error
+                        return "current-user"
+
+                    def search_tracks(self, access_token, query, limit=10):
+                        calls.append("search")
+                        if stage == "search" and len(self.searches) == 1:
+                            raise error
+                        return super().search_tracks(access_token, query, limit)
+
+                    def create_playlist(self, access_token, name, public=False, description=""):
+                        calls.append("create")
+                        if stage == "create":
+                            raise error
+                        return super().create_playlist(access_token, name, public, description)
+
+                    def add_playlist_items(self, access_token, playlist_id, uris, position=None):
+                        calls.append("add")
+                        if stage == "second_batch" and self.add_calls:
+                            raise error
+                        return super().add_playlist_items(access_token, playlist_id, uris, position)
+
+                client = Client({f'track:"Track {index}" artist:"Artist" album:"Album"': (SpotifyTrackCandidate(f"spotify:track:{index}", f"Track {index}", ("Artist",), "Album"),) for index in range(count)})
+                report = directory / "report.txt"
+                cache = directory / "matches.json"
+                state = directory / "state.json"
+                with self.assertRaises(SpotifyAuthenticationError) as caught:
+                    publish_spotify_playlists(directory, report, client, "raw", playlist_master_paths=(master,), match_cache_path=cache, publish_state_cache_path=state, publisher_config=PublisherConfig("spotify", "", ""))
+                self.assertIs(caught.exception, error)
+                text = report.read_text()
+                self.assertIn("needs action", text)
+                self.assertIn("pending writes were not sent", text)
+                self.assertNotIn("no playlist writes were attempted", text)
+                self.assertEqual(calls.count("search"), 2 if stage == "search" else count if stage in {"create", "second_batch"} else 0)
+                matches = json.loads(cache.read_text())["matches"]
+                self.assertEqual(len(matches), 1 if stage == "search" else count if stage in {"create", "second_batch"} else 0)
+                if stage == "second_batch":
+                    self.assertEqual(len(client.add_calls), 1)
+                    self.assertEqual(len(load_spotify_publish_state(state)["Synthetic"]), 100)
+                    self.assertIn("Added tracks: 100", text)
+                    self.assertIn("publishing failed", text)
+                else:
+                    self.assertEqual(client.add_calls, [])
+
+    def test_authentication_remains_primary_when_checkpoint_save_fails(self):
+        from publishers.spotify import publish_playlist
+        from publishers.spotify.client import SpotifyAuthenticationError
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            error = SpotifyAuthenticationError("Reauthorize before restarting")
+            client = PublishingSpotifyClient({})
+            with (
+                patch.object(client, "list_current_user_playlists", side_effect=error),
+                patch.object(publish_playlist, "save_spotify_track_match_cache", side_effect=OSError("private-path-secret")),
+                self.assertRaises(SpotifyAuthenticationError) as caught,
+            ):
+                publish_spotify_playlists(directory, directory / "report.txt", client, "raw", playlist_master_paths=(), match_cache_path=directory / "matches.json", publish_state_cache_path=directory / "state.json")
+            self.assertIs(caught.exception, error)
+            report = (directory / "report.txt").read_text()
+            self.assertIn("match cache checkpoint failed", report)
+            self.assertNotIn("private-path-secret", report)
+
+    def test_normal_startup_constructs_session_and_reports_actual_refresh_attempts(self):
+        from publishers.spotify import publish_playlist
+        from publishers.spotify.client import HttpResponse, SpotifyClient
+        from publishers.spotify.session import SpotifySession
+        from publishers.spotify.token_cache import save_spotify_token
+
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            settings = SpotifySettings("client", "http://localhost/callback", directory / "token.json")
+            token = SpotifyToken("old", "refresh", 1061, " ".join(DEFAULT_AUTHORIZE_SCOPES), "Bearer")
+            save_spotify_token(settings.token_cache_path, token)
+            now = [1000.0]
+            requests = []
+            session = SpotifySession(settings, token, DEFAULT_AUTHORIZE_SCOPES, wall_time=lambda: now[0], token_transport=lambda request: HttpResponse(200, {}, '{"access_token":"fresh"}'))
+
+            def transport(request):
+                requests.append(request)
+                now[0] = 1002
+                return HttpResponse(200, {}, '{"items":[],"id":"owner"}')
+
+            original_init = SpotifyClient.__init__
+
+            def initialize_client(instance, debug_log=None):
+                original_init(instance, transport=transport, debug_log=debug_log)
+            args = publish_playlist.build_spotify_publisher_namespace(env_file=directory / "env", playlist_output_dir=directory, report=directory / "report.txt", token_cache=settings.token_cache_path, match_cache=directory / "matches.json", publish_state_cache=directory / "state.json", publisher_config=directory / "publisher.json", progress=False)
+            with (
+                patch.object(publish_playlist, "load_spotify_settings", return_value=settings),
+                patch.object(publish_playlist, "get_access_token_for_run", return_value="old") as authorize,
+                patch.object(publish_playlist, "SpotifySession", return_value=session) as construct,
+                patch.object(SpotifyClient, "__init__", initialize_client),
+                patch("sys.stdout", new_callable=io.StringIO) as output,
+            ):
+                summary = publish_playlist.run_spotify_publish_from_args(args, playlist_master_paths=(), publisher_config=PublisherConfig("spotify", "", ""))
+                publish_playlist.print_summary(summary)
+            authorize.assert_called_once()
+            construct.assert_called_once()
+            self.assertEqual([request.headers["Authorization"] for request in requests], ["Bearer old", "Bearer fresh"])
+            self.assertIn("Token refresh attempts: 1", args.report.read_text())
+            self.assertIn("Token refresh attempts: 1", output.getvalue())
+
+
+class SpotifyRequestPacingPublisherTests(unittest.TestCase):
+    def test_legacy_summary_without_request_count_prints_unavailable(self):
+        from publishers.spotify import publish_playlist
+
+        summary = publish_summary_stub()
+        delattr(type(summary), "request_count")
+        with (
+            patch.object(publish_playlist, "run_spotify_publish_from_args", return_value=summary),
+            patch("sys.stdout", new_callable=io.StringIO) as output,
+        ):
+            self.assertEqual(publish_playlist.main([]), 0)
+        self.assertIn("Web API attempts: unavailable", output.getvalue())
+
+    def test_request_interval_rejected_before_settings(self):
+        from publishers.spotify import publish_playlist
+
+        for interval in (-1.0, float("nan"), float("inf"), -float("inf")):
+            with self.subTest(interval=interval):
+                args = publish_playlist.build_spotify_publisher_namespace()
+                args.request_interval_seconds = interval
+                with (
+                    patch.object(publish_playlist, "load_spotify_settings", side_effect=AssertionError("settings accessed before validation")) as settings,
+                    patch.object(publish_playlist, "load_or_create_publisher_config") as config,
+                    patch.object(publish_playlist, "get_access_token_for_run") as token,
+                    self.assertRaisesRegex(ValueError, "finite.*non-negative"),
+                ):
+                    publish_playlist.run_spotify_publish_from_args(args)
+                settings.assert_not_called()
+                config.assert_not_called()
+                token.assert_not_called()
+                with patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit) as failure:
+                    publish_playlist.parse_args([f"--request-interval-seconds={interval}"])
+                self.assertEqual(failure.exception.code, 2)
+
+    def test_request_interval_builders_preserve_omitted_zero_and_positive_values(self):
+        from publishers.spotify import publish_playlist
+
+        for interval, expected in ((None, 0.0), (0.0, 0.0), (0.5, 0.5)):
+            with self.subTest(interval=interval):
+                argv = publish_playlist.build_spotify_publisher_argv(request_interval_seconds=interval)
+                parsed = publish_playlist.parse_args(argv)
+                namespace = publish_playlist.build_spotify_publisher_namespace(request_interval_seconds=interval)
+                self.assertEqual(parsed.request_interval_seconds, expected)
+                self.assertEqual(namespace.request_interval_seconds, expected)
+                self.assertEqual("--request-interval-seconds" in argv, interval is not None)
+                self.assertEqual(parsed.max_new_searches_per_run, 500)
+
+    def test_report_counts_transport_attempts_separately_from_searches(self):
+        self.run_connected_publish(fail_write=False, sync_mode="append")
+
+    def test_normal_runner_paces_its_constructed_client(self):
+        self.run_connected_publish(fail_write=False, sync_mode="append", construct_client=True)
+
+    def test_failed_append_report_counts_the_failed_attempt(self):
+        self.run_connected_publish(fail_write=True, sync_mode="append")
+
+    def test_replace_report_counts_the_final_write(self):
+        self.run_connected_publish(fail_write=False, sync_mode="replace")
+
+    def test_budget_stop_report_counts_the_checkpoint_write(self):
+        self.run_connected_publish(fail_write=False, sync_mode="append", budget_stop=True)
+
+    def run_connected_publish(self, *, fail_write: bool, sync_mode: str, construct_client: bool = False, budget_stop: bool = False):
+        from publishers.spotify import publish_playlist
+        from publishers.spotify.client import HttpRequest, HttpResponse, SpotifyClient
+        from publishers.spotify.request_control import SpotifyRequestControl
+        from tests.spotify.test_request_control import FakeClock
+
+        clock = FakeClock()
+        control = SpotifyRequestControl(monotonic=clock.monotonic, sleep=clock.sleep)
+        starts: list[float] = []
+        requests: list[HttpRequest] = []
+        remote_uris: list[str] = []
+        search_attempts = 0
+        track = {"uri": "spotify:track:alpha", "name": "Alpha One", "artists": [{"name": "Alpha Artist"}], "album": {"name": "Alpha Album"}}
+
+        def transport(request: HttpRequest) -> HttpResponse:
+            nonlocal search_attempts
+            starts.append(clock.now)
+            requests.append(request)
+            if "/me/playlists?" in request.url:
+                return HttpResponse(200, {}, json.dumps({"items": [{"id": "target", "name": "Synthetic", "owner": {"id": "owner"}, "public": False}], "next": None}))
+            if request.url.endswith("/me"):
+                return HttpResponse(200, {}, '{"id":"owner"}')
+            if request.method == "GET" and "/playlists/target/items?" in request.url:
+                return HttpResponse(200, {}, json.dumps({"items": [{"item": track} for _ in remote_uris], "next": None}))
+            if "/search?" in request.url:
+                search_attempts += 1
+                if search_attempts == 1:
+                    return HttpResponse(429, {"Retry-After": "4"}, "")
+                return HttpResponse(200, {}, json.dumps({"tracks": {"items": [track]}}))
+            if request.url.endswith("/playlists/target/items") and request.method in {"POST", "PUT"}:
+                if fail_write:
+                    return HttpResponse(500, {}, "synthetic write failure")
+                assert request.body is not None
+                remote_uris[:] = json.loads(request.body)["uris"]
+                return HttpResponse(201 if request.method == "POST" else 200, {}, '{}')
+            self.fail(f"Unexpected request: {request.method} {request.url}")
+
+        client = SpotifyClient(transport=transport, sleep=clock.sleep, request_control=control)
+        original_init = SpotifyClient.__init__
+
+        def initialize_client(instance, debug_log=None):
+            original_init(instance, transport=transport, sleep=clock.sleep, request_control=control, debug_log=debug_log)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            master = directory / "playlists" / "Synthetic" / "Synthetic.csv"
+            rows = [playlist_row("111", "Alpha Album", "Alpha One", "Alpha Artist")]
+            if budget_stop:
+                rows.append(playlist_row("222", "Beta Album", "Beta One", "Beta Artist"))
+            write_playlist_master(master, rows)
+            args = publish_playlist.build_spotify_publisher_namespace(
+                env_file=directory / "env", playlist_output_dir=directory / "playlists",
+                report=directory / "report.txt", token_cache=directory / "token.json",
+                match_cache=directory / "match.json", publish_state_cache=directory / "state.json",
+                publisher_config=directory / "publisher.json", access_token="synthetic-token",
+                request_interval_seconds=1.0, publisher_sync_mode=sync_mode, progress=False,
+                max_new_searches_per_run=1 if budget_stop else 500,
+            )
+            snapshots = []
+            real_writer = publish_playlist.write_publish_report
+
+            def write_report(path, summary):
+                real_writer(path, summary)
+                snapshots.append((summary.run_status, summary.request_count, path.read_text()))
+
+            with (
+                patch.object(publish_playlist, "load_spotify_settings", return_value=SpotifySettings("synthetic-client", "http://127.0.0.1:8765/callback")),
+                patch.object(publish_playlist, "write_publish_report", side_effect=write_report),
+                patch.object(SpotifyClient, "__init__", initialize_client),
+                patch("sys.stdout", new_callable=io.StringIO) as output,
+            ):
+                if fail_write:
+                    with self.assertRaises(SpotifyApiError):
+                        publish_playlist.run_spotify_publish_from_args(args, publisher_config=PublisherConfig("spotify", "", ""), spotify_client=client)
+                    self.assertEqual(remote_uris, [])
+                    self.assertIn("failed", snapshots[-1][0])
+                else:
+                    summary = publish_playlist.run_spotify_publish_from_args(args, publisher_config=PublisherConfig("spotify", "", ""), spotify_client=None if construct_client else client)
+                    publish_playlist.print_summary(summary)
+                    self.assertEqual(summary.request_count, 6)
+                    self.assertEqual(summary.search_count, 1)
+                    self.assertEqual(remote_uris, ["spotify:track:alpha"])
+                    self.assertIn("Web API attempts: 6", output.getvalue())
+                    if budget_stop:
+                        self.assertIn("search budget reached", summary.run_status)
+                        self.assertEqual(summary.track_count, 1)
+                    elif sync_mode == "append":
+                        self.assertTrue(any("checkpoint" in state and count == 6 for state, count, _ in snapshots))
+                self.assertEqual(starts, [0, 1, 2, 3, 7, 8])
+                self.assertEqual(snapshots[-1][1], 6)
+                self.assertIn("Web API attempts: 6", args.report.read_text())
+                self.assertIn("Spotify searches: 1", args.report.read_text())
+                if not fail_write and sync_mode == "append" and not construct_client and not budget_stop:
+                    # A second invocation reuses the cache/client, but reports only its own reads.
+                    starts.clear()
+                    requests.clear()
+                    cached = publish_playlist.run_spotify_publish_from_args(args, publisher_config=PublisherConfig("spotify", "", ""), spotify_client=client)
+                    self.assertEqual(starts, [9, 10, 11])
+                    self.assertEqual(cached.request_count, 3)
+                    self.assertEqual(cached.search_count, 0)
+                    self.assertEqual(cached.cache_hit_count, 1)
+                    self.assertTrue(all(request.method == "GET" for request in requests))
+
+    def test_old_namespace_and_custom_client_keep_unavailable_metrics(self):
+        from publishers.spotify import publish_playlist
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            args = publish_playlist.build_spotify_publisher_namespace(
+                playlist_output_dir=directory, report=directory / "report.txt",
+                match_cache=directory / "match.json", publish_state_cache=directory / "state.json",
+                access_token="synthetic-token", dry_run=True, progress=False,
+            )
+            if hasattr(args, "request_interval_seconds"):
+                delattr(args, "request_interval_seconds")
+            with patch.object(publish_playlist, "load_spotify_settings", return_value=SpotifySettings("synthetic", "http://127.0.0.1:8765/callback")):
+                summary = publish_playlist.run_spotify_publish_from_args(
+                    args, playlist_master_paths=(), publisher_config=PublisherConfig("spotify", "", ""), spotify_client=PublishingSpotifyClient({}),
+                )
+            self.assertIsNone(summary.request_count)
+            self.assertIn("Web API attempts: unavailable", args.report.read_text())
+
+
+class SpotifyContinuousPublishingTests(unittest.TestCase):
+    def setUp(self):
+        from publishers.spotify import publish_playlist as module
+        from publishers.spotify.client import HttpResponse, SpotifyClient
+        from publishers.spotify.request_control import SpotifyRequestControl
+        from publishers.spotify.session import SpotifySession
+        from publishers.spotify.token_cache import save_spotify_token
+        from tests.spotify.test_request_control import FakeClock
+        import urllib.parse
+
+        self.module = module
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = Path(self.temporary.name)
+        self.master = self.directory / "Synthetic" / "Synthetic.csv"
+        self.names = ["alpha", "bravo", "charlie", "delta", "echo"]
+        self.write_source(self.names)
+        self.clock = FakeClock()
+        self.remote = []
+        self.created = False
+        self.user_id = "owner"
+        self.requests = []
+        self.writes = []
+        self.search_names = []
+        self.responses = []
+        self.reports = []
+        self.refreshes = []
+        self.before_transport = None
+        self.on_sleep = None
+        self.settings = SpotifySettings("synthetic-client", "http://127.0.0.1:8765/callback", self.directory / "token.json")
+        self.token = SpotifyToken(access_token="TOKEN_SENTINEL", refresh_token="REFRESH_SENTINEL", expires_at=1700003600, scope=" ".join(DEFAULT_AUTHORIZE_SCOPES), token_type="Bearer")
+        save_spotify_token(self.settings.token_cache_path, self.token)
+        self.args = module.build_spotify_publisher_namespace(
+            playlist_output_dir=self.directory, report=self.directory / "report.txt",
+            token_cache=self.settings.token_cache_path, match_cache=self.directory / "match.json",
+            publish_state_cache=self.directory / "state.json", continuous=True,
+            max_new_searches_per_run=2, progress=False,
+        )
+        def sleep(seconds):
+            if self.on_sleep:
+                self.on_sleep(seconds)
+            self.clock.sleep(seconds)
+        self.control = SpotifyRequestControl(1, monotonic=self.clock.monotonic,
+                                             wall_time=lambda: 1700000000 + self.clock.now, sleep=sleep)
+        def token_transport(request):
+            self.refreshes.append(self.clock.now)
+            self.clock.now += 2
+            return HttpResponse(200, {}, json.dumps({"access_token":"ROTATED_SENTINEL", "refresh_token":"ROTATED_REFRESH_SENTINEL", "token_type":"Bearer", "expires_in":3600}))
+        def transport(request):
+            parsed = urllib.parse.urlparse(request.url)
+            query = urllib.parse.parse_qs(parsed.query)
+            entry = (self.clock.now, request.method, parsed.path, json.loads(request.body) if request.body else None)
+            self.requests.append(entry)
+            if self.before_transport:
+                override = self.before_transport(request, parsed, query)
+                if override is not None:
+                    return override
+            if parsed.path == "/v1/me":
+                payload = {"id": self.user_id}
+            elif parsed.path == "/v1/me/playlists" and request.method == "GET":
+                payload = {"items": [self.playlist_payload()] if self.created else [], "next":None}
+            elif parsed.path == "/v1/me/playlists":
+                self.created = True
+                self.writes.append(entry)
+                return HttpResponse(201, {}, json.dumps(self.playlist_payload()))
+            elif parsed.path == "/v1/search":
+                if query["type"] == ["album"]:
+                    payload = {"albums":{"items":[]}}
+                else:
+                    name = next(name for name in self.names if f'track:"{name}"' in query["q"][0])
+                    self.search_names.append(name)
+                    payload = {"tracks":{"items":[self.track_payload(name)]}}
+            elif request.method == "GET":
+                payload = {"items":[{"track":self.track_payload(uri.split(":")[-1])} for uri in self.remote], "next":None}
+            else:
+                self.writes.append(entry)
+                data = json.loads(request.body)
+                if request.method == "PUT":
+                    self.remote[:] = data["uris"]
+                    return HttpResponse(200, {}, "{}")
+                position = data.get("position", len(self.remote))
+                self.remote[position:position] = data["uris"]
+                return HttpResponse(201, {}, "{}")
+            return HttpResponse(200, {}, json.dumps(payload))
+        self.client = SpotifyClient(transport=transport, request_control=self.control, sleep=sleep)
+        def session(settings, token, scopes):
+            return SpotifySession(settings, token, scopes, wall_time=lambda:1700000000 + self.clock.now, token_transport=token_transport)
+        self.startup = self.enter_patch(patch.object(module, "get_access_token_for_run", return_value="TOKEN_SENTINEL"))
+        self.enter_patch(patch.object(module, "load_spotify_settings", return_value=self.settings))
+        self.enter_patch(patch.object(module, "SpotifySession", side_effect=session))
+        real_writer = module.write_publish_report
+        def report(path, summary):
+            real_writer(path, summary)
+            self.reports.append(summary)
+        self.enter_patch(patch.object(module, "write_publish_report", side_effect=report))
+
+    def enter_patch(self, patcher):
+        result = patcher.start()
+        self.addCleanup(patcher.stop)
+        return result
+
+    def write_source(self, names, release_id=""):
+        write_playlist_master(self.master, [{"Track Name":name, "Artist Name":"Synthetic Artist", "Album Name":"Synthetic Album", "Release Id":release_id, "Track Number":str(index)} for index, name in enumerate(names, 1)])
+
+    def playlist_payload(self):
+        return {"id":"playlist", "name":"Synthetic", "owner":{"id":"owner"}, "public":False, "collaborative":False}
+
+    def track_payload(self, name):
+        return {"id":name, "uri":f"spotify:track:{name}", "name":name, "type":"track", "artists":[{"name":"Synthetic Artist"}], "album":{"name":"Synthetic Album", "id":"album"}}
+
+    def run_publish(self):
+        with patch("sys.stdout", new_callable=io.StringIO) as output:
+            try:
+                return self.module.run_spotify_publish_from_args(self.args, publisher_config=PublisherConfig("spotify", "", ""), spotify_client=self.client)
+            finally:
+                self.console = output.getvalue()
+
+    def test_j1_three_capped_passes_full_final_coverage_and_exact_order_once(self):
+        def observe_boundary(request, parsed, query):
+            if parsed.path == "/v1/me" and len(self.requests) > 1:
+                expected = 1 if len(self.remote) == 2 else 2
+                self.assertIn(f"Invocation completed passes: {expected}", self.args.report.read_text())
+            return None
+        self.before_transport = observe_boundary
+        summary = self.run_publish()
+        self.assertEqual(self.remote, ["spotify:track:alpha", "spotify:track:bravo", "spotify:track:charlie", "spotify:track:delta", "spotify:track:echo"])
+        self.assertEqual(self.search_names, ["alpha", "bravo", "charlie", "delta", "echo"])
+        self.assertEqual(summary.completed_pass_count, 3)
+        self.assertEqual(summary.stop_reason, "complete")
+        self.assertEqual(summary.run_state, "complete")
+        self.assertEqual(summary.track_count, 5)
+        self.assertEqual(summary.cache_hit_count, 4)
+        self.assertEqual(summary.search_count, 1)
+        self.assertEqual(summary.request_count, 17)
+        self.assertEqual(self.startup.call_count, 1)
+        self.assertEqual([report.stop_reason for report in self.reports if report.stop_reason == "search_budget"], ["search_budget", "search_budget", "search_budget", "search_budget"])
+        print("J1 trace:", json.dumps({"requests":self.requests,"remote":self.remote,"passes":summary.completed_pass_count,"coverage":summary.track_count}))
+
+    def test_continuous_dry_run_and_uncapped_zero(self):
+        self.args.apply = False
+        self.args.dry_run = True
+        self.args.max_new_searches_per_run = 0
+        summary = self.run_publish()
+        self.assertEqual(self.writes, [])
+        self.assertEqual(summary.track_count, 5)
+        self.assertEqual(summary.completed_pass_count, 1)
+        self.assertEqual(summary.would_add_count, 5)
+
+    def test_forbidden_flags_fail_before_settings_or_token_side_effects(self):
+        for field, value in (("publisher_sync_mode", "replace"), ("refresh_match_cache", True), ("access_token", "TOKEN"), ("request_interval_seconds", 0), ("request_interval_seconds", float("inf"))):
+            original = getattr(self.args, field)
+            setattr(self.args, field, value)
+            with patch.object(self.module, "load_spotify_settings") as settings, self.assertRaises(ValueError):
+                self.run_publish()
+            settings.assert_not_called()
+            setattr(self.args, field, original)
+        self.startup.assert_not_called()
+        self.assertEqual(self.requests, [])
+
+    def test_j2_receipt_cooldown_expiry_slow_refresh_and_four_pauses(self):
+        from publishers.spotify.client import HttpResponse
+        from publishers.spotify.token_cache import load_spotify_token
+        self.names = ["alpha"]
+        self.write_source(self.names)
+        self.args.max_new_searches_per_run = 0
+        pauses = []
+        checkpoint_delayed = False
+        def response(request, parsed, query):
+            if parsed.path == "/v1/search" and len(pauses) < 4:
+                pauses.append(self.clock.now)
+                return HttpResponse(429, {"Retry-After":"7200" if len(pauses) == 1 else "4"},
+                                    '{"error":{"reason":"QUOTA_EXCEEDED"},"secret":"BODY_SENTINEL"}' if len(pauses) == 1 else "{}")
+            return None
+        self.before_transport = response
+        real_writer = self.module.write_publish_report
+        def report(path, summary):
+            nonlocal checkpoint_delayed
+            real_writer(path, summary)
+            if summary.run_state == "waiting" and not checkpoint_delayed:
+                checkpoint_delayed = True
+                self.assertTrue(self.args.match_cache.exists())
+                self.assertTrue(self.args.publish_state_cache.exists())
+                self.clock.now += 2
+        with patch.object(self.module, "write_publish_report", side_effect=report):
+            summary = self.run_publish()
+        self.assertEqual([entry[0] for entry in self.requests], [0,1,2,7204,7206,7208,7212,7216,7220,7228,7236,7244,7260,7276,7292,7308,7324])
+        self.assertEqual(pauses, [2,7208,7220,7244])
+        self.assertEqual(self.refreshes, [7202])
+        saved = load_spotify_token(self.settings.token_cache_path)
+        assert saved is not None
+        self.assertEqual(saved.access_token, "ROTATED_SENTINEL")
+        self.assertEqual((summary.request_count, summary.rate_limit_count, summary.quota_count, summary.token_refresh_count, summary.completed_pass_count, summary.wait_seconds), (17,4,1,1,1,7210))
+        self.assertIn("2023-11-15T00:13:22+00:00", self.console)
+        self.assertIn("7198 seconds remaining", self.console)
+        self.assertNotIn("Synthetic", self.console)
+        for sentinel in ("TOKEN_SENTINEL", "REFRESH_SENTINEL", "ROTATED_SENTINEL", "BODY_SENTINEL"):
+            self.assertNotIn(sentinel, self.console + self.args.report.read_text())
+        print("J2 trace:", json.dumps({"requests":self.requests,"pause_receipts":pauses,"refresh_starts":self.refreshes,"wait_seconds":summary.wait_seconds,"attempts":summary.request_count}))
+
+    def test_j3_positional_pause_replans_after_remote_edit(self):
+        from publishers.spotify.client import HttpResponse
+        self.args.max_new_searches_per_run = 0
+        self.run_publish()
+        self.remote = ["spotify:track:bravo", "spotify:track:delta"]
+        self.requests.clear()
+        self.writes.clear()
+        paused = False
+        edited = False
+        def response(request, parsed, query):
+            nonlocal paused
+            if request.method == "POST" and parsed.path.endswith("/items") and not paused:
+                body = json.loads(request.body)
+                if body["uris"] == ["spotify:track:charlie"]:
+                    self.assertEqual(body["position"], 2)
+                    paused = True
+                    return HttpResponse(429, {"Retry-After":"4"}, "{}")
+            return None
+        def edit(seconds):
+            nonlocal edited
+            if not paused or edited:
+                return
+            self.assertEqual(self.remote, ["spotify:track:alpha", "spotify:track:bravo", "spotify:track:delta"])
+            report = self.reports[-1]
+            self.assertEqual(report.run_state, "waiting")
+            self.assertEqual(report.added_count, 1)
+            self.assertEqual(report.would_add_count, 2)
+            self.assertTrue(self.args.match_cache.exists())
+            self.assertTrue(self.args.publish_state_cache.exists())
+            self.remote.insert(0, "spotify:track:zulu")
+            edited = True
+        self.before_transport = response
+        self.on_sleep = edit
+        summary = self.run_publish()
+        self.assertTrue(edited)
+        self.assertEqual(self.remote, ["spotify:track:zulu", "spotify:track:alpha", "spotify:track:bravo", "spotify:track:charlie", "spotify:track:delta", "spotify:track:echo"])
+        bodies = [entry[3] for entry in self.requests if entry[1] == "POST"]
+        self.assertEqual(bodies, [{"uris":["spotify:track:alpha"],"position":0}, {"uris":["spotify:track:charlie"],"position":2}, {"uris":["spotify:track:charlie"],"position":3}, {"uris":["spotify:track:echo"],"position":5}])
+        self.assertEqual(summary.search_count, 0)
+        self.assertEqual(summary.completed_pass_count, 1)
+        self.assertEqual(sum(entry[2].endswith("/items") and entry[1]=="GET" for entry in self.requests), 2)
+        print("J3 trace:", json.dumps({"requests":self.requests,"remote":self.remote,"writes":self.writes}))
+
+    def test_budget_one_completed_no_candidate_album_with_cached_first_row(self):
+        from publishers.spotify.match_cache import cache_track_match, save_spotify_track_match_cache
+        self.names = ["alpha", "bravo", "charlie"]
+        self.write_source(self.names, "release")
+        self.args.max_new_searches_per_run = 1
+        # Seed a literal first-row decision, leaving the other two genuinely uncached.
+        tracks = self.module.read_playlist_tracks_from_master_paths((self.master,))
+        cache = {}
+        cache_track_match(cache, TrackMatchDecision(track=tracks[0], status=MATCHED, spotify_uri="spotify:track:alpha", reason="synthetic", candidate=SpotifyTrackCandidate("spotify:track:alpha", "alpha", ("Synthetic Artist",), "Synthetic Album")))
+        save_spotify_track_match_cache(self.args.match_cache, cache)
+        from publishers.spotify.client import HttpResponse
+        self.before_transport = lambda request, parsed, query: HttpResponse(200, {}, '{"tracks":{"items":[]}}') if parsed.path == "/v1/search" and query["type"] == ["track"] else None
+        summary = self.run_publish()
+        self.assertEqual(summary.completed_pass_count, 3)
+        self.assertEqual(summary.unmatched_count, 2)
+        self.assertEqual(summary.run_status, "processing complete; matches need review")
+        self.assertEqual(sum(entry[2] == "/v1/search" for entry in self.requests), 7)
+        self.assertEqual(self.remote, ["spotify:track:alpha"])
+        self.assertEqual(summary.stop_reason, "complete")
+
+    def test_startup_refresh_is_included_in_invocation_total(self):
+        from dataclasses import replace
+        from publishers.spotify.client import HttpResponse
+        from publishers.spotify.session import get_spotify_access_token
+        from publishers.spotify.token_cache import save_spotify_token
+        save_spotify_token(self.settings.token_cache_path, replace(self.token, expires_at=1700000000))
+        startup_calls = []
+        def transport(request):
+            startup_calls.append(request)
+            return HttpResponse(200, {}, json.dumps({"access_token":"STARTUP_TOKEN", "token_type":"Bearer", "expires_in":3600}))
+        def startup(settings, force_reauthorize=False, on_refresh=None):
+            return get_spotify_access_token(settings, DEFAULT_AUTHORIZE_SCOPES, now=1700000000, token_transport=transport, on_refresh=on_refresh)
+        self.startup.side_effect = startup
+        summary = self.run_publish()
+        self.assertEqual(summary.token_refresh_count, 1)
+        self.assertEqual(len(startup_calls), 1)
+        self.assertEqual(self.refreshes, [])
+        self.assertIn("Token refresh attempts: 1", self.args.report.read_text())
+
+    def test_startup_pause_pins_account_before_inventory_and_rechecks_on_resume(self):
+        from publishers.spotify.client import HttpResponse, SpotifyAuthenticationError
+        paused = False
+        def response(request, parsed, query):
+            nonlocal paused
+            if parsed.path == "/v1/me/playlists" and not paused:
+                paused = True
+                return HttpResponse(429, {"Retry-After":"4"}, "{}")
+            return None
+        self.before_transport = response
+        self.on_sleep = lambda seconds: setattr(self, "user_id", "changed-owner") if paused else None
+        with self.assertRaises(SpotifyAuthenticationError):
+            self.run_publish()
+        self.assertEqual([r[2] for r in self.requests], ["/v1/me", "/v1/me/playlists", "/v1/me"])
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.reports[-1].run_state, "needs_action")
+
+    def test_selected_input_invalid_after_pause_stops_before_new_requests(self):
+        from publishers.spotify.client import HttpResponse
+        paused = False
+        def response(request, parsed, query):
+            nonlocal paused
+            if parsed.path == "/v1/search" and not paused:
+                paused = True
+                return HttpResponse(429, {"Retry-After":"4"}, "{}")
+            return None
+        self.before_transport = response
+        self.on_sleep = lambda seconds: self.master.write_text("invalid,header\n") if paused else None
+        with self.assertRaises(ValueError):
+            self.run_publish()
+        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.reports[-1].run_state, "failed")
+
+    def test_newly_discovered_input_is_not_selected_on_resume(self):
+        from publishers.spotify.client import HttpResponse
+        paused = False
+        def response(request, parsed, query):
+            nonlocal paused
+            if parsed.path == "/v1/search" and not paused:
+                paused = True
+                return HttpResponse(429, {"Retry-After":"4"}, "{}")
+            return None
+        self.before_transport = response
+        def new_source(seconds):
+            if paused:
+                write_playlist_master(self.directory / "Other" / "Other.csv", [{"Track Name":"unselected"}])
+        self.on_sleep = new_source
+        summary = self.run_publish()
+        self.assertEqual(summary.track_count, 5)
+        self.assertEqual(summary.playlist_count, 1)
+        self.assertEqual(self.search_names, self.names)
+
+    def test_quota_without_reset_stops_once_with_actionable_report(self):
+        from publishers.spotify.client import HttpResponse
+        self.before_transport = lambda request, parsed, query: HttpResponse(429, {}, '{"error":{"reason":"QUOTA_EXCEEDED"},"secret":"BODY_SENTINEL"}')
+        with patch("sys.stderr", new_callable=io.StringIO) as error_output, self.assertRaises(SpotifyApiError):
+            self.run_publish()
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.control.wait_seconds, 0)
+        self.assertEqual(self.reports[-1].run_state, "needs_action")
+        self.assertEqual(self.reports[-1].quota_count, 1)
+        self.assertIn("reset time was not provided", self.args.report.read_text() + error_output.getvalue())
+        self.assertNotIn("BODY_SENTINEL", self.args.report.read_text() + error_output.getvalue())
+
+    def test_pause_checkpoint_failure_is_terminal_without_wait_or_pending_flush(self):
+        from publishers.spotify.client import HttpResponse
+        self.before_transport = lambda request, parsed, query: HttpResponse(429, {"Retry-After":"4"}, "{}") if parsed.path == "/v1/search" else None
+        with patch.object(self.module, "save_spotify_track_match_cache", side_effect=OSError("disk unavailable")), patch("sys.stderr", new_callable=io.StringIO), self.assertRaisesRegex(SpotifyApiError, "checkpoint failed"):
+            self.run_publish()
+        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(self.control.wait_seconds, 0)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.reports[-1].run_state, "failed")
+
+    def test_wait_interrupt_retains_reason_deadline_even_if_report_write_fails(self):
+        from publishers.spotify.client import HttpResponse
+        self.before_transport = lambda request, parsed, query: HttpResponse(429, {"Retry-After":"7200"}, "{}")
+        def interrupt(seconds):
+            self.clock.now += 3
+            raise KeyboardInterrupt("stopped")
+        self.on_sleep = interrupt
+        real_writer = self.module.write_publish_report
+        real_open = io.open
+        prior_report = []
+        prior_files = []
+        partial_writes = []
+        def failing_open(*args, **kwargs):
+            output = real_open(*args, **kwargs)
+            real_write = output.write
+            def partial_write(text):
+                real_write(text[:20])
+                output.flush()
+                partial_writes.append(text[:20])
+                raise OSError("report disk unavailable")
+            output.write = partial_write
+            return output
+        def report(path, summary):
+            if summary.run_state == "interrupted":
+                prior_report.append(path.read_bytes())
+                prior_files.extend(path.parent.iterdir())
+                with patch("io.open", side_effect=failing_open):
+                    real_writer(path, summary)
+                return
+            real_writer(path, summary)
+        with patch.object(self.module, "write_publish_report", side_effect=report), patch("sys.stderr", new_callable=io.StringIO) as errors, self.assertRaises(KeyboardInterrupt):
+            self.run_publish()
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.control.wait_seconds, 3)
+        self.assertEqual(len(partial_writes), 1)
+        self.assertEqual(self.args.report.read_bytes(), prior_report[0])
+        self.assertEqual(set(self.args.report.parent.iterdir()), set(prior_files))
+        self.assertIn("2023-11-15T00:13:20+00:00", self.args.report.read_text())
+        self.assertIn("2023-11-15T00:13:20+00:00", errors.getvalue())
+        self.assertIn("report", errors.getvalue())
+
+    def test_ctrl_c_during_pause_progress_update_stops_before_resume(self):
+        self.assert_pause_cleanup_interrupt_stops("update")
+
+    def test_ctrl_c_during_pause_progress_finish_stops_before_resume(self):
+        self.assert_pause_cleanup_interrupt_stops("finish")
+
+    def test_ctrl_c_during_pause_response_logging_retains_deadline(self):
+        self.assert_pause_cleanup_interrupt_stops("log_debug")
+
+    def assert_pause_cleanup_interrupt_stops(self, method):
+        from publishers.spotify.client import HttpResponse
+        original_run = self.module.run_spotify_publish_from_args
+        self.args.progress = True
+        paused = False
+        interrupted = False
+        def response(request, parsed, query):
+            nonlocal paused
+            if parsed.path == "/v1/search" and not paused:
+                paused = True
+                return HttpResponse(429, {"Retry-After": "7200"}, "{}")
+            return None
+        def cleanup(*args, **kwargs):
+            nonlocal interrupted
+            if paused and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt()
+        self.before_transport = response
+        with (
+            patch.object(self.client if method == "log_debug" else ProgressReporter, method, side_effect=cleanup),
+            patch.object(self.module, "parse_args", return_value=self.args),
+            patch.object(self.module, "run_spotify_publish_from_args", side_effect=lambda args, **kwargs: original_run(args, publisher_config=PublisherConfig("spotify", "", ""), spotify_client=self.client, **kwargs)),
+            patch("sys.stdout", new_callable=io.StringIO),
+            patch("sys.stderr", new_callable=io.StringIO) as errors,
+        ):
+            result = self.module.main([])
+        self.assertEqual(result, 130)
+        self.assertTrue(interrupted)
+        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(self.control.wait_seconds, 0)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.reports[-1].run_state, "interrupted")
+
+        self.assertIn("2023-11-15T00:13:22+00:00", self.args.report.read_text())
+        self.assertIn("2023-11-15T00:13:22+00:00", errors.getvalue())
+
+
+    def test_search_api_failure_stops_once_without_search_storm(self):
+        from publishers.spotify.client import HttpResponse
+        self.before_transport = lambda request, parsed, query: HttpResponse(500, {}, "BODY_SENTINEL") if parsed.path == "/v1/search" else None
+        with self.assertRaises(SpotifyApiError):
+            self.run_publish()
+        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(self.writes, [])
+        self.assertNotIn("BODY_SENTINEL", self.console + self.args.report.read_text())
+        self.assertEqual(self.reports[-1].run_state, "failed")
+
+    def test_album_attempt_full_key_invalidation_and_interrupted_attempt_retry(self):
+        from dataclasses import replace
+        from publishers.spotify.client import HttpResponse, SpotifyRateLimitPauseError
+        from publishers.spotify.match_cache import cache_track_match, save_spotify_track_match_cache
+        from publishers.spotify.matching import UNMATCHED
+        self.names = ["alpha", "bravo", "charlie"]
+        self.write_source(self.names, "release")
+        attempts = set()
+        album_calls = []
+        interrupt = False
+        def response(request, parsed, query):
+            if parsed.path == "/v1/search" and query["type"] == ["album"]:
+                album_calls.append(query["q"])
+                if interrupt:
+                    return HttpResponse(429, {"Retry-After":"4"}, "{}")
+            return None
+        self.before_transport = response
+        def run_pass(index, limit=10, candidate=None):
+            match_path = self.directory / f"match-{index}.json"
+            if candidate:
+                tracks = self.module.read_playlist_tracks_from_master_paths((self.master,))
+                cache = {}
+                cache_track_match(cache, TrackMatchDecision(tracks[0], UNMATCHED, "", "synthetic", review_candidates=(candidate,)))
+                save_spotify_track_match_cache(match_path, cache)
+            return self.module.publish_spotify_playlists(self.directory, self.args.report, self.client, "TOKEN_SENTINEL",
+                        playlist_master_paths=(self.master,), match_cache_path=match_path,
+                        publish_state_cache_path=self.args.publish_state_cache, apply=False,
+                        search_limit=limit, max_new_searches_per_run=1, completed_album_attempts=attempts)
+        first = run_pass(1)
+        self.assertEqual((first.stop_reason, first.track_count, first.resume_progress_made), ("search_budget",0,True))
+        second = run_pass(2)
+        self.assertEqual((second.stop_reason, second.track_count), ("search_budget",1))
+        self.assertEqual(len(album_calls), 1)
+        run_pass(3, limit=9)
+        with patch.object(self.module, "MATCHER_VERSION", MATCHER_VERSION+1):
+            run_pass(4)
+        candidate = SpotifyTrackCandidate("spotify:track:hint", "hint-one", ("Synthetic Artist",), "Synthetic Album")
+        run_pass(5, candidate=candidate)
+        run_pass(6, candidate=replace(candidate, name="hint-two"))
+        self.master.write_text(self.master.read_text().replace("Synthetic Album", "Changed Album"))
+        run_pass(7)
+        self.assertEqual(len(album_calls), 6)
+        self.assertEqual(len(attempts), 6)
+        attempts.clear()
+        interrupt = True
+        self.control.continuous = True
+        with self.assertRaises(SpotifyRateLimitPauseError):
+            run_pass(8)
+        self.assertEqual(attempts, set())
+        interrupt = False
+        run_pass(9)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(len(album_calls), 8)
+
+    def test_create_pause_resumes_from_inventory_without_repeating_searches(self):
+        from publishers.spotify.client import HttpResponse
+        paused = False
+        def response(request, parsed, query):
+            nonlocal paused
+            if request.method == "POST" and parsed.path == "/v1/me/playlists" and not paused:
+                paused = True
+                return HttpResponse(429, {"Retry-After":"4"}, "{}")
+            return None
+        self.before_transport = response
+        self.args.max_new_searches_per_run = 0
+        summary = self.run_publish()
+        self.assertEqual(self.search_names, self.names)
+        self.assertEqual(len(self.remote), 5)
+        self.assertEqual(summary.completed_pass_count, 1)
+        self.assertEqual(sum(r[2] == "/v1/me/playlists" and r[1] == "GET" for r in self.requests), 2)
+        self.assertEqual(sum(r[1] == "POST" for r in self.requests), 3)
+
+    def test_album_page_pause_retries_incomplete_attempt_before_retaining(self):
+        from publishers.spotify.client import HttpResponse
+        self.names = ["alpha", "bravo", "charlie"]
+        self.write_source(self.names, "release")
+        self.args.max_new_searches_per_run = 0
+        pages = []
+        album_searches = []
+        def response(request, parsed, query):
+            if parsed.path == "/v1/search" and query["type"] == ["album"]:
+                album_searches.append(self.clock.now)
+                return HttpResponse(200, {}, json.dumps({"albums":{"items":[{"id":"album", "name":"Synthetic Album", "artists":[{"name":"Synthetic Artist"}], "total_tracks":3}]}}))
+            if parsed.path == "/v1/albums/album/tracks":
+                pages.append(self.clock.now)
+                if len(pages) == 1:
+                    return HttpResponse(429, {"Retry-After":"4"}, "{}")
+                return HttpResponse(200, {}, json.dumps({"items":[dict(self.track_payload(name), track_number=i, disc_number=1) for i,name in enumerate(self.names,1)], "next":None}))
+            return None
+        self.before_transport = response
+        summary = self.run_publish()
+        self.assertEqual(len(pages), 2)
+        self.assertEqual(len(album_searches), 2)
+        self.assertEqual(self.search_names, [])
+        self.assertEqual(self.remote, ["spotify:track:alpha", "spotify:track:bravo", "spotify:track:charlie"])
+        self.assertEqual(summary.completed_pass_count, 1)
+
+    def test_second_append_batch_pause_retains_first_hundred_without_flushing_pending(self):
+        from publishers.spotify.client import HttpResponse
+        self.names = [f"song{index:03}" for index in range(101)]
+        self.write_source(self.names)
+        self.args.max_new_searches_per_run = 0
+        paused = False
+        observed = False
+        def response(request, parsed, query):
+            nonlocal paused
+            if request.method == "POST" and parsed.path.endswith("/items") and len(self.remote) == 100 and not paused:
+                paused = True
+                return HttpResponse(429, {"Retry-After":"4"}, "{}")
+            return None
+        def observe(seconds):
+            nonlocal observed
+            if paused and not observed:
+                self.assertEqual(self.remote, [f"spotify:track:song{index:03}" for index in range(100)])
+                self.assertEqual(self.reports[-1].added_count, 100)
+                self.assertEqual(self.reports[-1].would_add_count, 1)
+                observed = True
+        self.before_transport = response
+        self.on_sleep = observe
+        summary = self.run_publish()
+        self.assertTrue(observed)
+        self.assertEqual(self.remote, [f"spotify:track:song{index:03}" for index in range(101)])
+        self.assertEqual(len(self.search_names), 101)
+        self.assertEqual(summary.cache_hit_count, 101)
+        self.assertEqual(summary.completed_pass_count, 1)
+        self.assertEqual([len(r[3]["uris"]) for r in self.writes if r[2].endswith("/items")], [100,1])
+
+    def test_no_cacheable_progress_budget_stops_without_another_pass(self):
+        with patch.object(self.module, "cache_track_match"), self.assertRaisesRegex(SpotifyApiError, "no retained progress"):
+            self.run_publish()
+        self.assertEqual(self.search_names, ["alpha", "bravo"])
+        self.assertEqual(self.reports[-1].run_state, "failed")
+
+    def test_main_connected_completion_error_and_wait_interrupt_exit_codes(self):
+        from publishers.spotify.client import HttpResponse
+        original = self.module.run_spotify_publish_from_args
+        def run(args, **kwargs):
+            return original(args, publisher_config=PublisherConfig("spotify", "", ""), spotify_client=self.client, **kwargs)
+        argv = self.module.build_spotify_publisher_argv(continuous=True, playlist_output_dir=self.directory,
+            report=self.args.report, token_cache=self.args.token_cache, match_cache=self.args.match_cache,
+            publish_state_cache=self.args.publish_state_cache, no_progress=True, dry_run=True,
+            max_new_searches_per_run=0)
+        with patch.object(self.module, "run_spotify_publish_from_args", side_effect=run), patch("sys.stdout", new_callable=io.StringIO) as output, patch("sys.stderr", new_callable=io.StringIO) as errors:
+            self.assertEqual(self.module.main(argv), 0)
+            self.before_transport = lambda request, parsed, query: HttpResponse(500, {}, "BODY_SENTINEL")
+            self.assertEqual(self.module.main(argv), 1)
+            self.before_transport = lambda request, parsed, query: HttpResponse(429, {"Retry-After":"7200"}, "{}")
+            def interrupt(seconds):
+                if self.reports[-1].run_state == "waiting":
+                    raise KeyboardInterrupt
+            self.on_sleep = interrupt
+            self.assertEqual(self.module.main(argv), 130)
+        report = self.args.report.read_text()
+        self.assertEqual(self.reports[-1].run_state, "interrupted")
+        self.assertIn("Resume at:", report)
+        self.assertIn("Interrupted:", errors.getvalue())
+        self.assertNotIn("BODY_SENTINEL", output.getvalue() + errors.getvalue() + report)
+        self.assertEqual(self.writes, [])
+
+    def test_exact_last_row_at_cap_completes_without_an_extra_pass(self):
+        self.names = ["alpha"]
+        self.write_source(self.names)
+        self.args.max_new_searches_per_run = 1
+        summary = self.run_publish()
+        self.assertEqual(summary.stop_reason, "complete")
+        self.assertEqual(summary.completed_pass_count, 1)
+        self.assertEqual(summary.track_count, 1)
+        self.assertEqual(sum(r[2] == "/v1/me" for r in self.requests), 1)
+
+    def test_fallback_resets_only_after_retained_pass_progress(self):
+        from publishers.spotify.client import HttpResponse
+        pauses = 0
+        after_progress = False
+        def response(request, parsed, query):
+            nonlocal pauses, after_progress
+            if parsed.path == "/v1/search":
+                if pauses < 5:
+                    pauses += 1
+                    return HttpResponse(429, {}, "[]")
+                if len(self.remote) == 2 and not after_progress:
+                    after_progress = True
+                    return HttpResponse(429, {}, "{}")
+            return None
+        self.before_transport = response
+        summary = self.run_publish()
+        self.assertEqual(summary.wait_seconds, 1860)
+        self.assertEqual(summary.rate_limit_count, 6)
+        self.assertEqual(summary.quota_count, 0)
+        self.assertEqual(summary.completed_pass_count, 3)
+        self.assertEqual(self.control.minimum_interval_seconds, 30)
+
+    def test_continuous_fake_client_does_not_invent_transport_metrics(self):
+        summary = self.module.run_spotify_publish_from_args(self.args, playlist_master_paths=(),
+            publisher_config=PublisherConfig("spotify", "", ""), spotify_client=PublishingSpotifyClient({}))
+        self.assertIsNone(summary.request_count)
+        self.assertIsNone(summary.rate_limit_count)
+        self.assertEqual(summary.completed_pass_count, 1)
+
+    def test_failed_pause_report_still_prints_deadline_and_never_waits(self):
+        from publishers.spotify.client import HttpResponse
+        self.before_transport = lambda request, parsed, query: HttpResponse(429, {"Retry-After":"7200"}, "{}")
+        with patch.object(self.module, "write_publish_report", side_effect=OSError("report unavailable")), patch("sys.stderr", new_callable=io.StringIO) as errors, self.assertRaises(SpotifyApiError):
+            self.run_publish()
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.control.wait_seconds, 0)
+        self.assertIn("2023-11-15T00:13:20+00:00", errors.getvalue())
+
+    def test_mixed_malformed_remote_page_stops_before_search_or_write(self):
+        from publishers.spotify.client import HttpResponse
+        self.created = True
+        self.remote = ["spotify:track:alpha"]
+        missing_uri = self.track_payload("bravo")
+        del missing_uri["uri"]
+        def response(request, parsed, query):
+            if request.method == "GET" and parsed.path.endswith("/items"):
+                return HttpResponse(200, {}, json.dumps({"items":[{"track":self.track_payload("alpha")}, malformed], "next":None}))
+            return None
+        self.before_transport = response
+        for malformed in ({"track": missing_uri}, {"track": {"type": "track"}},
+                          "malformed", {}, {"track": {}}, {"track": "malformed"}, {"item": "malformed"}):
+            with self.subTest(malformed=malformed):
+                self.requests.clear()
+                with self.assertRaisesRegex(SpotifyApiError, "Malformed Spotify playlist item"):
+                    self.run_publish()
+                self.assertEqual(len(self.requests), 3)
+                self.assertEqual(self.search_names, [])
+                self.assertEqual(self.writes, [])
+                self.assertEqual(self.reports[-1].run_state, "failed")
+
+    def test_remote_null_and_nontrack_entries_keep_existing_handling(self):
+        from publishers.spotify.client import HttpResponse
+        self.names = ["alpha"]
+        self.write_source(self.names)
+        self.created = True
+        self.remote = ["spotify:track:alpha"]
+        def response(request, parsed, query):
+            if request.method == "GET" and parsed.path.endswith("/items"):
+                return HttpResponse(200, {}, json.dumps({"items":[{"track":self.track_payload("alpha")}, {"track":None}, {"item":None}, {"item":{"type":"episode","uri":"spotify:episode:synthetic","name":"Synthetic Episode"}}], "next":None}))
+            return None
+        self.before_transport = response
+        summary = self.run_publish()
+        self.assertEqual(summary.run_state, "complete")
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.remote, ["spotify:track:alpha"])
+
+    def test_bounded_final_report_and_console_are_complete_with_processing_checkpoints(self):
+        self.names = ["alpha"]
+        self.write_source(self.names)
+        self.args.continuous = False
+        self.args.max_new_searches_per_run = 0
+        for apply, mode in ((True,"append"), (False,"append"), (True,"replace")):
+            with self.subTest(apply=apply, mode=mode):
+                self.args.apply = apply
+                self.args.dry_run = not apply
+                self.args.publisher_sync_mode = mode
+                self.created = False
+                self.remote.clear()
+                self.reports.clear()
+                summary = self.run_publish()
+                self.assertEqual(summary.run_state, "complete")
+                self.assertIn("- Run state: complete", self.args.report.read_text())
+                if apply:
+                    self.assertTrue(any(report.run_state == "processing" for report in self.reports[:-1]))
+                with patch("sys.stdout", new_callable=io.StringIO) as output:
+                    self.module.print_summary(summary)
+                self.assertIn("Run state: complete", output.getvalue())
+                self.assertNotIn("Run state: processing", output.getvalue())
+
+    def test_builders_and_parser_continuous_defaults(self):
+        args = self.module.parse_args(self.module.build_spotify_publisher_argv(continuous=True, no_progress=True))
+        self.assertTrue(args.continuous)
+        self.assertEqual(args.request_interval_seconds, 1.0)
+        self.assertEqual(self.module.parse_args([]).request_interval_seconds, 0.0)
+        self.assertFalse(self.module.parse_args([]).continuous)
+
 
 
 if __name__ == "__main__":

@@ -341,8 +341,9 @@ folder path, or playlist master CSV path. Omit `--playlists` to process every
 playlist. The value `all` is not accepted for `--playlists`; omitting the flag is
 the all-playlists path.
 
-If the token cache is missing, expired, invalid, or missing the required Spotify
-scopes, the script opens the Spotify login page and then continues the run. The
+At startup, the script reuses a valid cached token or refreshes an expired one.
+If the cache is missing, invalid, cannot be refreshed, or lacks the required
+Spotify scopes, it opens the Spotify login page and then continues the run. The
 publisher requests playlist read/write access and `user-read-private`; it uses
 the profile scope only to identify the current Spotify user before choosing a
 playlist target. To force a fresh login, pass `--reauthorize`:
@@ -406,9 +407,130 @@ python3 scripts/publishers/spotify/publish_playlist.py \
   --max-new-searches-per-run 50
 ```
 
-Use `--max-new-searches-per-run 0` for an uncapped run. If Spotify throttles
+Use `--max-new-searches-per-run 0` for an uncapped pass. In bounded mode, if Spotify throttles
 before the default 500 new searches, rerun the publisher after the cooldown and
 use a lower value such as `50` or `25`.
+
+The standalone publisher also accepts `--request-interval-seconds N` to space
+Web API request starts. `N` must be finite and non-negative; the default is
+`0` in bounded mode, which adds no pacing delay. For example, this preview spaces requests by
+at least one second:
+
+```bash
+rtk proxy python3 scripts/publishers/spotify/publish_playlist.py \
+  --publishing-dry-run --request-interval-seconds 1
+```
+
+Spacing applies to searches, pagination, playlist reads, writes and retries.
+Cached match decisions need no search request, while playlist safety reads
+still run. Retry waits also satisfy the spacing interval; they do not add a
+second full interval after an already-long wait. Pacing does not change the
+search budget or guarantee that Spotify will avoid throttling. Normal sessions
+renew tokens after waiting, immediately before the next Web API attempt, using
+the existing 60-second expiry leeway. Rotated tokens are saved atomically before
+use. An explicit 401 triggers one forced refresh and one retry; a second 401,
+403, lost scopes, missing/revoked refresh token or token-save failure stops the
+run. OAuth failures do not enter the Web API rate-limit retry loop.
+
+Authentication stops save completed matches and confirmed publish state on a
+best-effort basis, with a `needs action` report. Pending writes are not flushed;
+partial-write details are preserved. A checkpoint failure is reported without
+hiding the authentication error. The publisher never opens a browser mid-run.
+Restart with `--reauthorize` after resolving the problem. It does not replay
+uncertain writes after timeouts or server errors. Raw access-token overrides
+bypass renewal, and clients without a token provider keep their existing path.
+Omit `--continuous` for ordinary bounded operation; omit the interval option too
+to restore its default pacing. Collection,
+release-playlist and dedupe commands retain their current defaults and flags.
+
+The publisher saves completed matches after each album resolution,
+every 25 completed row decisions, and at append checkpoints. This includes
+negative decisions when few or no tracks match. A save failure stops further
+publishing. Startup failures, later errors and Ctrl-C attempt to save each
+available cache and a current report; a secondary save failure does not hide
+the original stop. Ctrl-C returns exit code 130.
+
+Stopping never sends pending writes. Reports retain confirmed additions and
+identify a stopped create or append request whose remote outcome may be
+uncertain. Resolve the cause before restarting, honor any reported cooldown,
+and let the next run reread the actual playlist. These checkpoints use the
+existing atomic cache writers, but do not make multiple files or Spotify
+writes transactional. A killed process still needs a manual restart; arbitrary
+crashes or concurrent remote edits have no exactly-once recovery guarantee.
+
+Reports and the terminal summary show `Web API attempts` separately from
+`Spotify searches`. Attempts include reads, writes, pages and retried or failed
+transport calls in the current invocation; OAuth calls are excluded. Existing
+checkpoints record the total reached when that report was written. A failure
+before another report can be written leaves the last snapshot, not a guaranteed
+final total. In-process callers without request instrumentation show
+`unavailable` rather than zero. This changes no match, token or publish-state
+cache format.
+
+`Token refresh attempts` counts refresh requests during the publishing session.
+Continuous runs also include startup refresh attempts; ordinary bounded runs
+retain their session-only count. Reports snapshot this count, and the terminal
+shows it on completion or an authentication stop. Raw-token and custom clients
+without a renewable session show `unavailable`. OAuth attempts are separate
+from `Web API attempts`.
+
+For a large append run, `--continuous` advances through checkpointed search
+passes and waits through resumable Spotify cooldowns:
+
+```bash
+rtk proxy python3 scripts/publishers/spotify/publish_playlist.py --continuous
+```
+
+This command writes to Spotify. Add `--publishing-dry-run` to preview: Spotify
+reads and local cache/report writes still occur, but playlist creation and
+updates do not. Continuous mode defaults to one second between Web API request
+starts; an explicit interval must be finite and positive. Each 429 doubles that
+interval up to `max(initial interval, 30)` seconds, without speeding up again
+during the invocation. No interval guarantees freedom from throttling.
+
+`--max-new-searches-per-run` becomes the budget for each pass, still defaulting
+to 500; `0` removes the cap. Started search ladders may exceed the budget. Saved
+matches and completed album lookup attempts advance later passes, and the run
+returns success only after a full pass. Completion may leave ambiguous or
+unmatched music: the report says `processing complete; matches need review`.
+
+A 429 checkpoints completed work before waiting. Any finite positive server
+cooldown is honored in full, including hours; checkpoint time counts toward
+that deadline. Ordinary 429s without a usable delay use 60, 120, 240, 480, then
+900 seconds, resetting only after retained matching progress. An explicit
+`QUOTA_EXCEEDED` response without a usable reset delay stops for user action;
+the publisher does not guess a reset schedule. Cause, remaining duration and
+available UTC resume time stay visible with `--no-progress`, at pause start and
+at most once per minute. Ctrl-C during a wait returns 130 and retains the
+available reason/deadline in the report. A persistence failure stops automatic
+continuation.
+
+Every resumed pass reloads the originally selected CSVs and current Spotify
+playlist contents, checks the original account and playlist ownership/privacy,
+and plans insertions again. New files discovered during the run are ignored;
+a missing or invalid selected file or changed account stops the run. Confirmed
+writes are retained and pending requests are never replayed as a saved queue.
+API/transport errors and unreadable success responses stop for inspection;
+a create or append result can be uncertain. Reauthorization is a separate
+startup action, never an automatic browser prompt after a cooldown.
+
+Reports separate `processing`, `waiting`, `complete`, `needs_action`,
+`interrupted` and `failed` run states from the pass's `complete` or
+`search_budget` stop reason. Invocation totals cover actual Web API attempts,
+429s, explicit quota responses, token refresh attempts, completed passes and
+cooldown wait seconds. Track/search/cache figures describe the current pass;
+final source coverage comes from the final full pass, without adding repeated
+rows into an inflated total.
+
+Continuous mode supports standalone append and its dry-run equivalent. It
+rejects replace mode, `--refresh-match-cache` and raw `--access-token` overrides
+before authentication. Do a bounded cache refresh separately when needed.
+Configured release publishing, wrappers and dedupe remain bounded. Keep one
+publisher process per account/cache context. This is a foreground process,
+without cross-process coordination or automatic restart after terminal closure,
+reboot or process kill. Restart manually, honor any reported cooldown, and
+preserve the match cache. A fixed-delay shell loop is not the supported
+scheduler. Omitting `--continuous` does not undo Spotify writes already made.
 
 Replace mode plans the final playlist from the matched local CSV rows in source
 order:
@@ -645,10 +767,12 @@ An applied manual match remains authoritative across matcher updates. The
 importer refuses to replace a different matched or manual Spotify URI unless
 you also pass `--replace-existing`.
 
-If Spotify rate-limits a request, the client waits and retries. It honors
-`Retry-After` exactly when Spotify sends it, and uses a 60-second wait when the
-header is missing or invalid. If Spotify keeps returning `429` after three
-retries, or sends a `Retry-After` longer than the allowed wait, the publisher
+In bounded mode, if Spotify rate-limits a request, the client waits and retries. It honors
+finite positive `Retry-After` seconds, and uses a 60-second wait when the
+header is missing or unusable, including zero, negative or non-finite values.
+The default maximum accepted retry wait is 480 seconds. If Spotify keeps
+returning `429` after three retries, or sends a `Retry-After` longer than the
+allowed wait, the publisher
 treats that as a rate-limit stop instead of a row-level search error. It saves
 the match cache, writes an aborted partial report for rows already planned,
 prints that report path, and exits with a nonzero status. In append mode,
