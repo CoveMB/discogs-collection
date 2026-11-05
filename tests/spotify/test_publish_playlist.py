@@ -6947,6 +6947,72 @@ class SpotifyContinuousPublishingTests(unittest.TestCase):
             finally:
                 self.console = output.getvalue()
 
+    def run_with_progress(self):
+        stream = TerminalStream()
+        snapshots = []
+
+        def observe(request, parsed, query):
+            snapshots.append((request.method, stream.getvalue().rsplit("\r", 1)[-1].strip()))
+
+        self.args.progress = True
+        self.before_transport = observe
+        with patch("sys.stderr", stream):
+            summary = self.run_publish()
+        return summary, snapshots, stream.getvalue()
+
+    def test_progress_distinguishes_reads_and_writes_across_capped_passes(self):
+        summary, snapshots, output = self.run_with_progress()
+
+        for method, line in snapshots:
+            expected = "Reconciling Spotify playlists" if method == "GET" else "Updating Spotify playlists"
+            self.assertTrue(line.startswith(expected), (method, line))
+            self.assertIn(" rows ", line)
+        self.assertEqual(output.count("0/5 rows 0%"), 3)
+        write_lines = [line for method, line in snapshots if method != "GET"]
+        self.assertIn("2/5 rows 40%", write_lines[0])
+        self.assertIn("5/5 rows 100%", write_lines[-1])
+        self.assertEqual(summary.completed_pass_count, 3)
+        self.assertEqual(self.remote, [f"spotify:track:{name}" for name in self.names])
+
+    def test_progress_returns_to_reconciling_after_mid_playlist_checkpoint(self):
+        self.names = [f"song{index:03}" for index in range(101)]
+        self.write_source(self.names)
+        self.args.max_new_searches_per_run = 0
+
+        summary, snapshots, _ = self.run_with_progress()
+
+        first_write = next(index for index, (method, _) in enumerate(snapshots) if method != "GET")
+        later_reads = [line for method, line in snapshots[first_write + 1:] if method == "GET"]
+        self.assertTrue(later_reads)
+        self.assertTrue(all(line.startswith("Reconciling Spotify playlists") for line in later_reads))
+        self.assertEqual(summary.added_count, 101)
+        self.assertEqual(self.remote, [f"spotify:track:{name}" for name in self.names])
+
+    def test_progress_never_reports_updating_when_all_tracks_already_exist(self):
+        self.created = True
+        self.remote = [f"spotify:track:{name}" for name in self.names]
+        self.args.max_new_searches_per_run = 0
+
+        summary, _, output = self.run_with_progress()
+
+        self.assertIn("Reconciling Spotify playlists", output)
+        self.assertNotIn("Updating Spotify playlists", output)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(summary.added_count, 0)
+
+    def test_progress_labels_replace_writes_after_reconciliation(self):
+        self.args.continuous = False
+        self.args.publisher_sync_mode = "replace"
+        self.args.max_new_searches_per_run = 0
+
+        _, snapshots, _ = self.run_with_progress()
+
+        for method, line in snapshots:
+            expected = "Reconciling Spotify playlists" if method == "GET" else "Updating Spotify playlists"
+            self.assertTrue(line.startswith(expected), (method, line))
+        self.assertTrue(any(method == "PUT" for method, _ in snapshots))
+        self.assertEqual(self.remote, [f"spotify:track:{name}" for name in self.names])
+
     def test_j1_three_capped_passes_full_final_coverage_and_exact_order_once(self):
         def observe_boundary(request, parsed, query):
             if parsed.path == "/v1/me" and len(self.requests) > 1:
@@ -6972,7 +7038,10 @@ class SpotifyContinuousPublishingTests(unittest.TestCase):
         self.args.apply = False
         self.args.dry_run = True
         self.args.max_new_searches_per_run = 0
-        summary = self.run_publish()
+        summary, snapshots, output = self.run_with_progress()
+        self.assertTrue(all(line.startswith("Planning Spotify playlists") for _, line in snapshots))
+        self.assertIn("5/5 rows 100%", output)
+        self.assertNotIn("Updating Spotify playlists", output)
         self.assertEqual(self.writes, [])
         self.assertEqual(summary.track_count, 5)
         self.assertEqual(summary.completed_pass_count, 1)

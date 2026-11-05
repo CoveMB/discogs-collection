@@ -352,9 +352,14 @@ playlist target. To force a fresh login, pass `--reauthorize`:
 python3 scripts/publishers/spotify/publish_playlist.py --reauthorize
 ```
 
-When run in an interactive terminal, the script shows Spotify planning progress
-on `stderr` with the same-line progress bar used by the enrichment and playlist
-export scripts. You can turn it off with `--no-progress`.
+When run in an interactive terminal, the script shows a same-line progress bar
+on `stderr`. `Reconciling Spotify playlists` means it is checking source rows
+against saved matches and current playlist contents. The label changes to
+`Updating Spotify playlists` while it writes changes, then returns to
+reconciliation. The count and percentage always describe source rows checked
+in the current pass, not tracks uploaded. Each pass starts at zero; append mode
+skips tracks already present. Dry runs show `Planning Spotify playlists`. You
+can turn the progress bar off with `--no-progress`.
 
 Spotify target playlist names come from `config/publisher.json`. The publisher
 uses `playlist_prefix` and `playlist_suffix` around each local playlist folder

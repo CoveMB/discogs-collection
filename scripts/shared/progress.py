@@ -13,10 +13,12 @@ class ProgressReporter:
         width: int = 24,
         label: str = "Processing rows",
         enabled: bool | None = None,
+        unit: str = "",
     ) -> None:
         self.stream = stream or sys.stderr
         self.width = max(1, width)
         self.label = label
+        self.unit = unit
         self.enabled = self.stream_is_terminal() if enabled is None else enabled
         self.current = 0
         self.total = 0
@@ -58,7 +60,8 @@ class ProgressReporter:
         filled_width = int(ratio * self.width)
         bar = "#" * filled_width + "-" * (self.width - filled_width)
         percentage = int(ratio * 100)
-        line = f"\r{self.label} [{bar}] {self.current}/{self.total} {percentage}%"
+        unit = f" {self.unit}" if self.unit else ""
+        line = f"\r{self.label} [{bar}] {self.current}/{self.total}{unit} {percentage}%"
         padding = " " * max(0, self.last_line_length - len(line))
         self.stream.write(line + padding)
         self.stream.flush()

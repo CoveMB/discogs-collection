@@ -333,6 +333,8 @@ def publish_spotify_playlists(
             )
             total_tracks = sum(len(tracks) for tracks in tracks_by_master_path.values())
             if progress:
+                if apply:
+                    progress.label = "Reconciling Spotify playlists"
                 progress.start(total_tracks)
             if invocation is not None:
                 current_user_id = spotify_client.get_current_user_id(access_token=access_token)
@@ -463,6 +465,7 @@ def publish_spotify_playlists(
                     ):
                         if publisher_sync_mode == APPEND_SYNC_MODE:
                             final_items, playlist_contexts, spotify_playlists = finalize_append_playlist(
+                                progress=progress,
                                 request_control=request_control,
                                 spotify_session=spotify_session,
                                 invocation=invocation,
@@ -603,6 +606,7 @@ def publish_spotify_playlists(
                             save_spotify_track_match_cache(match_cache_path, match_cache)
                         if publisher_sync_mode == APPEND_SYNC_MODE and apply and len(append_candidates) >= 100:
                             final_items, playlist_contexts, spotify_playlists = finalize_append_playlist(
+                                progress=progress,
                                 request_control=request_control,
                                 spotify_session=spotify_session,
                                 invocation=invocation,
@@ -644,6 +648,7 @@ def publish_spotify_playlists(
                         ):
                             if publisher_sync_mode == APPEND_SYNC_MODE:
                                 final_items, playlist_contexts, spotify_playlists = finalize_append_playlist(
+                                    progress=progress,
                                     request_control=request_control,
                                     spotify_session=spotify_session,
                                     invocation=invocation,
@@ -707,6 +712,7 @@ def publish_spotify_playlists(
 
                 if publisher_sync_mode == APPEND_SYNC_MODE:
                     final_items, playlist_contexts, spotify_playlists = finalize_append_playlist(
+                        progress=progress,
                         request_control=request_control,
                         spotify_session=spotify_session,
                         invocation=invocation,
@@ -764,6 +770,7 @@ def publish_spotify_playlists(
                 raise replace_validation_error
             if apply and publisher_sync_mode == REPLACE_SYNC_MODE:
                 applied_decisions, applied_final_items, applied_playlist_contexts, spotify_playlists = apply_planned_playlist_writes(
+                    progress=progress,
                     request_control=request_control,
                     spotify_session=spotify_session,
                     invocation=invocation,
@@ -1053,6 +1060,7 @@ def finalize_append_playlist(
     request_control: SpotifyRequestControl | None = None,
     spotify_session: SpotifySession | None = None,
     invocation: SpotifyPublishInvocation | None = None,
+    progress: ProgressReporter | None = None,
 ) -> tuple[list[FinalPlaylistItem], list[PlaylistPublishContext], tuple[SpotifyPlaylist, ...]]:
     context = playlist_contexts[context_index]
     observe_existing_publish_state_tracks(
@@ -1076,6 +1084,9 @@ def finalize_append_playlist(
     if not plan.write_operations:
         save_spotify_publish_state(publish_state_cache_path, publish_state)
         return final_items, playlist_contexts, tuple(spotify_playlists)
+    if progress:
+        progress.label = "Updating Spotify playlists"
+        progress.update(len(decisions))
     applied_context = context
     operation = "playlist creation" if not context.playlist_id else "playlist append"
     try:
@@ -1124,6 +1135,9 @@ def finalize_append_playlist(
         searched_row_count=searched_row_count,
         run_status=run_status or append_checkpoint_run_status(search_count),
     )
+    if progress:
+        progress.label = "Reconciling Spotify playlists"
+        progress.update(len(decisions))
     return final_items, playlist_contexts, tuple(updated_playlists)
 
 
@@ -1910,6 +1924,7 @@ def apply_planned_playlist_writes(
     request_control: SpotifyRequestControl | None = None,
     spotify_session: SpotifySession | None = None,
     invocation: SpotifyPublishInvocation | None = None,
+    progress: ProgressReporter | None = None,
 ) -> tuple[
     tuple[PlaylistPublishDecision, ...],
     tuple[FinalPlaylistItem, ...],
@@ -1921,12 +1936,16 @@ def apply_planned_playlist_writes(
     current_contexts = playlist_contexts
     current_playlists = tuple(spotify_playlists)
     for index, context in enumerate(current_contexts):
+        planned_write_uris = planned_write_uris_by_playlist.get(context.target_playlist_name, ())
+        if progress and (context.playlist_id or planned_write_uris):
+            progress.label = "Updating Spotify playlists"
+            progress.update(len(current_decisions))
         try:
             applied_context = apply_playlist_writes(
                 spotify_client=spotify_client,
                 access_token=access_token,
                 context=context,
-                planned_write_uris=planned_write_uris_by_playlist.get(context.target_playlist_name, ()),
+                planned_write_uris=planned_write_uris,
             )
         except (Exception, KeyboardInterrupt) as error:
             current_contexts[index] = replace(
@@ -1953,6 +1972,9 @@ def apply_planned_playlist_writes(
             search_count=search_count,
             searched_row_count=searched_row_count,
         )
+    if progress:
+        progress.label = "Reconciling Spotify playlists"
+        progress.update(len(current_decisions))
     return tuple(current_decisions), tuple(current_final_items), tuple(current_contexts), current_playlists
 
 
@@ -2227,8 +2249,8 @@ def run_spotify_publish_from_args(
                     if continuous else args.access_token or get_access_token_for_run(settings, force_reauthorize=args.reauthorize))
     if debug_log:
         debug_log("spotify_access_token_ready")
-    progress_label = "Updating Spotify playlists" if args.apply else "Planning Spotify playlists"
-    progress = ProgressReporter(label=progress_label) if getattr(args, "progress", False) else None
+    progress_label = "Reconciling Spotify playlists" if args.apply else "Planning Spotify playlists"
+    progress = ProgressReporter(label=progress_label, unit="rows") if getattr(args, "progress", False) else None
     client = spotify_client if spotify_client is not None else SpotifyClient(debug_log=debug_log)
     spotify_session: SpotifySession | None = None
     if isinstance(client, SpotifyClient) and args.access_token:
