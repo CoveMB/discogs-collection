@@ -498,6 +498,76 @@ class SpotifyClientTests(unittest.TestCase):
             ),
         )
 
+    def test_lists_unnamed_playlists_and_continues_pagination(self):
+        from publishers.spotify.request_control import SpotifyRequestControl
+
+        for continuous in (False, True):
+            for name in ("", " \t "):
+                with self.subTest(continuous=continuous, name=name):
+                    captured_requests = []
+                    responses = [
+                        HttpResponse(200, {}, json.dumps({
+                            "items": [{
+                                "id": "unnamed-playlist",
+                                "name": name,
+                                "owner": {"id": "current-user"},
+                                "public": False,
+                                "collaborative": False,
+                                "external_urls": {"spotify": "https://open.spotify.com/playlist/unnamed-playlist"},
+                            }],
+                            "next": "https://api.spotify.com/v1/me/playlists?limit=50&offset=50",
+                        })),
+                        HttpResponse(200, {}, json.dumps({
+                            "items": [{"id": "target-playlist", "name": "Discogs - Synthetic"}],
+                            "next": None,
+                        })),
+                    ]
+
+                    def transport(request):
+                        captured_requests.append(request)
+                        return responses.pop(0)
+
+                    control = SpotifyRequestControl(continuous=continuous)
+                    client = SpotifyClient(transport=transport, request_control=control)
+
+                    playlists = client.list_current_user_playlists("synthetic-token")
+
+                    self.assertEqual(playlists, (
+                        SpotifyPlaylist(
+                            playlist_id="unnamed-playlist",
+                            name="",
+                            url="https://open.spotify.com/playlist/unnamed-playlist",
+                            owner_id="current-user",
+                            public=False,
+                        ),
+                        SpotifyPlaylist(playlist_id="target-playlist", name="Discogs - Synthetic", url=""),
+                    ))
+                    self.assertEqual([request.method for request in captured_requests], ["GET", "GET"])
+                    self.assertIn("offset=50", captured_requests[1].url)
+                    self.assertEqual(control.request_count, 2)
+
+    def test_continuous_playlist_list_rejects_malformed_entries(self):
+        from publishers.spotify.request_control import SpotifyRequestControl
+
+        for item in (None, {}, {"name": "BODY_SENTINEL"}, {"id": "playlist"},
+                     {"id": "", "name": ""}, {"id": "playlist", "name": None},
+                     {"id": "playlist", "name": 42}, {"id": "playlist", "name": True},
+                     {"id": "playlist", "name": []}, {"id": "playlist", "name": {}}):
+            with self.subTest(item=item):
+                response = HttpResponse(200, {}, json.dumps({
+                    "items": [{"id": "valid-playlist", "name": "BODY_SENTINEL"}, item],
+                    "next": None,
+                }))
+                control = SpotifyRequestControl(continuous=True)
+                client = SpotifyClient(transport=lambda request: response, request_control=control)
+
+                with self.assertRaises(SpotifyApiError) as caught:
+                    client.list_current_user_playlists("TOKEN_SENTINEL")
+
+                self.assertEqual(control.request_count, 1)
+                self.assertNotIn("BODY_SENTINEL", str(caught.exception))
+                self.assertNotIn("TOKEN_SENTINEL", str(caught.exception))
+
     def test_get_playlist_items_reads_tracks_across_pages(self):
         captured_requests = []
         responses = [

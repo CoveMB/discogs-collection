@@ -655,16 +655,17 @@ def parse_playlist_object(payload: object) -> SpotifyPlaylist | None:
     if not isinstance(payload, dict):
         return None
     playlist_id = clean_cell(payload.get("id"))
-    name = clean_cell(payload.get("name"))
+    name = payload.get("name")
     owner = payload.get("owner", {})
     external_urls = payload.get("external_urls", {})
     public_value = payload.get("public")
     url = clean_cell(external_urls.get("spotify")) if isinstance(external_urls, dict) else ""
-    if not playlist_id or not name:
+    # Spotify can return unnamed playlists; an empty string is still a valid name.
+    if not playlist_id or not isinstance(name, str):
         return None
     return SpotifyPlaylist(
         playlist_id=playlist_id,
-        name=name,
+        name=clean_cell(name),
         url=url,
         owner_id=clean_cell(owner.get("id")) if isinstance(owner, dict) else "",
         public=public_value if isinstance(public_value, bool) else None,
