@@ -1072,6 +1072,45 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
                 )
                 self.assertEqual(replacement.replace_calls, [("house", (chosen.uri,))])
 
+    def test_publish_edition_tie_checks_strict_metadata_for_existing_cohort_uri(self):
+        row = playlist_row("111", "Tidal Signals 海", "After Light 夜", "Harbour Lines 航")
+        chosen, alternate = recording_edition_candidates(row)
+        query = 'track:"After Light 夜" artist:"Harbour Lines 航" album:"Tidal Signals 海"'
+        playlist = SpotifyPlaylist(playlist_id="house", name="House", url="", owner_id="current-user")
+        existing = SpotifyPlaylistItem(
+            uri=alternate.uri, name=alternate.name, artists=alternate.artists, album_name=alternate.album_name,
+        )
+        cases = (
+            ("different title", replace(existing, name="After Light 日"), "ambiguous", ""),
+            ("different credit", replace(existing, artists=("Harbour Lines 船",)), "ambiguous", ""),
+            ("different album", replace(existing, album_name="Tidal Signals 山"), "ambiguous", ""),
+            ("equivalent spelling", replace(existing, name="after  light 夜"), "already_present", alternate.uri),
+        )
+        for label, item, status, selected_uri in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary_directory:
+                directory = Path(temporary_directory)
+                write_playlist_master(directory / "House" / "House.csv", [row])
+                cache_path = directory / "matches.json"
+                report_path = directory / "report.txt"
+                for source in ("search", "cache"):
+                    with self.subTest(source=source):
+                        client = PublishingSpotifyClient(
+                            {query: (chosen, alternate)}, playlists=(playlist,),
+                            playlist_items_by_id={"house": (item,)},
+                        )
+                        summary = publish_spotify_playlists(
+                            directory, report_path, client, "access-token", match_cache_path=cache_path,
+                        )
+
+                        decision = summary.decisions[0]
+                        self.assertEqual((decision.match_source, decision.status, decision.spotify_uri),
+                                         (source, status, selected_uri))
+                        if status == "ambiguous":
+                            self.assertIn("conflicting metadata", decision.reason)
+                            self.assertIn("ambiguous | no Spotify URI", report_path.read_text(encoding="utf-8"))
+                        self.assertEqual(client.add_calls, [])
+                        self.assertEqual([final.spotify_uri for final in summary.final_items], [item.uri])
+
     def test_publish_edition_tie_reviews_cross_identity_source_uri_before_writing(self):
         live = playlist_row("live", "Tidal Signals", "After Light (Live)", "Harbour Lines")
         filler = [playlist_row(str(index), "Fixture Album", f"Track {index}", "Fixture Artist") for index in range(99)]

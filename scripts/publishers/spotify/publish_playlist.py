@@ -72,6 +72,7 @@ from publishers.spotify.matching import (  # noqa: E402
     normalized_identity_artists,
     resolve_spotify_edition_tie,
     spotify_candidate_identity_key,
+    spotify_recording_metadata_from_values,
     spotify_track_identity_key,
     track_match_error,
 )
@@ -489,9 +490,7 @@ def publish_spotify_playlists(
                     identity_key = spotify_playlist_item_identity_key(target_playlist_name, item)
                     existing_items_by_identity.setdefault(identity_key, []).append(item)
                 existing_incomplete_spotify_uris = incomplete_spotify_playlist_item_uris(existing_items)
-                existing_complete_identities_by_uri = complete_playlist_item_identities_by_uri(
-                    target_playlist_name, existing_items,
-                )
+                existing_complete_items_by_uri = complete_playlist_items_by_uri(existing_items)
                 for source_position, track in enumerate(playlist_tracks, start=1):
                     track_cache_key = spotify_track_match_key(track)
                     cached_match = None
@@ -685,7 +684,7 @@ def publish_spotify_playlists(
                             publisher_sync_mode=publisher_sync_mode,
                             existing_items_by_identity=existing_items_by_identity,
                             existing_incomplete_spotify_uris=existing_incomplete_spotify_uris,
-                            existing_complete_identities_by_uri=existing_complete_identities_by_uri,
+                            existing_complete_items_by_uri=existing_complete_items_by_uri,
                             source_matches=source_matches,
                             recording_conflict=recording_conflict,
                         )
@@ -769,9 +768,7 @@ def publish_spotify_playlists(
                             existing_items = spotify_playlist_items_from_final_items(
                                 playlist_final_items(final_items, target_playlist_name)
                             )
-                            existing_complete_identities_by_uri = complete_playlist_item_identities_by_uri(
-                                target_playlist_name, existing_items,
-                            )
+                            existing_complete_items_by_uri = complete_playlist_items_by_uri(existing_items)
                             append_candidates = []
                         if debug_log:
                             debug_log(f"publish_track_done index={processed_track_count} status={publish_decision.status} source={match_source}")
@@ -1517,7 +1514,7 @@ def build_publish_decision(
     publisher_sync_mode: str,
     existing_items_by_identity: Mapping[str, Sequence[SpotifyPlaylistItem]],
     existing_incomplete_spotify_uris: set[str],
-    existing_complete_identities_by_uri: Mapping[str, set[str]],
+    existing_complete_items_by_uri: Mapping[str, Sequence[SpotifyPlaylistItem]],
     source_matches: PlaylistSourceMatches,
     recording_conflict: str,
 ) -> PlaylistPublishDecision:
@@ -1552,10 +1549,11 @@ def build_publish_decision(
         earlier_match = source_matches.by_identity.get(identity_key)
         status, spotify_uri, reason = append_track_disposition(
             decision,
+            target_playlist_name,
             identity_key,
             existing_items_by_identity.get(identity_key, ()),
             existing_incomplete_spotify_uris,
-            existing_complete_identities_by_uri,
+            existing_complete_items_by_uri,
             earlier_match.match if earlier_match else None,
         )
     if status == AMBIGUOUS:
@@ -1593,18 +1591,22 @@ def edition_cohort_uris(decision: TrackMatchDecision) -> set[str]:
 
 def append_track_disposition(
     decision: TrackMatchDecision,
+    target_playlist_name: str,
     identity_key: str,
     existing_identity_items: Sequence[SpotifyPlaylistItem],
     existing_incomplete_spotify_uris: set[str],
-    existing_complete_identities_by_uri: Mapping[str, set[str]],
+    existing_complete_items_by_uri: Mapping[str, Sequence[SpotifyPlaylistItem]],
     earlier_source_match: TrackMatchDecision | None,
 ) -> tuple[str, str, str]:
     cohort_uris = edition_cohort_uris(decision)
     if cohort_uris:
         if any(
-            observed_identity != identity_key
-            for uri in cohort_uris
-            for observed_identity in existing_complete_identities_by_uri.get(uri, ())
+            spotify_playlist_item_identity_key(target_playlist_name, item) != identity_key
+            or candidate.recording_metadata().conflicts_with(spotify_recording_metadata_from_values(
+                title=item.name, artist_names=item.artists, album_name=item.album_name, album_id="",
+            ))
+            for candidate in decision.review_candidates
+            for item in existing_complete_items_by_uri.get(candidate.uri, ())
         ):
             return (
                 AMBIGUOUS,
@@ -1986,17 +1988,14 @@ def incomplete_spotify_playlist_item_uris(existing_items: Sequence[SpotifyPlayli
     }
 
 
-def complete_playlist_item_identities_by_uri(
-    target_playlist_name: str,
+def complete_playlist_items_by_uri(
     existing_items: Sequence[SpotifyPlaylistItem],
-) -> dict[str, set[str]]:
-    identities_by_uri: dict[str, set[str]] = {}
+) -> dict[str, list[SpotifyPlaylistItem]]:
+    items_by_uri: dict[str, list[SpotifyPlaylistItem]] = {}
     for item in existing_items:
         if item.uri and spotify_playlist_item_has_identity_metadata(item):
-            identities_by_uri.setdefault(item.uri, set()).add(
-                spotify_playlist_item_identity_key(target_playlist_name, item)
-            )
-    return identities_by_uri
+            items_by_uri.setdefault(item.uri, []).append(item)
+    return items_by_uri
 
 
 def spotify_playlist_item_has_identity_metadata(item: SpotifyPlaylistItem) -> bool:
