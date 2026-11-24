@@ -4,8 +4,10 @@ import json
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -13,8 +15,11 @@ SCRIPTS_DIRECTORY = PROJECT_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 
 from publishers.spotify.client import (
+    HttpRequest,
+    HttpResponse,
     SpotifyAlbumLookupError,
     SpotifyApiError,
+    SpotifyClient,
     SpotifyPlaylist,
     SpotifyPlaylistItem,
     SpotifyRateLimitDeferredError,
@@ -33,6 +38,10 @@ from publishers.spotify.match_cache import (
     ALBUM_RECOVERY_ATTEMPT_ALBUM_IDS_FIELD,
     ALBUM_RECOVERY_ATTEMPT_MATCHER_VERSION_FIELD,
     MATCHER_VERSION,
+    load_spotify_track_match_cache,
+    save_spotify_track_match_cache,
+    spotify_candidate_cache_record,
+    spotify_candidate_from_cache_record,
     spotify_track_match_key,
 )
 from publishers.spotify.release_matching import SpotifyAlbumCandidate, SpotifyAlbumTrack
@@ -344,6 +353,43 @@ def matching_candidate(row: dict[str, str]) -> SpotifyTrackCandidate:
     )
 
 
+def recording_edition_candidates(row: dict[str, str]) -> tuple[SpotifyTrackCandidate, SpotifyTrackCandidate]:
+    first = replace(
+        matching_candidate(row), uri="spotify:track:edition-a", album_id="edition-a", isrc="USAAA2600001",
+    )
+    return first, replace(first, uri="spotify:track:edition-b", album_id="edition-b")
+
+
+def recording_edition_album_tracks(rows: list[dict[str, str]], album_id: str) -> tuple[SpotifyAlbumTrack, ...]:
+    return tuple(
+        SpotifyAlbumTrack(
+            uri=f"spotify:track:{album_id}" if index == 1 else f"spotify:track:{album_id}-{index}",
+            name=row["Track Name"], artists=(row["Artist Name"],),
+            disc_number=1, track_number=index, is_playable=True,
+        )
+        for index, row in enumerate(rows, start=1)
+    )
+
+
+def overlapping_edition_candidates(
+    north: dict[str, str],
+    south: dict[str, str],
+) -> tuple[tuple[SpotifyTrackCandidate, SpotifyTrackCandidate], tuple[SpotifyTrackCandidate, SpotifyTrackCandidate]]:
+    shared_uri = "spotify:track:zzz-shared"
+    north_base = replace(matching_candidate(north), isrc="CAAAC2600001")
+    south_base = replace(matching_candidate(south), isrc="CAAAC2600002")
+    return (
+        (
+            replace(north_base, uri="spotify:track:aaa-north", album_id="north-album"),
+            replace(north_base, uri=shared_uri, album_id="shared-album"),
+        ),
+        (
+            replace(south_base, uri="spotify:track:bbb-south", album_id="south-album"),
+            replace(south_base, uri=shared_uri, album_id="shared-album"),
+        ),
+    )
+
+
 def playlist_track(
     playlist_name: str,
     release_id: str,
@@ -401,6 +447,22 @@ def cached_negative_match_record(
             else attempt_matcher_version
         )
     return record
+
+
+def saved_edition_match_record(
+    row: dict[str, str],
+    cohort: tuple[SpotifyTrackCandidate, ...],
+) -> dict[str, object]:
+    candidates = [spotify_candidate_cache_record(candidate) for candidate in cohort]
+    return {
+        **cached_negative_match_record(row, ()),
+        **candidates[0],
+        "match_status": "matched",
+        "match_reason": "saved synthetic edition match",
+        "match_strategy": "same_recording_edition",
+        "version_sensitive": True,
+        "review_candidates": candidates,
+    }
 
 
 def write_cached_negative_release(
@@ -574,6 +636,1241 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         )
         config_patcher.start()
         self.addCleanup(config_patcher.stop)
+
+    def test_publish_same_recording_edition_tie_uses_existing_searches_and_cache(self):
+        row = playlist_row("111", "Tidal Signals", "After Light", "Harbour Lines")
+        first, second = recording_edition_candidates(row)
+        search_items = [
+            {
+                "uri": candidate.uri,
+                "name": candidate.name,
+                "artists": [{"name": artist} for artist in candidate.artists],
+                "album": {"id": candidate.album_id, "name": candidate.album_name},
+                "external_ids": {"isrc": candidate.isrc.lower()},
+                "is_playable": playable,
+            }
+            for candidate, playable in ((second, False), (first, True))
+        ]
+        requests: list[HttpRequest] = []
+        responses = {
+            "/v1/me/playlists": {"items": []},
+            "/v1/me": {"id": "current-user"},
+            "/v1/search": {"tracks": {"items": search_items}},
+        }
+
+        def transport(request: HttpRequest) -> HttpResponse:
+            requests.append(request)
+            return HttpResponse(200, {}, json.dumps(responses[urlsplit(request.url).path]))
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            write_playlist_master(directory / "House" / "House.csv", [row])
+            report_path = directory / "report.txt"
+            cache_path = directory / "matches.json"
+            client = SpotifyClient(transport=transport)
+            fresh = publish_spotify_playlists(
+                directory, report_path, client, "access-token", match_cache_path=cache_path,
+                apply=False, request_control=client.request_control,
+            )
+
+            self.assertEqual(fresh.search_count, 1)
+            self.assertEqual(fresh.request_count, 3)
+            self.assertEqual([request.method for request in requests], ["GET"] * 3)
+            self.assertEqual(
+                requests[-1].url,
+                "https://api.spotify.com/v1/search?q=track%3A%22After+Light%22+"
+                "artist%3A%22Harbour+Lines%22+album%3A%22Tidal+Signals%22&type=track&limit=10",
+            )
+            self.assertEqual(fresh.decisions[0].status, "would_add")
+            self.assertEqual(fresh.decisions[0].spotify_uri, first.uri)
+            self.assertEqual(fresh.decisions[0].match_source, "search")
+            self.assertIn("same recording across Spotify editions", report_path.read_text(encoding="utf-8"))
+            cache = load_spotify_track_match_cache(cache_path)
+            record = cache["111|1|harbour lines|tidal signals|after light"]
+            self.assertEqual(record["match_strategy"], "same_recording_edition")
+            self.assertIs(record["version_sensitive"], True)
+            self.assertEqual(record["spotify_isrc"], "USAAA2600001")
+            self.assertIs(record["spotify_is_playable"], True)
+            review_records = record["review_candidates"]
+            assert isinstance(review_records, list)
+            self.assertEqual(
+                [(item["spotify_uri"], item["spotify_isrc"], item["spotify_is_playable"]) for item in review_records],
+                [(second.uri, "USAAA2600001", False), (first.uri, "USAAA2600001", True)],
+            )
+
+            cached_client = SpotifyClient(transport=transport)
+            reused = publish_spotify_playlists(
+                directory, report_path, cached_client, "access-token", match_cache_path=cache_path,
+                apply=False, request_control=cached_client.request_control,
+            )
+            self.assertEqual(reused.search_count, 0)
+            self.assertEqual(reused.request_count, 2)
+            self.assertEqual(reused.decisions[0].match_source, "cache")
+            self.assertEqual(reused.decisions[0].candidate, fresh.decisions[0].candidate)
+            self.assertEqual(reused.decisions[0].review_candidates, fresh.decisions[0].review_candidates)
+
+            review_records[0]["spotify_isrc"] = "UſAAA2600001"
+            review_records[0]["spotify_is_playable"] = 1
+            invalid = spotify_candidate_from_cache_record(review_records[0])
+            assert invalid is not None
+            self.assertEqual(invalid.isrc, "")
+            self.assertIsNone(invalid.is_playable)
+            save_spotify_track_match_cache(cache_path, cache)
+            repaired = publish_spotify_playlists(
+                directory, report_path, SpotifyClient(transport=transport), "access-token",
+                match_cache_path=cache_path, apply=False,
+            )
+            self.assertEqual(repaired.search_count, 1)
+            self.assertEqual(repaired.decisions[0].spotify_uri, first.uri)
+
+            save_spotify_track_match_cache(cache_path, {
+                "111|1|harbour lines|tidal signals|after light": {
+                    "match_status": "manual", "spotify_uri": "spotify:track:manual-override",
+                },
+            })
+            manual = publish_spotify_playlists(
+                directory, report_path, SpotifyClient(transport=transport), "access-token",
+                match_cache_path=cache_path, apply=False,
+            )
+            self.assertEqual(manual.search_count, 0)
+            self.assertEqual(manual.decisions[0].match_source, "cache")
+            self.assertEqual(manual.decisions[0].spotify_uri, "spotify:track:manual-override")
+
+    def test_publish_edition_tie_checks_raw_search_observations(self):
+        row = playlist_row("111", "Tidal Signals", "After Light", "Harbour Lines")
+        first, second = recording_edition_candidates(row)
+        third = replace(first, uri="spotify:track:edition-c", album_id="edition-c")
+        queries = (
+            'track:"After Light" artist:"Harbour Lines" album:"Tidal Signals"',
+            'track:"After Light" artist:"Harbour Lines"',
+        )
+        cases = (
+            ("hidden competing recording", (first, second, replace(third, isrc="USAAA2600002")), ""),
+            ("hidden contradictory title", (first, second, third), ""),
+            ("later unavailable", (first, second, replace(first, is_playable=False)), second.uri),
+            ("later playable", (first, second, replace(second, is_playable=True)), second.uri),
+        )
+        for label, observations, expected_uri in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary_directory:
+                directory = Path(temporary_directory)
+                write_playlist_master(directory / "House" / "House.csv", [row])
+                client = PublishingSpotifyClient({
+                    queries[0]: (replace(third, name="Another Track"),),
+                    queries[1]: observations,
+                })
+                summary = publish_spotify_playlists(
+                    directory, directory / "report.txt", client, "access-token",
+                    match_cache_path=directory / "matches.json", apply=False,
+                )
+
+                self.assertEqual(summary.search_count, 2)
+                self.assertEqual([query for _, query, _ in client.searches], list(queries))
+                self.assertEqual(summary.decisions[0].status, "would_add" if expected_uri else "ambiguous")
+                self.assertEqual(summary.decisions[0].spotify_uri, expected_uri)
+                self.assertEqual(summary.decisions[0].search_queries, queries)
+
+    def test_publish_edition_tie_checks_identifiable_search_items_without_titles(self):
+        row = playlist_row("111", "Tidal Signals", "After Light", "Harbour Lines")
+        first, second = recording_edition_candidates(row)
+        first_item, second_item = (
+            {
+                "uri": candidate.uri,
+                "name": candidate.name,
+                "artists": [{"name": artist} for artist in candidate.artists],
+                "album": {"id": candidate.album_id, "name": candidate.album_name},
+                "external_ids": {"isrc": candidate.isrc},
+            }
+            for candidate in (first, second)
+        )
+        incomplete = {**first_item, "name": ""}
+        conflicting = {**incomplete, "external_ids": {"isrc": "USAAA2600009"}}
+        unknown_uri = {**conflicting, "uri": ""}
+        exact_query = 'track:"After Light" artist:"Harbour Lines" album:"Tidal Signals"'
+        next_query = 'track:"After Light" artist:"Harbour Lines"'
+        cases = (
+            ("conflicting untitled winner", {exact_query: (first_item, second_item, conflicting)}, "ambiguous", 1),
+            ("untitled winner on earlier query", {exact_query: (incomplete,), next_query: (first_item, second_item)},
+             "ambiguous", 2),
+            ("ordinary match", {exact_query: (conflicting, first_item)}, "would_add", 1),
+            ("unidentifiable observation", {exact_query: (unknown_uri, first_item, second_item)}, "would_add", 1),
+        )
+        for label, hits_by_query, status, search_count in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary_directory:
+                directory = Path(temporary_directory)
+                write_playlist_master(directory / "House" / "House.csv", [row])
+                queries: list[str] = []
+
+                def transport(request: HttpRequest) -> HttpResponse:
+                    parsed_url = urlsplit(request.url)
+                    if parsed_url.path == "/v1/search":
+                        query = parse_qs(parsed_url.query)["q"][0]
+                        queries.append(query)
+                        return HttpResponse(200, {}, json.dumps({"tracks": {"items": hits_by_query.get(query, ())}}))
+                    if parsed_url.path == "/v1/me/playlists":
+                        return HttpResponse(200, {}, '{"items":[]}')
+                    if parsed_url.path == "/v1/me":
+                        return HttpResponse(200, {}, '{"id":"current-user"}')
+                    self.fail(f"Unexpected Spotify request {request.method} {parsed_url.path}")
+
+                result = publish_spotify_playlists(
+                    directory, directory / "report.txt", SpotifyClient(transport=transport),
+                    "access-token", match_cache_path=directory / "matches.json", apply=False,
+                )
+
+                self.assertEqual(result.search_count, search_count)
+                self.assertEqual(queries, [exact_query, next_query][:search_count])
+                decision = result.decisions[0]
+                self.assertEqual(decision.status, status)
+                self.assertEqual(decision.spotify_uri, "" if status == "ambiguous" else first.uri)
+                expected_candidates = [first.uri] if label == "ordinary match" else [first.uri, second.uri]
+                self.assertEqual([candidate.uri for candidate in decision.review_candidates], expected_candidates)
+                self.assertTrue(all(candidate.name == "After Light" for candidate in decision.review_candidates))
+
+    def test_publish_edition_tie_requires_complete_typed_search_metadata(self):
+        row = playlist_row("111", "Tidal Signals", "After Light", "Harbour Lines")
+        first, second = recording_edition_candidates(row)
+        first_item, second_item = (
+            {
+                "uri": candidate.uri,
+                "name": candidate.name,
+                "artists": [{"id": "harbour", "name": "Harbour Lines"}],
+                "album": {"id": candidate.album_id, "name": candidate.album_name},
+                "external_ids": {"isrc": candidate.isrc},
+            }
+            for candidate in (first, second)
+        )
+        incomplete_credit = {
+            **second_item, "artists": [{"id": "harbour", "name": "Harbour Lines"}, {"id": "guest"}],
+        }
+        malformed_album = {**second_item, "album": {"id": 42, "name": "Tidal Signals"}}
+        null_artists = {**first_item, "artists": None}
+        cases = (
+            ("missing artist name", (first_item, incomplete_credit), "ambiguous", ""),
+            ("numeric album ID", (first_item, malformed_album), "ambiguous", ""),
+            ("null artists on a winning URI", (first_item, second_item, null_artists), "ambiguous", ""),
+            ("ordinary match with incomplete raw credit", (incomplete_credit,), "would_add", second.uri),
+            ("ordinary match with numeric raw ID", (malformed_album,), "would_add", second.uri),
+        )
+        for label, items, expected_status, expected_uri in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary_directory:
+                directory = Path(temporary_directory)
+                write_playlist_master(directory / "House" / "House.csv", [row])
+
+                def transport(request: HttpRequest) -> HttpResponse:
+                    path = urlsplit(request.url).path
+                    payload = {
+                        "/v1/search": {"tracks": {"items": items}},
+                        "/v1/me/playlists": {"items": []},
+                        "/v1/me": {"id": "current-user"},
+                    }[path]
+                    self.assertEqual(request.method, "GET")
+                    return HttpResponse(200, {}, json.dumps(payload))
+
+                summary = publish_spotify_playlists(
+                    directory, directory / "report.txt", SpotifyClient(transport=transport), "access-token",
+                    match_cache_path=directory / "matches.json", apply=False,
+                )
+
+                self.assertEqual(summary.search_count, 1)
+                decision = summary.decisions[0]
+                self.assertEqual((decision.status, decision.spotify_uri), (expected_status, expected_uri))
+                expected_candidates = 1 if expected_uri else 2
+                self.assertEqual([candidate.artists for candidate in decision.review_candidates],
+                                 [("Harbour Lines",)] * expected_candidates)
+
+    def test_publish_edition_tie_requires_complete_typed_cached_metadata(self):
+        row = playlist_row("111", "Tidal Signals", "After Light", "Harbour Lines")
+        first, alternate = recording_edition_candidates(row)
+        cache_key = "111|1|harbour lines|tidal signals|after light"
+        query = 'track:"After Light" artist:"Harbour Lines" album:"Tidal Signals"'
+        cases = (
+            ("null artist in chosen record", "chosen", {"spotify_artist_names": ["Harbour Lines", None]}),
+            ("null artist in cohort", "alternate", {"spotify_artist_names": ["Harbour Lines", None]}),
+            ("numeric album ID in cohort", "alternate", {"spotify_album_id": 42}),
+        )
+        for label, location, malformed_fields in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary_directory:
+                directory = Path(temporary_directory)
+                write_playlist_master(directory / "House" / "House.csv", [row])
+                cache_path = directory / "matches.json"
+                record = saved_edition_match_record(row, (first, alternate))
+                if location == "chosen":
+                    record.update(malformed_fields)
+                else:
+                    cohort = record["review_candidates"]
+                    assert isinstance(cohort, list)
+                    cohort[1].update(malformed_fields)
+                save_spotify_track_match_cache(cache_path, {cache_key: record})
+                client = PublishingSpotifyClient({query: (first, alternate)})
+
+                summary = publish_spotify_playlists(
+                    directory, directory / "report.txt", client, "access-token",
+                    match_cache_path=cache_path, apply=False,
+                )
+
+                self.assertEqual(summary.search_count, 1)
+                self.assertEqual(summary.decisions[0].match_source, "search")
+                self.assertEqual(summary.decisions[0].spotify_uri, first.uri)
+
+                if location == "chosen":
+                    legacy = {**record, "match_strategy": "", "version_sensitive": False}
+                    save_spotify_track_match_cache(cache_path, {cache_key: legacy})
+                    summary = publish_spotify_playlists(
+                        directory, directory / "report.txt", PublishingSpotifyClient({}), "access-token",
+                        match_cache_path=cache_path, apply=False,
+                    )
+                    self.assertEqual(summary.search_count, 0)
+                    self.assertEqual(summary.decisions[0].match_source, "cache")
+                    self.assertEqual(summary.decisions[0].spotify_uri, first.uri)
+
+    def test_publish_edition_tie_keeps_existing_write_guards(self):
+        row = playlist_row("111", "Tidal Signals", "After Light", "Harbour Lines")
+        first, second = recording_edition_candidates(row)
+        query = 'track:"After Light" artist:"Harbour Lines" album:"Tidal Signals"'
+        playlist = SpotifyPlaylist(playlist_id="house", name="House", url="", owner_id="current-user")
+        equivalent = SpotifyPlaylistItem(uri=second.uri, name=second.name, artists=second.artists, album_name=second.album_name)
+        equivalent_uri_only = replace(equivalent, name="", artists=(), album_name="")
+        other_recording = replace(equivalent, uri="spotify:track:different-recording")
+        other_uri_only = replace(equivalent_uri_only, uri=other_recording.uri)
+        inventory_cases = (
+            ("complete copy", (equivalent,), "already_present", equivalent.uri),
+            ("URI-only copy", (equivalent_uri_only,), "already_present", equivalent.uri),
+            ("complete collision", (other_recording,), "ambiguous", ""),
+            ("unrelated URI-only item", (other_uri_only,), "would_add", first.uri),
+            ("collision plus complete copy", (other_recording, equivalent), "already_present", equivalent.uri),
+            ("collision plus URI-only copy", (other_recording, equivalent_uri_only), "already_present", equivalent.uri),
+        )
+        for label, inventory, expected_status, expected_uri in inventory_cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary_directory:
+                directory = Path(temporary_directory)
+                write_playlist_master(directory / "House" / "House.csv", [row])
+                report_path = directory / "report.txt"
+                cache_path = directory / "matches.json"
+                for source in ("search", "cache"):
+                    with self.subTest(source=source):
+                        client = PublishingSpotifyClient(
+                            {query: (second, first)}, playlists=(playlist,), playlist_items_by_id={"house": inventory},
+                        )
+                        summary = publish_spotify_playlists(
+                            directory, report_path, client, "access-token",
+                            match_cache_path=cache_path, apply=expected_status != "would_add",
+                        )
+                        decision = summary.decisions[0]
+                        self.assertEqual(decision.match_source, source)
+                        self.assertEqual(decision.status, expected_status)
+                        self.assertEqual(decision.spotify_uri, expected_uri)
+                        self.assertIn(
+                            f"| {expected_status} | {expected_uri or 'no Spotify URI'}",
+                            report_path.read_text(encoding="utf-8"),
+                        )
+                        if expected_status == "ambiguous":
+                            self.assertIsNone(decision.candidate)
+                            self.assertIn("existing Spotify item", decision.reason)
+                        final_uris = [item.spotify_uri for item in summary.final_items]
+                        planned_uris = [first.uri] if expected_status == "would_add" else []
+                        self.assertEqual(final_uris, [item.uri for item in inventory] + planned_uris)
+                        self.assertEqual(client.add_calls, [])
+                        self.assertEqual(client.replace_calls, [])
+                        self.assertEqual(client.created_playlists, [])
+                        record = next(iter(load_spotify_track_match_cache(cache_path).values()))
+                        self.assertEqual(record["match_status"], "matched")
+                        self.assertEqual(record["spotify_uri"], first.uri)
+                if label in {"complete copy", "complete collision"}:
+                    client = PublishingSpotifyClient({}, playlists=(playlist,), playlist_items_by_id={"house": inventory})
+                    publish_spotify_playlists(
+                        directory, report_path, client, "access-token",
+                        match_cache_path=cache_path, publisher_sync_mode="replace",
+                    )
+                    self.assertEqual(client.searches, [])
+                    self.assertEqual(client.replace_calls, [("house", (first.uri,))])
+
+        ordinary_row = playlist_row("222", "Other Album", "Other Track", "Other Artist")
+        ordinary_query = 'track:"Other Track" artist:"Other Artist" album:"Other Album"'
+        doubled_credit = ("Harbour Lines", "Harbour Lines")
+        unsafe_cases = (
+            ("different ISRC", (first, replace(second, isrc="USAAA2600002"))),
+            ("episode", (first, replace(second, uri="spotify:episode:edition-b"))),
+            ("different append identity", (first, replace(second, artists=doubled_credit))),
+            ("later different append identity", (first, second, replace(first, artists=doubled_credit))),
+        )
+        for label, observations in unsafe_cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary_directory:
+                directory = Path(temporary_directory)
+                write_playlist_master(directory / "House" / "House.csv", [ordinary_row, row])
+                cache_path = directory / "matches.json"
+                report_path = directory / "report.txt"
+                client = PublishingSpotifyClient(
+                    {ordinary_query: (matching_candidate(ordinary_row),), query: observations}, playlists=(playlist,),
+                )
+                dry_run = publish_spotify_playlists(
+                    directory, report_path, client, "access-token", match_cache_path=cache_path, apply=False,
+                )
+                self.assertEqual(dry_run.decisions[1].status, "ambiguous")
+                self.assertEqual(dry_run.decisions[1].spotify_uri, "")
+                self.assertEqual([item.spotify_uri for item in dry_run.final_items], ["spotify:track:222"])
+                with self.assertRaisesRegex(ValueError, r"replace mode aborted before writing .*ambiguous=1"):
+                    publish_spotify_playlists(
+                        directory, report_path, client, "access-token", match_cache_path=cache_path,
+                        publisher_sync_mode="replace",
+                    )
+                self.assertEqual(client.add_calls, [])
+                self.assertEqual(client.replace_calls, [])
+                self.assertEqual(client.created_playlists, [])
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            write_playlist_master(directory / "House" / "House.csv", [row])
+            cache_path = directory / "matches.json"
+            save_spotify_track_match_cache(cache_path, {
+                "111|1|harbour lines|tidal signals|after light": {
+                    "match_status": "matched", "matcher_version": MATCHER_VERSION - 1,
+                    "spotify_uri": "spotify:track:legacy",
+                },
+            })
+            legacy = publish_spotify_playlists(
+                directory, directory / "report.txt", PublishingSpotifyClient({query: (first, second)}),
+                "access-token", match_cache_path=cache_path, apply=False,
+            )
+            self.assertEqual(legacy.search_count, 0)
+            self.assertEqual(legacy.decisions[0].status, "would_add")
+            self.assertEqual(legacy.decisions[0].spotify_uri, "spotify:track:legacy")
+
+    def test_publish_edition_tie_reviews_conflicting_metadata_for_existing_cohort_uri(self):
+        row = playlist_row("111", "Tidal Signals", "After Light", "Harbour Lines")
+        chosen, alternate = recording_edition_candidates(row)
+        query = 'track:"After Light" artist:"Harbour Lines" album:"Tidal Signals"'
+        playlist = SpotifyPlaylist(playlist_id="house", name="House", url="", owner_id="current-user")
+        for conflict in (chosen, alternate):
+            with self.subTest(uri=conflict.uri), tempfile.TemporaryDirectory() as temporary_directory:
+                directory = Path(temporary_directory)
+                write_playlist_master(directory / "House" / "House.csv", [row])
+                cache_path = directory / "matches.json"
+                report_path = directory / "report.txt"
+                inventory = SpotifyPlaylistItem(
+                    uri=conflict.uri, name="After Light (Live)", artists=conflict.artists, album_name=conflict.album_name,
+                )
+                for source in ("search", "cache"):
+                    with self.subTest(source=source):
+                        client = PublishingSpotifyClient(
+                            {query: (chosen, alternate)}, playlists=(playlist,), playlist_items_by_id={"house": (inventory,)},
+                        )
+                        summary = publish_spotify_playlists(
+                            directory, report_path, client, "access-token", match_cache_path=cache_path,
+                        )
+                        decision = summary.decisions[0]
+                        self.assertEqual((decision.match_source, decision.status, decision.spotify_uri), (source, "ambiguous", ""))
+                        self.assertIn("conflicting metadata", decision.reason)
+                        self.assertIn("ambiguous | no Spotify URI", report_path.read_text(encoding="utf-8"))
+                        self.assertEqual(client.add_calls, [])
+                        self.assertEqual([item.spotify_uri for item in summary.final_items], [conflict.uri])
+                        record = next(iter(load_spotify_track_match_cache(cache_path).values()))
+                        self.assertEqual(record["spotify_uri"], chosen.uri)
+                replacement = PublishingSpotifyClient({}, playlists=(playlist,), playlist_items_by_id={"house": (inventory,)})
+                publish_spotify_playlists(
+                    directory, report_path, replacement, "access-token",
+                    match_cache_path=cache_path, publisher_sync_mode="replace",
+                )
+                self.assertEqual(replacement.replace_calls, [("house", (chosen.uri,))])
+
+    def test_publish_edition_tie_checks_strict_metadata_for_existing_cohort_uri(self):
+        row = playlist_row("111", "Tidal Signals 海", "After Light 夜", "Harbour Lines 航")
+        chosen, alternate = recording_edition_candidates(row)
+        query = 'track:"After Light 夜" artist:"Harbour Lines 航" album:"Tidal Signals 海"'
+        playlist = SpotifyPlaylist(playlist_id="house", name="House", url="", owner_id="current-user")
+        existing = SpotifyPlaylistItem(
+            uri=alternate.uri, name=alternate.name, artists=alternate.artists, album_name=alternate.album_name,
+        )
+        cases = (
+            ("different title", replace(existing, name="After Light 日"), "ambiguous", ""),
+            ("different credit", replace(existing, artists=("Harbour Lines 船",)), "ambiguous", ""),
+            ("different album", replace(existing, album_name="Tidal Signals 山"), "ambiguous", ""),
+            ("equivalent spelling", replace(existing, name="after  light 夜"), "already_present", alternate.uri),
+        )
+        for label, item, status, selected_uri in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary_directory:
+                directory = Path(temporary_directory)
+                write_playlist_master(directory / "House" / "House.csv", [row])
+                cache_path = directory / "matches.json"
+                report_path = directory / "report.txt"
+                for source in ("search", "cache"):
+                    with self.subTest(source=source):
+                        client = PublishingSpotifyClient(
+                            {query: (chosen, alternate)}, playlists=(playlist,),
+                            playlist_items_by_id={"house": (item,)},
+                        )
+                        summary = publish_spotify_playlists(
+                            directory, report_path, client, "access-token", match_cache_path=cache_path,
+                        )
+
+                        decision = summary.decisions[0]
+                        self.assertEqual((decision.match_source, decision.status, decision.spotify_uri),
+                                         (source, status, selected_uri))
+                        if status == "ambiguous":
+                            self.assertIn("conflicting metadata", decision.reason)
+                            self.assertIn("ambiguous | no Spotify URI", report_path.read_text(encoding="utf-8"))
+                        self.assertEqual(client.add_calls, [])
+                        self.assertEqual([final.spotify_uri for final in summary.final_items], [item.uri])
+
+    def test_publish_edition_tie_reviews_cross_identity_source_uri_before_writing(self):
+        live = playlist_row("live", "Tidal Signals", "After Light (Live)", "Harbour Lines")
+        filler = [playlist_row(str(index), "Fixture Album", f"Track {index}", "Fixture Artist") for index in range(99)]
+        row = playlist_row("111", "Tidal Signals", "After Light", "Harbour Lines")
+        chosen, alternate = recording_edition_candidates(row)
+        live_candidate = replace(matching_candidate(live), uri=chosen.uri)
+        searches: dict[str, tuple[SpotifyTrackCandidate, ...]] = {
+            f'track:"{item["Track Name"]}" artist:"Fixture Artist" album:"Fixture Album"': (matching_candidate(item),)
+            for item in filler
+        }
+        searches['track:"After Light (Live)" artist:"Harbour Lines" album:"Tidal Signals"'] = (live_candidate,)
+        searches['track:"After Light" artist:"Harbour Lines" album:"Tidal Signals"'] = (chosen, alternate)
+        playlist = SpotifyPlaylist(playlist_id="house", name="House", url="", owner_id="current-user")
+        for edition_first in (False, True):
+            for crosses_checkpoint in (False, True):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    directory = Path(temporary_directory)
+                    earlier, later = (row, live) if edition_first else (live, row)
+                    between = filler if crosses_checkpoint else []
+                    write_playlist_master(directory / "House" / "House.csv", [earlier, *between, later])
+                    expected_uris = (chosen.uri, *(f"spotify:track:{index}" for index in range(len(between))))
+                    report = directory / "report.txt"
+                    for mode, apply in (("append", False), ("append", True), ("replace", True)):
+                        cache = directory / f"{mode}-{apply}-matches.json"
+                        for source in ("search", "cache"):
+                            with self.subTest(edition_first=edition_first, crosses_checkpoint=crosses_checkpoint,
+                                              mode=mode, apply=apply, source=source):
+                                client = PublishingSpotifyClient(searches, playlists=(playlist,))
+                                client.candidates_by_uri[chosen.uri] = chosen if edition_first else live_candidate
+                                state = directory / f"{mode}-{apply}-{source}-state.json"
+                                if mode == "replace":
+                                    with self.assertRaisesRegex(ValueError, r"replace mode aborted before writing .*ambiguous=1"):
+                                        publish_spotify_playlists(
+                                            directory, report, client, "access-token", match_cache_path=cache,
+                                            publish_state_cache_path=state, publisher_sync_mode=mode, apply=apply,
+                                        )
+                                    self.assertEqual(client.replace_calls, [])
+                                    self.assertEqual(client.add_calls, [])
+                                else:
+                                    summary = publish_spotify_playlists(
+                                        directory, report, client, "access-token", match_cache_path=cache,
+                                        publish_state_cache_path=state, publisher_sync_mode=mode, apply=apply,
+                                    )
+                                    decision = summary.decisions[-1]
+                                    self.assertEqual(
+                                        (decision.match_source, decision.status, decision.spotify_uri),
+                                        (source, "ambiguous", ""),
+                                    )
+                                    self.assertIn("conflicting metadata", decision.reason)
+                                    self.assertEqual(tuple(item.spotify_uri for item in summary.final_items), expected_uris)
+                                    expected_writes = [("house", expected_uris, None)] if apply else []
+                                    self.assertEqual(client.add_calls, expected_writes)
+                                self.assertEqual(len(client.searches), len(between) + 2 if source == "search" else 0)
+                                self.assertIn("| ambiguous | no Spotify URI", report.read_text(encoding="utf-8"))
+
+    def test_publish_edition_tie_retains_compatible_evidence_for_planned_and_observed_uris(self):
+        rows = [
+            playlist_row(str(number), "Tidal Signals", title, "Harbour Lines")
+            for number, title in enumerate(("Drift", "DRIFT", "drift", "Drift (Live)"), start=1)
+        ]
+        winner, _ = recording_edition_candidates(rows[0])
+        planned = replace(winner, uri="spotify:track:z", album_id="edition-z")
+        observed = replace(winner, uri="spotify:track:y", album_id="edition-y")
+        ordinary = replace(planned, isrc="")
+        later_winner = replace(winner, uri="spotify:track:edition-c", album_id="edition-c")
+        conflicting = tuple(
+            replace(candidate, isrc="USAAA2600002") for candidate in (later_winner, planned, observed)
+        )
+        playlist = SpotifyPlaylist(playlist_id="house", name="House", url="", owner_id="current-user")
+        inventory_item = SpotifyPlaylistItem(
+            uri=observed.uri, name=observed.name, artists=observed.artists, album_name=observed.album_name,
+        )
+        for already_present in (False, True):
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                directory = Path(temporary_directory)
+                write_playlist_master(directory / "House" / "House.csv", rows)
+                cache = directory / "matches.json"
+                physical_uri = observed.uri if already_present else planned.uri
+                incompatible_ordinary = replace(ordinary, uri=physical_uri, name="Drift (Live)")
+                searches = {
+                    'track:"Drift" artist:"Harbour Lines" album:"Tidal Signals"': (ordinary,),
+                    'track:"DRIFT" artist:"Harbour Lines" album:"Tidal Signals"': (winner, planned, observed),
+                    'track:"drift" artist:"Harbour Lines" album:"Tidal Signals"': conflicting,
+                    'track:"Drift (Live)" artist:"Harbour Lines" album:"Tidal Signals"': (incompatible_ordinary,),
+                }
+                for source in ("search", "cache"):
+                    with self.subTest(already_present=already_present, source=source):
+                        client = PublishingSpotifyClient(
+                            searches, playlists=(playlist,),
+                            playlist_items_by_id={"house": (inventory_item,) if already_present else ()},
+                        )
+                        client.candidates_by_uri[physical_uri] = observed if already_present else ordinary
+                        summary = publish_spotify_playlists(
+                            directory, directory / "report.txt", client, "access-token", match_cache_path=cache,
+                            publish_state_cache_path=directory / f"{source}-state.json",
+                        )
+                        first_status = "already_present" if already_present else "added"
+                        second_status = "already_present" if already_present else "duplicate_in_source"
+                        second_uri = observed.uri if already_present else winner.uri
+                        self.assertEqual(
+                            [(decision.match_source, decision.status, decision.spotify_uri) for decision in summary.decisions],
+                            [(source, first_status, planned.uri), (source, second_status, second_uri),
+                             (source, "ambiguous", ""), (source, "ambiguous", "")],
+                        )
+                        self.assertIn("different ISRC", summary.decisions[2].reason)
+                        self.assertIn("conflicting metadata", summary.decisions[3].reason)
+                        self.assertEqual([item.spotify_uri for item in summary.final_items], [physical_uri])
+                        self.assertEqual(
+                            client.add_calls, [] if already_present else [("house", (planned.uri,), None)],
+                        )
+
+    def test_publish_edition_tie_holds_conflicting_observations_of_an_unselected_uri(self):
+        north = playlist_row("111", "Tidal Signals", "North Bridge", "Harbour Lines")
+        south = playlist_row("222", "Tidal Signals", "South Bridge", "Harbour Lines")
+        north_copies, south_copies = overlapping_edition_candidates(north, south)
+        north_query = 'track:"North Bridge" artist:"Harbour Lines" album:"Tidal Signals"'
+        south_query = 'track:"South Bridge" artist:"Harbour Lines" album:"Tidal Signals"'
+        playlist = SpotifyPlaylist(playlist_id="house", name="House", url="", owner_id="current-user")
+        cases = (
+            ("later chooses the shared URI", north_copies, (south_copies[0], replace(south_copies[1], is_playable=True))),
+            ("later chooses the other URI", north_copies, south_copies),
+            ("same ISRC with contradictory titles", north_copies,
+             tuple(replace(candidate, isrc="CAAAC2600001") for candidate in south_copies)),
+            ("earlier ordinary title with no ISRC or album ID",
+             (replace(north_copies[1], album_id="", isrc=""),), south_copies),
+        )
+        for label, earlier, later in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary_directory:
+                directory = Path(temporary_directory)
+                write_playlist_master(directory / "House" / "House.csv", [north, south])
+                report = directory / "report.txt"
+                searches = {north_query: earlier, south_query: later}
+                for mode in ("append", "replace"):
+                    cache = directory / f"{mode}-matches.json"
+                    for source in ("search", "cache"):
+                        with self.subTest(mode=mode, source=source):
+                            client = PublishingSpotifyClient(searches, playlists=(playlist,))
+                            state = directory / f"{mode}-{source}-state.json"
+                            if mode == "replace":
+                                with self.assertRaisesRegex(ValueError, r"replace mode aborted before writing .*ambiguous=1"):
+                                    publish_spotify_playlists(
+                                        directory, report, client, "access-token", match_cache_path=cache,
+                                        publish_state_cache_path=state, publisher_sync_mode=mode,
+                                    )
+                                self.assertEqual(client.replace_calls, [])
+                                self.assertEqual(client.add_calls, [])
+                            else:
+                                result = publish_spotify_playlists(
+                                    directory, report, client, "access-token", match_cache_path=cache,
+                                    publish_state_cache_path=state,
+                                )
+                                self.assertEqual(
+                                    [(decision.match_source, decision.status, decision.spotify_uri)
+                                     for decision in result.decisions],
+                                    [(source, "added", earlier[0].uri), (source, "ambiguous", "")],
+                                )
+                                self.assertIsNone(result.decisions[1].candidate)
+                                self.assertEqual([item.spotify_uri for item in result.final_items], [earlier[0].uri])
+                                self.assertEqual(client.add_calls, [("house", (earlier[0].uri,), None)])
+                            self.assertEqual(len(client.searches), 2 if source == "search" else 0)
+                            self.assertIn("| South Bridge | ambiguous | no Spotify URI", report.read_text(encoding="utf-8"))
+
+    def test_publish_edition_tie_keeps_alternate_evidence_out_of_other_playlist_inventory(self):
+        row = playlist_row("111", "Tidal Signals", "North Bridge", "Harbour Lines")
+        first, alternate = recording_edition_candidates(row)
+        query = 'track:"North Bridge" artist:"Harbour Lines" album:"Tidal Signals"'
+        playlists = tuple(
+            SpotifyPlaylist(playlist_id=name.lower(), name=name, url="", owner_id="current-user")
+            for name in ("First", "Second")
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            write_playlist_master(directory / "First" / "First.csv", [row])
+            second_row = playlist_row("222", "Tidal Signals", "NORTH BRIDGE", "Harbour Lines")
+            write_playlist_master(directory / "Second" / "Second.csv", [second_row])
+            client = PublishingSpotifyClient({
+                query: (first, alternate),
+                'track:"NORTH BRIDGE" artist:"Harbour Lines" album:"Tidal Signals"': (alternate,),
+            }, playlists=playlists)
+            result = publish_spotify_playlists(
+                directory, directory / "report.txt", client, "access-token",
+                match_cache_path=directory / "matches.json",
+            )
+        self.assertEqual([decision.status for decision in result.decisions], ["added", "added"])
+        self.assertEqual(client.add_calls, [("first", (first.uri,), None), ("second", (alternate.uri,), None)])
+
+    def test_publish_edition_tie_preserves_unknown_ordinary_metadata_on_cache_reuse(self):
+        row = playlist_row("111", "Tidal Signals", "North Bridge", "Harbour Lines")
+        copy, shared = recording_edition_candidates(row)
+        payload = {"tracks": {"items": [{
+            "uri": shared.uri,
+            "name": shared.name,
+            "artists": [{"name": "Harbour Lines"}],
+            "album": {"id": 42, "name": "Tidal Signals"},
+        }]}}
+        search = SpotifyClient(transport=lambda request: HttpResponse(200, {}, json.dumps(payload)))
+        ordinary = search.search_tracks("access-token", "synthetic-query")
+        playlist = SpotifyPlaylist(playlist_id="house", name="House", url="", owner_id="current-user")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            same_title = playlist_row("222", "Tidal Signals", "NORTH BRIDGE", "Harbour Lines")
+            write_playlist_master(directory / "House" / "House.csv", [row, same_title])
+            cache = directory / "matches.json"
+            for source in ("search", "cache"):
+                with self.subTest(source=source):
+                    client = PublishingSpotifyClient({
+                        'track:"North Bridge" artist:"Harbour Lines" album:"Tidal Signals"': ordinary,
+                        'track:"NORTH BRIDGE" artist:"Harbour Lines" album:"Tidal Signals"': (copy, shared),
+                    }, playlists=(playlist,))
+                    result = publish_spotify_playlists(
+                        directory, directory / "report.txt", client, "access-token",
+                        match_cache_path=cache, apply=False,
+                    )
+                    self.assertEqual([decision.match_source for decision in result.decisions], [source, source])
+                    self.assertEqual([decision.status for decision in result.decisions], ["would_add", "duplicate_in_source"])
+                    self.assertEqual([item.spotify_uri for item in result.final_items], [shared.uri])
+
+    def test_publish_edition_tie_holds_disjoint_source_matches(self):
+        night = playlist_row("111", "Tidal Signals", "Drift 夜", "Harbour Lines")
+        morning = playlist_row("222", "Tidal Signals", "Drift 朝", "Harbour Lines")
+        night_copies = recording_edition_candidates(night)
+        morning_first = replace(
+            matching_candidate(morning), uri="spotify:track:morning-a", album_id="morning-a", isrc="USAAA2600002",
+        )
+        morning_copies = (morning_first, replace(morning_first, uri="spotify:track:morning-b", album_id="morning-b"))
+        night_query = 'track:"Drift 夜" artist:"Harbour Lines" album:"Tidal Signals"'
+        morning_query = 'track:"Drift 朝" artist:"Harbour Lines" album:"Tidal Signals"'
+        playlist = SpotifyPlaylist(playlist_id="house", name="House", url="", owner_id="current-user")
+        cases = (
+            ("two edition proofs", night_copies, morning_copies, "ambiguous"),
+            ("edition then ordinary", night_copies, morning_copies[:1], "ambiguous"),
+            ("ordinary then edition", night_copies[:1], morning_copies, "ambiguous"),
+            ("two ordinary matches", night_copies[:1], morning_copies[:1], "duplicate_in_source"),
+        )
+        for label, before, after, later_status in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary_directory:
+                directory = Path(temporary_directory)
+                write_playlist_master(directory / "House" / "House.csv", [night, morning])
+                cache_path = directory / "matches.json"
+                report_path = directory / "report.txt"
+                for match_source in ("search", "cache"):
+                    with self.subTest(match_source=match_source):
+                        client = PublishingSpotifyClient({night_query: before, morning_query: after}, playlists=(playlist,))
+                        result = publish_spotify_playlists(
+                            directory, report_path, client, "access-token", match_cache_path=cache_path,
+                            publish_state_cache_path=directory / f"{match_source}-state.json",
+                        )
+
+                        self.assertEqual([decision.match_source for decision in result.decisions], [match_source] * 2)
+                        self.assertEqual([decision.status for decision in result.decisions], ["added", later_status])
+                        self.assertEqual(client.add_calls, [("house", (night_copies[0].uri,), None)])
+                        self.assertEqual([item.spotify_uri for item in result.final_items], [night_copies[0].uri])
+                        if later_status == "ambiguous":
+                            later = result.decisions[1]
+                            self.assertEqual(later.spotify_uri, "")
+                            self.assertIsNone(later.candidate)
+                            self.assertIn("earlier source row", later.reason)
+                            self.assertIn(
+                                "| Drift 朝 | ambiguous | no Spotify URI", report_path.read_text(encoding="utf-8"),
+                            )
+                        record = load_spotify_track_match_cache(cache_path)["222|1|harbour lines|tidal signals|drift"]
+                        self.assertEqual(record["match_status"], "matched")
+                        self.assertEqual(record["spotify_uri"], morning_first.uri)
+
+                replacement = PublishingSpotifyClient({}, playlists=(playlist,))
+                publish_spotify_playlists(
+                    directory, report_path, replacement, "access-token",
+                    match_cache_path=cache_path, publisher_sync_mode="replace",
+                )
+                self.assertEqual(replacement.replace_calls, [("house", (night_copies[0].uri, morning_first.uri))])
+
+    def test_publish_edition_tie_uses_shared_source_uri_and_actual_inventory(self):
+        earlier_row = playlist_row("111", "Tidal Signals", "Drift", "Harbour Lines")
+        later_row = playlist_row("222", "Tidal Signals", "DRIFT", "Harbour Lines")
+        first, shared = recording_edition_candidates(earlier_row)
+        later_first = replace(first, uri="spotify:track:earlier-lexical", album_id="earlier-lexical")
+        earlier_query = 'track:"Drift" artist:"Harbour Lines" album:"Tidal Signals"'
+        later_query = 'track:"DRIFT" artist:"Harbour Lines" album:"Tidal Signals"'
+        playlist = SpotifyPlaylist(playlist_id="house", name="House", url="", owner_id="current-user")
+        other_recording = SpotifyPlaylistItem(
+            uri="spotify:track:unrelated", name=shared.name, artists=shared.artists, album_name=shared.album_name,
+        )
+        cases = (
+            ("shared between editions", (first, shared), (later_first, shared), (), "added", "duplicate_in_source"),
+            ("shared with earlier ordinary", (shared,), (first, shared), (), "added", "duplicate_in_source"),
+            ("shared with later ordinary", (first, shared), (shared,), (), "added", "duplicate_in_source"),
+            ("ordinary presence used an unrelated URI", (shared,), (first, shared), (other_recording,),
+             "already_present", "ambiguous"),
+        )
+        for label, before, after, inventory, earlier_status, later_status in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary_directory:
+                directory = Path(temporary_directory)
+                write_playlist_master(directory / "House" / "House.csv", [earlier_row, later_row])
+                cache_path = directory / "matches.json"
+                for source in ("search", "cache"):
+                    with self.subTest(source=source):
+                        client = PublishingSpotifyClient(
+                            {earlier_query: before, later_query: after},
+                            playlists=(playlist,), playlist_items_by_id={"house": inventory},
+                        )
+                        result = publish_spotify_playlists(
+                            directory, directory / "report.txt", client, "access-token", match_cache_path=cache_path,
+                            publish_state_cache_path=directory / f"{source}-state.json",
+                        )
+
+                        self.assertEqual([decision.match_source for decision in result.decisions], [source] * 2)
+                        self.assertEqual([decision.status for decision in result.decisions], [earlier_status, later_status])
+                        if inventory:
+                            self.assertEqual(result.decisions[0].spotify_uri, shared.uri)
+                            self.assertEqual(result.decisions[1].spotify_uri, "")
+                            self.assertIn("existing Spotify item", result.decisions[1].reason)
+                            self.assertEqual(client.add_calls, [])
+                        else:
+                            self.assertEqual(client.add_calls, [("house", (before[0].uri,), None)])
+
+    def test_publish_edition_tie_reviews_overlapping_source_cohorts_with_conflicting_isrcs(self):
+        earlier = playlist_row("111", "Tidal Signals", "Drift", "Harbour Lines")
+        later = playlist_row("222", "Tidal Signals", "DRIFT", "Harbour Lines")
+        first, overlap = recording_edition_candidates(earlier)
+        later_winner = replace(first, uri="spotify:track:edition-0", album_id="edition-0", isrc="USAAA2600002")
+        conflicting_overlap = replace(overlap, isrc="USAAA2600002")
+        earlier_query = 'track:"Drift" artist:"Harbour Lines" album:"Tidal Signals"'
+        later_query = 'track:"DRIFT" artist:"Harbour Lines" album:"Tidal Signals"'
+        playlist = SpotifyPlaylist(playlist_id="house", name="House", url="", owner_id="current-user")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            write_playlist_master(directory / "House" / "House.csv", [earlier, later])
+            report_path = directory / "report.txt"
+            cache_path = directory / "matches.json"
+            for source in ("search", "cache"):
+                with self.subTest(source=source):
+                    client = PublishingSpotifyClient(
+                        {earlier_query: (first, overlap), later_query: (later_winner, conflicting_overlap)},
+                        playlists=(playlist,),
+                    )
+                    summary = publish_spotify_playlists(
+                        directory, report_path, client, "access-token", match_cache_path=cache_path,
+                        publish_state_cache_path=directory / f"{source}-state.json",
+                    )
+                    self.assertEqual(
+                        [(decision.match_source, decision.status, decision.spotify_uri) for decision in summary.decisions],
+                        [(source, "added", first.uri), (source, "ambiguous", "")],
+                    )
+                    self.assertIn("ISRC", summary.decisions[1].reason)
+                    self.assertEqual(client.add_calls, [("house", (first.uri,), None)])
+                    record = load_spotify_track_match_cache(cache_path)["222|1|harbour lines|tidal signals|drift"]
+                    self.assertEqual(record["spotify_uri"], later_winner.uri)
+                    self.assertEqual(record["spotify_isrc"], "USAAA2600002")
+
+            replacement = PublishingSpotifyClient({}, playlists=(playlist,))
+            with self.assertRaisesRegex(ValueError, r"replace mode aborted before writing .*ambiguous=1"):
+                publish_spotify_playlists(
+                    directory, report_path, replacement, "access-token",
+                    match_cache_path=cache_path, publisher_sync_mode="replace",
+                )
+            self.assertEqual(replacement.replace_calls, [])
+
+    def test_publish_edition_tie_excludes_conflicting_recording_evidence_from_album_hints(self):
+        north = playlist_row("111", "Tidal Signals", "North Bridge", "Harbour Lines")
+        south = playlist_row("222", "Tidal Signals", "South Bridge", "Harbour Lines")
+        north_copies, south_copies = overlapping_edition_candidates(north, south)
+        searches = {
+            'track:"North Bridge" artist:"Harbour Lines" album:"Tidal Signals"': north_copies,
+            'track:"South Bridge" artist:"Harbour Lines" album:"Tidal Signals"': south_copies,
+        }
+        siblings = [
+            playlist_row("222", "Tidal Signals", title, "Harbour Lines", str(number))
+            for number, title in enumerate(("Low Tide", "Far Shore"), start=2)
+        ]
+        for previously_held in (False, True):
+            with self.subTest(previously_held=previously_held), tempfile.TemporaryDirectory() as temporary_directory:
+                directory = Path(temporary_directory)
+                master = directory / "House" / "House.csv"
+                cache = directory / "matches.json"
+                report = directory / "report.txt"
+                if previously_held:
+                    write_playlist_master(master, [north, south])
+                    publish_spotify_playlists(
+                        directory, report, PublishingSpotifyClient(searches), "access-token",
+                        match_cache_path=cache, apply=False,
+                    )
+                    rows = [south, *siblings]
+                else:
+                    save_spotify_track_match_cache(cache, {
+                        "111|1|harbour lines|tidal signals|north bridge": saved_edition_match_record(north, north_copies),
+                        "222|1|harbour lines|tidal signals|south bridge": saved_edition_match_record(south, south_copies),
+                    })
+                    rows = [north, siblings[0], south, siblings[1]]
+                write_playlist_master(master, rows)
+                client = AlbumPublishingSpotifyClient(
+                    album_candidates=(),
+                    album_tracks_by_id={
+                        "south-album": recording_edition_album_tracks([south, *siblings], "south-album"),
+                        "shared-album": (),
+                    },
+                )
+                result = publish_spotify_playlists(
+                    directory, report, client, "access-token", match_cache_path=cache, apply=False,
+                )
+
+                self.assertEqual(client.album_searches, [("access-token", 'album:"Tidal Signals"', 10)])
+                self.assertEqual(client.album_track_requests, [])
+                self.assertEqual(
+                    [item.status for item in result.decisions if item.track.track_name in {"Low Tide", "Far Shore"}],
+                    ["unmatched", "unmatched"],
+                )
+
+    def test_publish_edition_tie_keeps_known_conflict_in_review_after_subset_reload(self):
+        from publishers.spotify.manual_matches import import_manual_match_overrides
+
+        north = playlist_row("111", "Tidal Signals", "North Bridge", "Harbour Lines")
+        south = playlist_row("222", "Tidal Signals", "South Bridge", "Harbour Lines")
+        north_copies, south_copies = overlapping_edition_candidates(north, south)
+        south_winner = replace(south_copies[1], is_playable=True)
+        searches = {
+            'track:"North Bridge" artist:"Harbour Lines" album:"Tidal Signals"': north_copies,
+            'track:"South Bridge" artist:"Harbour Lines" album:"Tidal Signals"': (south_copies[0], south_winner),
+        }
+        playlist = SpotifyPlaylist(playlist_id="house", name="House", url="", owner_id="current-user")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            master = directory / "House" / "House.csv"
+            cache = directory / "matches.json"
+            report = directory / "report.txt"
+            write_playlist_master(master, [north, south])
+            warm = publish_spotify_playlists(
+                directory, report, PublishingSpotifyClient(searches, playlists=(playlist,)), "access-token",
+                match_cache_path=cache, apply=False,
+            )
+            self.assertEqual([decision.status for decision in warm.decisions], ["would_add", "ambiguous"])
+            held_cache = load_spotify_track_match_cache(cache)
+            recording_key = "222|1|harbour lines|tidal signals|south bridge"
+            self.assertIs(held_cache[recording_key]["album_hint_recording_conflict"], True)
+
+            write_playlist_master(master, [south])
+            for mode in ("append", "replace"):
+                with self.subTest(mode=mode):
+                    client = PublishingSpotifyClient(searches, playlists=(playlist,))
+                    if mode == "replace":
+                        with self.assertRaisesRegex(ValueError, r"replace mode aborted before writing .*ambiguous=1"):
+                            publish_spotify_playlists(
+                                directory, report, client, "access-token", match_cache_path=cache,
+                                publisher_sync_mode="replace",
+                            )
+                    else:
+                        result = publish_spotify_playlists(
+                            directory, report, client, "access-token", match_cache_path=cache,
+                        )
+                        held = result.decisions[0]
+                        self.assertEqual((held.match_source, held.status, held.spotify_uri), ("cache", "ambiguous", ""))
+                        self.assertIsNone(held.candidate)
+                        self.assertEqual([candidate.uri for candidate in held.review_candidates],
+                                         [south_copies[0].uri, south_winner.uri])
+                        self.assertEqual(result.final_items, ())
+                    self.assertEqual(client.searches, [])
+                    self.assertEqual(client.add_calls, [])
+                    self.assertEqual(client.replace_calls, [])
+                    self.assertEqual(client.created_playlists, [])
+                    self.assertIn("| South Bridge | ambiguous | no Spotify URI", report.read_text(encoding="utf-8"))
+
+            refreshed = publish_spotify_playlists(
+                directory, report, PublishingSpotifyClient(searches, playlists=(playlist,)), "access-token",
+                match_cache_path=cache, refresh_match_cache=True, apply=False,
+            )
+            self.assertEqual(
+                (refreshed.decisions[0].match_source, refreshed.decisions[0].status, refreshed.decisions[0].spotify_uri),
+                ("search", "would_add", south_winner.uri),
+            )
+
+            save_spotify_track_match_cache(cache, held_cache)
+            override = directory / "manual.json"
+            override.write_text(json.dumps({
+                "schema_version": 1,
+                "record_type": "spotify_manual_match_overrides",
+                "matches": [{
+                    "release_id": "222", "track_number": "1", "artist_name": "Harbour Lines",
+                    "album_name": "Tidal Signals", "track_name": "South Bridge",
+                    "spotify_uri": "spotify:track:manually-verified", "spotify_track_name": "South Bridge",
+                    "spotify_artist_names": ["Harbour Lines"], "spotify_album_name": "Tidal Signals",
+                }],
+            }), encoding="utf-8")
+            import_manual_match_overrides(override, directory, cache, apply=True, replace_existing=True)
+            client = PublishingSpotifyClient({}, playlists=(playlist,))
+            manual = publish_spotify_playlists(
+                directory, report, client, "access-token", match_cache_path=cache,
+                publish_state_cache_path=directory / "manual-state.json",
+            )
+            self.assertEqual(
+                (manual.decisions[0].match_source, manual.decisions[0].status, manual.decisions[0].spotify_uri),
+                ("cache", "added", "spotify:track:manually-verified"),
+            )
+            self.assertEqual(client.add_calls, [("house", ("spotify:track:manually-verified",), None)])
+            self.assertEqual(client.searches, [])
+
+    def test_publish_edition_tie_keeps_manual_override_after_a_mixed_run_conflict(self):
+        from publishers.spotify.manual_matches import import_manual_match_overrides
+
+        north = playlist_row("111", "Tidal Signals", "North Bridge", "Harbour Lines")
+        south = playlist_row("222", "Tidal Signals", "South Bridge", "Harbour Lines")
+        north_copies, south_copies = overlapping_edition_candidates(north, south)
+        shared_uri = south_copies[1].uri
+        north_query = 'track:"North Bridge" artist:"Harbour Lines" album:"Tidal Signals"'
+        playlist = SpotifyPlaylist(playlist_id="house", name="House", url="", owner_id="current-user")
+        flag = "album_hint_recording_conflict"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            master = directory / "House" / "House.csv"
+            cache = directory / "matches.json"
+            write_playlist_master(master, [south])
+            override = directory / "manual.json"
+            override.write_text(json.dumps({
+                "schema_version": 1,
+                "record_type": "spotify_manual_match_overrides",
+                "matches": [{
+                    "release_id": "222", "track_number": "1", "artist_name": "Harbour Lines",
+                    "album_name": "Tidal Signals", "track_name": "South Bridge",
+                    "spotify_uri": shared_uri, "spotify_track_name": "South Bridge",
+                    "spotify_artist_names": ["Harbour Lines"], "spotify_album_name": "Tidal Signals",
+                    "spotify_album_id": "shared-album",
+                }],
+            }), encoding="utf-8")
+            import_manual_match_overrides(override, directory, cache, apply=True)
+            recording_key = "222|1|harbour lines|tidal signals|south bridge"
+
+            def publish_fixture(label: str):
+                client = PublishingSpotifyClient({north_query: north_copies}, playlists=(playlist,))
+                result = publish_spotify_playlists(
+                    directory, directory / f"{label}-report.txt", client, "access-token", match_cache_path=cache,
+                    publish_state_cache_path=directory / f"{label}-state.json",
+                )
+                return result, client
+
+            before, client = publish_fixture("manual-first")
+            self.assertEqual((before.decisions[0].match_source, before.decisions[0].spotify_uri), ("cache", shared_uri))
+            self.assertEqual(client.add_calls, [("house", (shared_uri,), None)])
+
+            write_playlist_master(master, [north, south])
+            mixed, client = publish_fixture("mixed")
+            self.assertEqual([(item.status, item.spotify_uri) for item in mixed.decisions],
+                             [("added", north_copies[0].uri), ("ambiguous", "")])
+            self.assertEqual(client.add_calls, [("house", (north_copies[0].uri,), None)])
+            with self.subTest("mixed run preserves the manual record"):
+                self.assertNotIn(flag, load_spotify_track_match_cache(cache)[recording_key])
+
+            write_playlist_master(master, [south])
+            for legacy_flag in (False, True):
+                with self.subTest(legacy_flag=legacy_flag):
+                    if legacy_flag:
+                        records = load_spotify_track_match_cache(cache)
+                        records[recording_key][flag] = True
+                        records[recording_key]["recording_conflict_reason"] = "old automatic conflict"
+                        save_spotify_track_match_cache(cache, records)
+                    result, client = publish_fixture(f"manual-reload-{legacy_flag}")
+                    decision = result.decisions[0]
+                    self.assertEqual((decision.match_source, decision.status, decision.spotify_uri),
+                                     ("cache", "added", shared_uri))
+                    self.assertEqual(client.searches, [])
+                    self.assertEqual(client.add_calls, [("house", (shared_uri,), None)])
+                    record = load_spotify_track_match_cache(cache)[recording_key]
+                    self.assertEqual(record["match_status"], "manual")
+                    self.assertNotIn(flag, record)
+                    self.assertNotIn("recording_conflict_reason", record)
+
+    def test_publish_edition_tie_keeps_conflict_in_review_during_album_lookup(self):
+        rows = [
+            playlist_row("222", "Tidal Signals", title, "Harbour Lines", str(number))
+            for number, title in enumerate(("South Bridge", "Low Tide", "Far Shore"), start=1)
+        ]
+        first, second = recording_edition_candidates(rows[0])
+        cache_key = "222|1|harbour lines|tidal signals|south bridge"
+        record = saved_edition_match_record(rows[0], (first, second))
+        record.update({
+            "album_hint_recording_conflict": True,
+            ALBUM_RECOVERY_ATTEMPT_MATCHER_VERSION_FIELD: MATCHER_VERSION,
+            ALBUM_RECOVERY_ATTEMPT_ALBUM_IDS_FIELD: ["edition-a", "edition-b"],
+        })
+        album = SpotifyAlbumCandidate(
+            album_id="validated", uri="spotify:album:validated", name="Tidal Signals",
+            artists=("Harbour Lines",), total_tracks=3,
+        )
+        client = AlbumPublishingSpotifyClient((album,), {"validated": recording_edition_album_tracks(rows, "validated")})
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            write_playlist_master(directory / "House" / "House.csv", [rows[1], rows[0], rows[2]])
+            cache = directory / "matches.json"
+            save_spotify_track_match_cache(cache, {cache_key: record})
+            result = publish_spotify_playlists(
+                directory, directory / "report.txt", client, "access-token", match_cache_path=cache, apply=False,
+            )
+            saved = load_spotify_track_match_cache(cache)[cache_key]
+
+        self.assertEqual(client.album_track_requests, [("access-token", "validated")])
+        self.assertEqual(client.searches, [])
+        self.assertEqual(
+            [(decision.match_source, decision.status, decision.spotify_uri) for decision in result.decisions],
+            [("album", "would_add", "spotify:track:validated-2"), ("cache", "ambiguous", ""),
+             ("album", "would_add", "spotify:track:validated-3")],
+        )
+        self.assertNotIn(ALBUM_RECOVERY_ATTEMPT_MATCHER_VERSION_FIELD, saved)
+        self.assertNotIn(ALBUM_RECOVERY_ATTEMPT_ALBUM_IDS_FIELD, saved)
+
+    def test_publish_edition_tie_requires_same_identity_for_search_cache_and_album_hints(self):
+        rows = [
+            playlist_row("111", "Tidal Signals", name, "Band, Straße", str(index))
+            for index, name in enumerate(("After Light", "Low Tide", "Far Shore"), start=1)
+        ]
+        original, alternate = recording_edition_candidates(rows[0])
+        first = replace(original, artists=("Band", "Straße"))
+        second = replace(alternate, artists=("Band", "STRASSE"))
+        query = 'track:"After Light" artist:"Band, Straße" album:"Tidal Signals"'
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            master = directory / "House" / "House.csv"
+            write_playlist_master(master, rows[:1])
+            report_path = directory / "report.txt"
+            cache_path = directory / "matches.json"
+            search = {query: (first, second)}
+
+            fresh = publish_spotify_playlists(
+                directory, report_path, PublishingSpotifyClient(search), "access-token",
+                match_cache_path=cache_path, apply=False,
+            )
+            self.assertEqual(fresh.decisions[0].status, "ambiguous")
+            self.assertEqual(fresh.search_count, 1)
+
+            for with_siblings in (False, True):
+                with self.subTest(with_siblings=with_siblings):
+                    write_playlist_master(master, rows if with_siblings else rows[:1])
+                    cache_key = "111|1|band strae|tidal signals|after light"
+                    save_spotify_track_match_cache(cache_path, {
+                        cache_key: saved_edition_match_record(rows[0], (first, second)),
+                    })
+                    client = AlbumPublishingSpotifyClient(
+                        album_candidates=(),
+                        album_tracks_by_id={
+                            candidate.album_id: recording_edition_album_tracks(rows, candidate.album_id)
+                            for candidate in (first, second)
+                        },
+                        candidates_by_query=search,
+                    )
+                    replay = publish_spotify_playlists(
+                        directory, report_path, client, "access-token", match_cache_path=cache_path, apply=False,
+                    )
+                    self.assertEqual(client.album_track_requests, [])
+                    self.assertIn(("access-token", query, 10), client.searches)
+                    self.assertEqual((replay.decisions[0].status, replay.decisions[0].spotify_uri), ("ambiguous", ""))
+
+    def test_publish_edition_tie_preserves_competing_album_hints(self):
+        rows = [
+            playlist_row("111", "Tidal Signals", name, "Harbour Lines", str(index))
+            for index, name in enumerate(("After Light", "Low Tide", "Far Shore"), start=1)
+        ]
+        first, second = recording_edition_candidates(rows[0])
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            master = directory / "House" / "House.csv"
+            write_playlist_master(master, rows[:1])
+            cache_path = directory / "matches.json"
+            report_path = directory / "report.txt"
+            fresh_client = PublishingSpotifyClient({
+                'track:"After Light" artist:"Harbour Lines" album:"Tidal Signals"': (second, first),
+            })
+            publish_spotify_playlists(
+                directory, report_path, fresh_client, "access-token", match_cache_path=cache_path, apply=False,
+            )
+            write_playlist_master(master, rows)
+            album_client = AlbumPublishingSpotifyClient(
+                album_candidates=(),
+                album_tracks_by_id={
+                    candidate.album_id: recording_edition_album_tracks(rows, candidate.album_id)
+                    for candidate in (first, second)
+                },
+            )
+
+            result = publish_spotify_playlists(
+                directory, report_path, album_client, "access-token", match_cache_path=cache_path, apply=False,
+            )
+
+            self.assertEqual(album_client.album_searches, [("access-token", 'album:"Tidal Signals"', 10)])
+            self.assertCountEqual(
+                album_client.album_track_requests, [("access-token", "edition-a"), ("access-token", "edition-b")],
+            )
+            self.assertEqual(result.decisions[0].match_source, "cache")
+            self.assertEqual(result.decisions[0].spotify_uri, first.uri)
+            self.assertEqual([decision.status for decision in result.decisions[1:]], ["unmatched", "unmatched"])
+            self.assertIn(
+                "2 Spotify album editions passed sequence validation",
+                report_path.read_text(encoding="utf-8"),
+            )
+
+    def test_publish_edition_proof_rejects_stale_album_hints(self):
+        saved_rows = [
+            playlist_row("111", "Tidal Signals 海", name, "Harbour Lines 航", str(index))
+            for index, name in enumerate(("After Light 夜", "Low Tide", "Far Shore"), start=1)
+        ]
+        saved_row = saved_rows[0]
+        edition_records = [
+            {
+                "spotify_uri": candidate.uri, "spotify_track_name": candidate.name,
+                "spotify_artist_names": list(candidate.artists), "spotify_album_name": candidate.album_name,
+                "spotify_album_id": candidate.album_id, "spotify_isrc": candidate.isrc,
+            }
+            for candidate in recording_edition_candidates(saved_row)
+        ]
+        cases = (
+            ("title", {"Track Name": "After Light 日"}, MATCHER_VERSION, False),
+            ("artist", {"Artist Name": "Harbour Lines 船"}, MATCHER_VERSION, False),
+            ("album", {"Album Name": "Tidal Signals 山"}, MATCHER_VERSION, False),
+            ("matcher version", {}, MATCHER_VERSION - 1, False),
+            ("sole stale attempt marker", {"Track Name": "After Light 日"}, MATCHER_VERSION, True),
+        )
+        for label, corrections, version, with_ordinary_hint in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary_directory:
+                directory = Path(temporary_directory)
+                current_row = {**saved_row, **corrections}
+                current_rows = [current_row, *saved_rows[1:]]
+                write_playlist_master(directory / "House" / "House.csv", current_rows)
+                cache_path = directory / "matches.json"
+                cache_record = cached_negative_match_record(
+                    saved_row, (), attempted_album_ids=("ordinary-edition",) if with_ordinary_hint else (),
+                )
+                cache_record.update({
+                    **edition_records[0],
+                    "matcher_version": version, "match_status": "matched",
+                    "match_strategy": "same_recording_edition", "version_sensitive": True,
+                    "review_candidates": edition_records,
+                })
+                records = {"111|1|harbour lines|tidal signals|after light": cache_record}
+                album_tracks = {"edition-a": recording_edition_album_tracks(saved_rows, "edition-a"), "edition-b": ()}
+                if with_ordinary_hint:
+                    records["111|2|harbour lines|tidal signals|low tide"] = cached_negative_match_record(
+                        saved_rows[1], ("ordinary-edition",),
+                    )
+                    album_tracks["ordinary-edition"] = recording_edition_album_tracks(current_rows, "ordinary-edition")
+                save_spotify_track_match_cache(cache_path, records)
+                query = (
+                    f'track:"{current_row["Track Name"]}" artist:"{current_row["Artist Name"]}" '
+                    f'album:"{current_row["Album Name"]}"'
+                )
+                client = AlbumPublishingSpotifyClient(
+                    album_candidates=(), album_tracks_by_id=album_tracks,
+                    candidates_by_query={query: (matching_candidate(current_row),)},
+                )
+
+                result = publish_spotify_playlists(
+                    directory, directory / "report.txt", client, "access-token",
+                    match_cache_path=cache_path, apply=False,
+                )
+
+                self.assertEqual(len(client.album_searches), 1)
+                if with_ordinary_hint:
+                    self.assertEqual(client.album_track_requests, [("access-token", "ordinary-edition")])
+                    self.assertEqual(client.searches, [])
+                    self.assertEqual(result.decisions[0].match_source, "album")
+                    self.assertEqual(result.decisions[0].spotify_uri, "spotify:track:ordinary-edition")
+                else:
+                    self.assertEqual(client.album_track_requests, [])
+                    self.assertIn(("access-token", query, 10), client.searches)
+                    self.assertEqual(result.decisions[0].match_source, "search")
+                    self.assertEqual(result.decisions[0].spotify_uri, "spotify:track:111")
 
     def test_publish_reason_keeps_spotify_original_annotation_match_evidence(self):
         track = PlaylistTrack(

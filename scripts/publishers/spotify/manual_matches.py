@@ -25,6 +25,7 @@ from publishers.spotify.match_cache import (  # noqa: E402
 from publishers.spotify.matching import (  # noqa: E402
     PlaylistTrack,
     build_spotify_track_search_query,
+    spotify_track_uri_is_structurally_valid,
 )
 from publishers.spotify.publish_playlist import read_playlist_tracks  # noqa: E402
 from shared.config_files import load_json_file, reject_unknown_keys  # noqa: E402
@@ -209,17 +210,6 @@ def load_manual_match_overrides(
             )
         )
     return tuple(overrides)
-
-
-def spotify_track_uri_is_structurally_valid(spotify_uri: str) -> bool:
-    segments = spotify_uri.split(":")
-    return bool(
-        len(segments) == 3
-        and segments[0] == "spotify"
-        and segments[1] == "track"
-        and segments[2]
-        and not any(character.isspace() for character in segments[2])
-    )
 
 
 def required_text(

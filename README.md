@@ -376,13 +376,32 @@ python3 scripts/publishers/spotify/publish_playlist.py \
   --publisher-sync-mode append
 ```
 
-In append mode, the publisher fetches the existing Spotify playlist first. It
-uses Spotify-visible metadata to avoid duplicates: target playlist, artist,
-album, and track. A row is reported as `already_present` when the same artist,
-album, and track already exist in the target playlist, even if the current match
-has a different Spotify URI. Duplicate artist, album, and track matches inside
-the same source run are skipped and reported. The same artist and track can
-still be added when it appears on a different album.
+In append mode, the publisher fetches the existing Spotify playlist first. For
+ordinary matches, it reports `already_present` when the same artists, album,
+and track already exist in the target playlist, even with a different Spotify
+URI. For a resolved edition tie, the existing URI must belong to the proven
+group. The report names that existing URI, including when Spotify returns it
+without track metadata. When the publisher finds no proven existing copy, a
+complete identity match outside the group sends the row to review.
+Conflicting complete playlist metadata for a proven URI also sends the row
+to review.
+
+The publisher skips and reports duplicate artist, album, and track matches
+within the same source run.
+When either match came from an edition tie, a duplicate also requires a
+shared Spotify URI. An ordinary match contributes its selected URI and an
+edition match contributes its proven group. A later conflicting row stays in
+review, including when both matches share a URI and give different ISRCs.
+The same artist and track can still be added when it appears on a different
+album.
+
+An edition match checks every URI in its proven group against recording
+observations from earlier source rows. A conflict sends the later row to review
+and excludes its cached match from album recovery. The row stays in review on
+later runs, even when only that row is selected. An explicit match-cache
+refresh or manual override can revisit it. Append still checks planned and
+existing playlist items for conflicts. Replace stops before writing when a
+source conflict sends a row to review.
 
 Append mode is source-aware. If a track is missing from Spotify but the
 publish-state cache shows that the publisher already knew that track for the
@@ -620,7 +639,20 @@ comma-separated artist lists, plain `artist title` text, and the existing
 as token separators before comparing track, artist, and album text, so curly
 apostrophes and long dashes behave like their ASCII forms. This normalization
 still requires all words to match. Only the explicit title fallbacks below may
-remove or add text. A separate letter-number spacing rule can match titles such
+remove or add text.
+
+When track search ties at the track, artist, and album tier, the publisher
+checks every observation of the tied URIs. Each must match the full Discogs
+title, artist credits, and album name, preserving punctuation and version text.
+The copies must have distinct Spotify album IDs, the same valid ISRC, and the
+same playlist identity. The publisher excludes unavailable copies, prefers
+ones Spotify marks playable, and breaks any remaining tie by URI. Missing
+playability leaves market availability unknown. Incomplete or conflicting
+recording evidence leaves the tie in review. Before applying a newly resolved
+edition tie, independently verify that the Spotify recording matches the track
+on the Discogs release.
+
+A separate letter-number spacing rule can match titles such
 as `Chroma001 Helium` and `CHROMA 001 HELIUM`. The albums must also match under
 that rule, and every Discogs artist must appear in Spotify's artist list. One
 qualifying candidate is matched; multiple candidates remain ambiguous. When a
@@ -684,10 +716,15 @@ Later runs reuse those decisions instead of searching Spotify again. Search
 errors are not cached, since they usually mean Spotify or the network failed
 temporarily. Typo-derived matches, position-derived album matches,
 letter-number spacing matches, Spotify Original annotation matches, albums
-recovered from cached track candidates, and version substitutes are
-version-sensitive.
+recovered from cached track candidates, version substitutes, and resolved
+edition ties are version-sensitive.
 A matcher update can recheck them without invalidating ordinary exact matches.
 Album cache records keep the Spotify album ID and the match strategy for audit.
+For a resolved edition tie, the cache keeps the chosen URI and every proven
+copy. The publisher checks the current matcher version and the source title,
+artist credits, and album name before reusing that evidence for matching,
+append, or album lookup. Older ambiguous records can lack the ISRCs needed to
+resolve an edition tie.
 To recheck every row and replace cached decisions with fresh Spotify results
 without writing playlist changes to Spotify, run:
 

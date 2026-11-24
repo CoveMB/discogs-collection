@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field, replace
 
 
 MATCHED = "matched"
@@ -46,6 +47,7 @@ CONSTRAINED_TYPO_MATCH_REASON_PREFIX = "track title matched by constrained typo 
 ALPHANUMERIC_SPACING_MATCH_REASON = "track and album matched after normalizing letter-number spacing"
 ALPHANUMERIC_SPACING_MATCH_STRATEGY = "alphanumeric_spacing"
 VERSION_SUBSTITUTE_MATCH_STRATEGY = "version_substitute"
+SAME_RECORDING_EDITION_MATCH_STRATEGY = "same_recording_edition"
 TRAILING_ENCLOSED_VERSION_PATTERN = re.compile(
     r"\s*[\(\[]\s*(?P<label>remaster(?:ed)?|live|(?:radio\s+)?edit)\s*[\)\]]\s*$",
     re.IGNORECASE,
@@ -91,12 +93,42 @@ class PlaylistTrack:
 
 
 @dataclass(frozen=True)
+class SpotifyRecordingMetadata:
+    title: str
+    artist_names: tuple[str, ...]
+    album_name: str
+    album_id: str
+
+    def conflicts_with(self, other: SpotifyRecordingMetadata) -> bool:
+        return any(
+            left and right and left != right
+            for left, right in (
+                (self.title, other.title),
+                (self.artist_names, other.artist_names),
+                (self.album_name, other.album_name),
+                (self.album_id, other.album_id),
+            )
+        )
+
+
+@dataclass(frozen=True)
 class SpotifyTrackCandidate:
     uri: str
     name: str
     artists: tuple[str, ...]
     album_name: str
     album_id: str = ""
+    isrc: str = ""
+    is_playable: bool | None = None
+    has_complete_recording_metadata: bool = field(default=True, compare=False)
+    observed_recording_metadata: SpotifyRecordingMetadata | None = field(default=None, compare=False)
+
+    def recording_metadata(self) -> SpotifyRecordingMetadata:
+        if self.observed_recording_metadata is not None:
+            return self.observed_recording_metadata
+        return spotify_recording_metadata_from_values(
+            title=self.name, artist_names=self.artists, album_name=self.album_name, album_id=self.album_id,
+        )
 
 
 @dataclass(frozen=True)
@@ -527,6 +559,141 @@ def choose_best_track_match(
     )
 
 
+def resolve_spotify_edition_tie(
+    decision: TrackMatchDecision,
+    observed_candidates: Sequence[SpotifyTrackCandidate],
+) -> TrackMatchDecision:
+    if decision.status != AMBIGUOUS:
+        return decision
+    track = decision.track
+    winning_uris = {candidate.uri for candidate in decision.review_candidates}
+    if (
+        len(winning_uris) < 2
+        or not all(candidate_matches_track(track, candidate) for candidate in decision.review_candidates)
+        or not all(spotify_track_uri_is_structurally_valid(uri) for uri in winning_uris)
+        or {
+            candidate.uri for candidate in observed_candidates
+            if candidate.name and candidate_matches_track(track, candidate)
+        } != winning_uris
+    ):
+        return decision
+
+    winning_observations = tuple(candidate for candidate in observed_candidates if candidate.uri in winning_uris)
+    if len({spotify_candidate_identity_key(track.playlist_name, candidate) for candidate in winning_observations}) != 1:
+        return decision
+
+    source_title = normalize_recording_evidence_text(track.track_name)
+    source_album = normalize_recording_evidence_text(track.album_name)
+    source_artist_names = split_source_artist_names(track.artist_name) or (track.artist_name,)
+    source_artists = sorted(normalize_recording_evidence_text(artist) for artist in source_artist_names)
+    if not source_title or not source_album or not all(source_artists):
+        return decision
+
+    candidates_by_uri: dict[str, SpotifyTrackCandidate] = {}
+    recording_isrc = ""
+    for candidate in winning_observations:
+        isrc = normalize_spotify_isrc(candidate.isrc)
+        album_id = candidate.album_id.strip()
+        if (
+            not candidate.has_complete_recording_metadata
+            or not isrc
+            or (recording_isrc and isrc != recording_isrc)
+            or not album_id
+            or normalize_recording_evidence_text(candidate.name) != source_title
+            or normalize_recording_evidence_text(candidate.album_name) != source_album
+            or sorted(normalize_recording_evidence_text(artist) for artist in candidate.artists) != source_artists
+        ):
+            return decision
+        recording_isrc = isrc
+        previous = candidates_by_uri.get(candidate.uri)
+        if previous is None:
+            candidates_by_uri[candidate.uri] = replace(candidate, album_id=album_id, isrc=isrc)
+        elif previous.album_id != album_id or (
+            previous.is_playable is not None
+            and candidate.is_playable is not None
+            and previous.is_playable != candidate.is_playable
+        ):
+            return decision
+        elif previous.is_playable is None and candidate.is_playable is not None:
+            candidates_by_uri[candidate.uri] = replace(previous, is_playable=candidate.is_playable)
+
+    cohort = tuple(candidates_by_uri[candidate.uri] for candidate in decision.review_candidates)
+    if len({candidate.album_id for candidate in cohort}) != len(cohort):
+        return decision
+    selected = min(
+        (candidate for candidate in cohort if candidate.is_playable is not False),
+        key=lambda candidate: (candidate.is_playable is not True, candidate.uri),
+        default=None,
+    )
+    if selected is None:
+        return decision
+    return replace(
+        decision,
+        status=MATCHED,
+        spotify_uri=selected.uri,
+        reason="same recording across Spotify editions with matching track title, artists, and album",
+        candidate=selected,
+        review_candidates=cohort,
+        match_strategy=SAME_RECORDING_EDITION_MATCH_STRATEGY,
+    )
+
+
+def normalize_spotify_isrc(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    code = value.strip()
+    if re.fullmatch(r"[A-Z]{2}[A-Z0-9]{3}[0-9]{7}", code, flags=re.ASCII | re.IGNORECASE):
+        return code.upper()
+    return ""
+
+
+def spotify_recording_metadata_is_complete(
+    *,
+    uri: object,
+    title: object,
+    artist_names: object,
+    album_name: object,
+    album_id: object,
+) -> bool:
+    return (
+        all(isinstance(value, str) and bool(value.strip()) for value in (uri, title, album_name, album_id))
+        and isinstance(artist_names, (list, tuple))
+        and bool(artist_names)
+        and all(isinstance(artist, str) and bool(artist.strip()) for artist in artist_names)
+    )
+
+
+def spotify_recording_metadata_from_values(
+    *,
+    title: object,
+    artist_names: object,
+    album_name: object,
+    album_id: object,
+) -> SpotifyRecordingMetadata:
+    artists: tuple[str, ...] = ()
+    if isinstance(artist_names, (list, tuple)) and all(
+        isinstance(artist, str) and artist.strip() for artist in artist_names
+    ):
+        artists = tuple(sorted(normalize_recording_evidence_text(artist) for artist in artist_names))
+    return SpotifyRecordingMetadata(
+        title=normalize_recording_evidence_text(title) if isinstance(title, str) else "",
+        artist_names=artists,
+        album_name=normalize_recording_evidence_text(album_name) if isinstance(album_name, str) else "",
+        album_id=album_id.strip() if isinstance(album_id, str) else "",
+    )
+
+
+def spotify_track_uri_is_structurally_valid(spotify_uri: str) -> bool:
+    segments = spotify_uri.split(":")
+    return bool(
+        len(segments) == 3
+        and segments[0] == "spotify"
+        and segments[1] == "track"
+        and segments[2]
+        and not any(character.isspace() for character in segments[2])
+    )
+
+
 def deduplicate_spotify_track_candidates(
     candidates: tuple[SpotifyTrackCandidate, ...],
 ) -> tuple[SpotifyTrackCandidate, ...]:
@@ -886,6 +1053,19 @@ def normalized_artist_in_candidates(artist_name: str, candidate_artists: tuple[s
     return bool(artist_key) and artist_key in {normalize_music_text(artist) for artist in candidate_artists}
 
 
+def normalize_recording_evidence_text(value: str) -> str:
+    text = unicodedata.normalize("NFC", value).casefold()
+    return " ".join(unicodedata.normalize("NFC", text).split())
+
+
+def recording_proof_source_matches(track: PlaylistTrack, *, title: str, artist: str, album: str) -> bool:
+    return all(
+        bool(source_text := normalize_recording_evidence_text(source))
+        and source_text == normalize_recording_evidence_text(saved)
+        for source, saved in ((track.track_name, title), (track.artist_name, artist), (track.album_name, album))
+    )
+
+
 def normalize_music_text(value: str) -> str:
     normalized = unicodedata.normalize("NFKD", value)
     punctuation_separated = "".join(
@@ -898,6 +1078,42 @@ def normalize_music_text(value: str) -> str:
     ascii_text = punctuation_separated.encode("ascii", "ignore").decode("ascii")
     ascii_text = re.sub(r"[^a-zA-Z0-9]+", " ", ascii_text.casefold())
     return re.sub(r"\s+", " ", ascii_text).strip()
+
+
+def spotify_candidate_identity_key(target_playlist_name: str, candidate: SpotifyTrackCandidate) -> str:
+    return spotify_track_identity_key(
+        target_playlist_name=target_playlist_name,
+        artist_names=candidate.artists,
+        album_name=candidate.album_name,
+        track_name=candidate.name,
+    )
+
+
+def spotify_track_identity_key(
+    target_playlist_name: str,
+    artist_names: Sequence[str],
+    album_name: str,
+    track_name: str,
+) -> str:
+    normalized_artists = normalized_identity_artists(artist_names)
+    return "|".join(
+        (
+            normalize_music_text(target_playlist_name),
+            " ".join(normalized_artists),
+            normalize_music_text(album_name),
+            normalize_music_text(track_name),
+        )
+    )
+
+
+def normalized_identity_artists(artist_names: Sequence[str]) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            normalized_artist
+            for normalized_artist in (normalize_music_text(artist_name) for artist_name in artist_names)
+            if normalized_artist
+        )
+    )
 
 
 def normalize_alphanumeric_spacing(value: str) -> str:
