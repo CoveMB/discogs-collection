@@ -11,6 +11,8 @@ playlist CSVs, can publish matched tracks to Spotify, and still supports
 explicit dry-run previews. It can resolve exact track-search ties between
 Spotify editions whose full source metadata agrees and whose ISRC is shared.
 Append uses the proven group of Spotify URIs to recognize an existing copy.
+For eligible unmatched tracks, the publisher makes one base-title search and
+shows the new candidates for manual review. Those tracks stay unmatched.
 The standalone publisher supports optional finite,
 non-negative request spacing, defaults to no added delay, and reports actual
 Web API attempts separately from searches. It retains bounded retries and
