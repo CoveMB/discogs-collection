@@ -821,6 +821,10 @@ An applied manual match remains authoritative across matcher updates. The
 importer refuses to replace a different matched or manual Spotify URI unless
 you also pass `--replace-existing`.
 
+For a bounded Spotify track search, the client waits one second after HTTP
+`502` and retries the same query once. The retry counts as an extra Web API
+attempt within that search. A second `502` ends the search with an error.
+
 In bounded mode, if Spotify rate-limits a request, the client waits and retries. It honors
 finite positive `Retry-After` seconds, and uses a 60-second wait when the
 header is missing or unusable, including zero, negative or non-finite values.

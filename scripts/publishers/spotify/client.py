@@ -418,7 +418,13 @@ class SpotifyClient:
             raise SpotifyApiError(f"Spotify playlist replace items failed with status {response.status}: {response.body}")
         json.loads(response.body or "{}")
 
-    def request_with_rate_limit_retries(self, request: HttpRequest, operation_name: str = "spotify_search") -> HttpResponse:
+    def request_with_rate_limit_retries(
+        self, request: HttpRequest, operation_name: str | None = None,
+    ) -> HttpResponse:
+        can_retry_bad_gateway = request.method == "GET" and operation_name == "spotify_search"
+        # Keep the legacy diagnostics for direct callers that omit the operation.
+        if operation_name is None:
+            operation_name = "spotify_search"
         max_retries = max(0, self.retry_policy.max_rate_limit_retries)
         attempt_number = 0
         rate_limit_retries = 0
@@ -463,6 +469,10 @@ class SpotifyClient:
             if response.status != 429:
                 if self.request_control.continuous:
                     self.validate_continuous_response(response, operation_name)
+                elif response.status == 502 and can_retry_bad_gateway:
+                    can_retry_bad_gateway = False
+                    self.sleep(1.0)
+                    continue
                 return response
             if rate_limit_retries >= max_retries:
                 wait_seconds = self.retry_policy.rate_limit_wait_seconds(response.headers)
