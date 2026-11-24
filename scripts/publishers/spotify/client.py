@@ -12,7 +12,12 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Protocol
 
-from publishers.spotify.matching import SpotifyTrackCandidate
+from publishers.spotify.matching import (
+    SpotifyTrackCandidate,
+    normalize_spotify_isrc,
+    spotify_recording_metadata_from_values,
+    spotify_recording_metadata_is_complete,
+)
 from publishers.spotify.release_matching import SpotifyAlbumCandidate, SpotifyAlbumTrack
 from publishers.spotify.request_control import SpotifyRateLimitInfo, SpotifyRequestControl, parse_retry_after
 from shared.debug_log import DebugLog
@@ -502,7 +507,9 @@ class SpotifyClient:
             item_count = len(page["items"])
             parsed_count = item_count
             if operation_name == "spotify_search":
-                parsed_count = len(parse_search_track_candidates(response.body))
+                parsed_count = sum(
+                    1 for candidate in parse_search_track_candidates(response.body) if candidate.name
+                )
             elif operation_name == "spotify_album_search":
                 parsed_count = len(parse_search_album_candidates(response.body))
             elif operation_name == "spotify_album_tracks":
@@ -539,25 +546,42 @@ def parse_search_track_candidates(body: str) -> tuple[SpotifyTrackCandidate, ...
     for item in items:
         if not isinstance(item, dict):
             continue
-        uri = clean_cell(item.get("uri"))
-        name = clean_cell(item.get("name"))
+        raw_uri = item.get("uri")
+        raw_name = item.get("name")
+        uri = clean_cell(raw_uri)
+        name = clean_cell(raw_name)
         album = item.get("album", {})
-        artists = item.get("artists", [])
-        album_name = clean_cell(album.get("name")) if isinstance(album, dict) else ""
-        album_id = clean_cell(album.get("id")) if isinstance(album, dict) else ""
-        artist_names = tuple(
-            clean_cell(artist.get("name"))
-            for artist in artists
-            if isinstance(artist, dict) and clean_cell(artist.get("name"))
-        )
-        if uri and name:
+        artists = item.get("artists")
+        raw_album_name = album.get("name") if isinstance(album, dict) else None
+        raw_album_id = album.get("id") if isinstance(album, dict) else None
+        raw_artist_names = tuple(
+            artist.get("name") if isinstance(artist, dict) else None for artist in artists
+        ) if isinstance(artists, list) else ()
+        artist_names = tuple(artist_name for raw_artist in raw_artist_names if (artist_name := clean_cell(raw_artist)))
+        if uri:
+            external_ids = item.get("external_ids")
+            restrictions = item.get("restrictions")
+            restriction_reason = restrictions.get("reason") if isinstance(restrictions, dict) else None
+            is_playable = item.get("is_playable")
+            if isinstance(restriction_reason, str) and restriction_reason.strip():
+                is_playable = False
             candidates.append(
                 SpotifyTrackCandidate(
                     uri=uri,
                     name=name,
                     artists=artist_names,
-                    album_name=album_name,
-                    album_id=album_id,
+                    album_name=clean_cell(raw_album_name),
+                    album_id=clean_cell(raw_album_id),
+                    isrc=normalize_spotify_isrc(external_ids.get("isrc")) if isinstance(external_ids, dict) else "",
+                    is_playable=is_playable if isinstance(is_playable, bool) else None,
+                    has_complete_recording_metadata=spotify_recording_metadata_is_complete(
+                        uri=raw_uri, title=raw_name, artist_names=raw_artist_names,
+                        album_name=raw_album_name, album_id=raw_album_id,
+                    ),
+                    observed_recording_metadata=spotify_recording_metadata_from_values(
+                        title=raw_name, artist_names=raw_artist_names,
+                        album_name=raw_album_name, album_id=raw_album_id,
+                    ),
                 )
             )
     return tuple(candidates)

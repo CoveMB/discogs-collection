@@ -336,6 +336,46 @@ class SpotifyClientTests(unittest.TestCase):
             ),
         )
 
+    def test_search_parses_optional_edition_evidence(self):
+        candidate_fields = (
+            {"external_ids": {"isrc": " usaaa2600001 "}, "is_playable": True},
+            {"external_ids": {"isrc": "invalid"}, "is_playable": False},
+            {"external_ids": {"isrc": 123456789012}, "is_playable": "true"},
+            {"external_ids": {"isrc": "UſAAA2600001"}, "is_playable": 0},
+            {},
+            {"restrictions": {"reason": "market"}},
+            {"restrictions": {"reason": "product"}, "is_playable": True},
+        )
+        items = [
+            {
+                "uri": f"spotify:track:copy{index}",
+                "name": "After Light",
+                "artists": [{"name": "Harbour Lines"}],
+                "album": {"id": f"edition{index}", "name": "Tidal Signals"},
+                **fields,
+            }
+            for index, fields in enumerate(candidate_fields)
+        ]
+        captured_requests: list[HttpRequest] = []
+
+        def transport(request: HttpRequest) -> HttpResponse:
+            captured_requests.append(request)
+            return HttpResponse(200, {}, json.dumps({"tracks": {"items": items}}))
+
+        candidates = SpotifyClient(transport=transport).search_tracks(
+            "access-token", 'track:"After Light"', limit=7,
+        )
+
+        self.assertEqual(
+            [(request.method, request.url) for request in captured_requests],
+            [("GET", "https://api.spotify.com/v1/search?q=track%3A%22After+Light%22&type=track&limit=7")],
+        )
+        self.assertEqual(
+            [(candidate.isrc, candidate.is_playable) for candidate in candidates],
+            [("USAAA2600001", True), ("", False), ("", None), ("", None),
+             ("", None), ("", False), ("", False)],
+        )
+
     def test_get_album_tracks_reads_order_and_playability_across_pages(self):
         captured_requests = []
         responses = [

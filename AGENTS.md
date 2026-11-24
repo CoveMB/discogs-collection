@@ -8,7 +8,10 @@ genre metadata from Discogs, maps those terms to local playlist labels, exports
 TuneMyMusic-style master CSV files per playlist, and creates split CSVs for
 playlist import batches. The optional Spotify publisher starts from those
 playlist CSVs, can publish matched tracks to Spotify, and still supports
-explicit dry-run previews. The standalone publisher supports optional finite,
+explicit dry-run previews. It can resolve exact track-search ties between
+Spotify editions whose full source metadata agrees and whose ISRC is shared.
+Append uses the proven group of Spotify URIs to recognize an existing copy.
+The standalone publisher supports optional finite,
 non-negative request spacing, defaults to no added delay, and reports actual
 Web API attempts separately from searches. It retains bounded retries and
 existing wrapper defaults. Opt-in standalone continuous append (including

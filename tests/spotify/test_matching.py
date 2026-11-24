@@ -1,5 +1,6 @@
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 
@@ -14,6 +15,7 @@ from publishers.spotify.matching import (
     build_spotify_track_search_query,
     choose_best_track_match,
     normalize_music_text,
+    resolve_spotify_edition_tie,
 )
 
 
@@ -1597,6 +1599,97 @@ class SpotifyMatchingTests(unittest.TestCase):
         self.assertEqual(decision.review_candidates, candidates)
         self.assertEqual(decision.search_queries, search_queries)
         self.assertEqual(decision.match_strategy, "")
+
+    def test_same_recording_edition_tie_selects_playable_copy_stably(self):
+        track = source_track(
+            track_name="Áfter Light 現場", artist_name="Harbour Lines, Nami", album_name="Tidal Signals",
+        )
+        first = SpotifyTrackCandidate(
+            uri="spotify:track:alpha",
+            name="A\u0301fter  Light 現場",
+            artists=("Nami", "Harbour Lines"),
+            album_name="Tidal Signals",
+            album_id="edition-a",
+            isrc="USAAA2600001",
+        )
+        second = replace(
+            first, uri="spotify:track:zulu", album_id="edition-b",
+            name="áfter light 現場", artists=("harbour lines", "nami"),
+        )
+        search_queries = ('track:"Áfter Light 現場"',)
+        cases = (
+            ("known playable", (first, replace(second, is_playable=True)), second.uri, True),
+            ("known unavailable", (replace(first, is_playable=False), second), second.uri, None),
+            ("unknowns", (first, second), first.uri, None),
+            ("reversed unknowns", (second, first), first.uri, None),
+            ("later unavailable", (first, second, replace(first, is_playable=False)), second.uri, None),
+            ("later playable", (first, second, replace(second, is_playable=True)), second.uri, True),
+        )
+        for label, observations, expected_uri, expected_playable in cases:
+            with self.subTest(label=label):
+                ambiguity = choose_best_track_match(track, observations, search_queries)
+                resolved = resolve_spotify_edition_tie(ambiguity, observations)
+
+                self.assertEqual(ambiguity.status, "ambiguous")
+                self.assertEqual(resolved.status, "matched")
+                self.assertEqual(resolved.match_strategy, "same_recording_edition")
+                self.assertEqual(resolved.spotify_uri, expected_uri)
+                self.assertIsNotNone(resolved.candidate)
+                assert resolved.candidate is not None
+                self.assertIs(resolved.candidate.is_playable, expected_playable)
+                self.assertEqual(resolved.search_queries, search_queries)
+                self.assertEqual(
+                    [candidate.uri for candidate in resolved.review_candidates],
+                    [candidate.uri for candidate in ambiguity.review_candidates],
+                )
+
+    def test_same_recording_edition_tie_retains_conflicting_evidence(self):
+        track = source_track(
+            track_name="After Light (Live) 夜", artist_name="Harbour Lines, Nami",
+            album_name="Tidal Signals 海",
+        )
+        first = SpotifyTrackCandidate(
+            uri="spotify:track:alpha",
+            name=track.track_name,
+            artists=("Harbour Lines", "Nami"),
+            album_name=track.album_name,
+            album_id="edition-a",
+            isrc="USAAA2600001",
+        )
+        second = replace(first, uri="spotify:track:zulu", album_id="edition-b")
+        cases = (
+            ("different ISRC", (first, replace(second, isrc="USAAA2600002"))),
+            ("missing ISRC", (first, replace(second, isrc=""))),
+            ("lookalike ISRC", (first, replace(second, isrc="UſAAA2600001"))),
+            ("different album tier", (
+                replace(first, album_name="Another Album"), replace(second, album_name="Another Album"),
+            )),
+            ("missing album ID", (first, replace(second, album_id=""))),
+            ("shared album ID", (first, replace(second, album_id="edition-a"))),
+            ("partial artist credit", (first, replace(second, artists=("Harbour Lines",)))),
+            ("changed version punctuation", (first, replace(second, name="After Light [Live] 夜"))),
+            ("changed Unicode title", (first, replace(second, name="After Light (Live) 日"))),
+            ("changed Unicode album", (first, replace(second, album_name="Tidal Signals 山"))),
+            ("all unavailable", (replace(first, is_playable=False), replace(second, is_playable=False))),
+            ("changed observed ID", (first, second, replace(first, isrc="USAAA2600002"))),
+            ("changed observed album", (first, second, replace(first, album_id="edition-c"))),
+            ("changed observed credit", (first, second, replace(first, artists=("Harbour Lines",)))),
+            ("conflicting playability", (
+                replace(first, is_playable=True), second, replace(first, is_playable=False),
+            )),
+            ("episode URI", (replace(first, uri="spotify:episode:alpha"), second)),
+            ("empty track URI suffix", (replace(first, uri="spotify:track:"), second)),
+        )
+        for label, observations in cases:
+            with self.subTest(label=label):
+                ambiguity = choose_best_track_match(track, observations)
+
+                self.assertEqual(ambiguity.status, "ambiguous")
+                self.assertIs(resolve_spotify_edition_tie(ambiguity, observations), ambiguity)
+
+        ordinary = choose_best_track_match(track, (first,))
+        self.assertEqual(ordinary.status, "matched")
+        self.assertIs(resolve_spotify_edition_tie(ordinary, (first, second)), ordinary)
 
     def test_accepts_tightly_constrained_title_typos(self):
         cases = (
