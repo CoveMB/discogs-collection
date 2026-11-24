@@ -109,7 +109,7 @@ def write_publish_report(path: Path, summary: SpotifyPublishSummary) -> None:
                 f"- Spotify searches: {summary.search_count}",
                 f"- Web API attempts: {summary.request_count if summary.request_count is not None else 'unavailable'}",
                 f"- Token refresh attempts: {summary.token_refresh_count if summary.token_refresh_count is not None else 'unavailable'}",
-                f"- Rows searched with ladder: {summary.searched_row_count}",
+                f"- Rows searched: {summary.searched_row_count}",
                 f"- Cached matched tracks: {cached_matched_publish_decision_count(summary.decisions)}",
                 f"- Cached ambiguous tracks: {count_publish_decisions(summary.decisions, MATCH_SOURCE_CACHE, {AMBIGUOUS})}",
                 f"- Cached unmatched tracks: {count_publish_decisions(summary.decisions, MATCH_SOURCE_CACHE, {UNMATCHED})}",
@@ -216,7 +216,12 @@ def format_publish_review_details(decision: PlaylistPublishDecision) -> list[str
         else:
             lines.append("  Matching Spotify candidates: none recorded")
         return lines
-    append_unmatched_candidate_diagnostics(lines, decision.track, decision.review_candidates)
+    ordinary_candidates = tuple(candidate for candidate in decision.review_candidates if not candidate.version_title_review_only)
+    append_unmatched_candidate_diagnostics(lines, decision.track, ordinary_candidates)
+    version_title_candidates = tuple(candidate for candidate in decision.review_candidates if candidate.version_title_review_only)
+    if version_title_candidates:
+        lines.append("  Version-title candidates for manual review:")
+        lines.extend(f"    - {format_spotify_candidate(candidate)}" for candidate in version_title_candidates)
     return lines
 
 

@@ -28,6 +28,7 @@ from publishers.spotify.matching import (
     resolve_spotify_edition_tie,
     spotify_recording_metadata_from_values,
     spotify_recording_metadata_is_complete,
+    with_version_title_review_candidates,
 )
 from publishers.spotify.release_matching import (
     ALBUM_ALPHANUMERIC_SPACING_MATCH_STRATEGY,
@@ -48,6 +49,7 @@ CACHEABLE_MATCH_STATUSES = {MATCHED, AMBIGUOUS, UNMATCHED}
 CONSTRAINED_TYPO_MATCH_STRATEGY = "constrained_title_typo"
 ALBUM_RECOVERY_ATTEMPT_MATCHER_VERSION_FIELD = "album_recovery_attempt_matcher_version"
 ALBUM_RECOVERY_ATTEMPT_ALBUM_IDS_FIELD = "album_recovery_attempt_album_ids"
+VERSION_TITLE_REVIEW_CANDIDATES_FIELD = "version_title_review_candidates"
 ALBUM_HINT_RECORDING_CONFLICT_FIELD = "album_hint_recording_conflict"
 RECORDING_CONFLICT_REASON_FIELD = "recording_conflict_reason"
 
@@ -217,7 +219,8 @@ def cached_review_decision(
 ) -> CachedSpotifyTrackMatch:
     has_recording_conflict = cache_record_has_recording_conflict(record)
     reason = clean_cell(record.get("match_reason")) or f"cached Spotify {match_status} decision"
-    review_candidates = review_candidates_from_cache_record(record)
+    saved_candidates = review_candidates_from_cache_record(record)
+    review_candidates = tuple(candidate for candidate in saved_candidates if not candidate.version_title_review_only)
     if has_recording_conflict:
         reason = clean_cell(record.get(RECORDING_CONFLICT_REASON_FIELD)) or "cached Spotify recording conflict requires review"
         if not review_candidates and (candidate := spotify_candidate_from_cache_record(record)):
@@ -226,19 +229,21 @@ def cached_review_decision(
         record["last_seen_at"] = seen_at
         if has_recording_conflict:
             record_cached_recording_conflict(record, reason)
-    return CachedSpotifyTrackMatch(
-        cache_key=cache_key,
-        decision=TrackMatchDecision(
-            track=track,
-            status=match_status,
-            spotify_uri="",
-            reason=reason,
-            candidate=None,
-            review_candidates=review_candidates,
-            search_queries=search_queries_from_cache_record(record),
-        ),
-        has_recording_conflict=has_recording_conflict,
+    decision = TrackMatchDecision(
+        track=track,
+        status=match_status,
+        spotify_uri="",
+        reason=reason,
+        review_candidates=review_candidates,
+        search_queries=search_queries_from_cache_record(record),
     )
+    if match_status == UNMATCHED:
+        version_title_candidates = (
+            *review_candidates_from_cache_record(record, field_name=VERSION_TITLE_REVIEW_CANDIDATES_FIELD),
+            *(candidate for candidate in saved_candidates if candidate.version_title_review_only),
+        )
+        decision = with_version_title_review_candidates(decision, version_title_candidates)
+    return CachedSpotifyTrackMatch(cache_key=cache_key, decision=decision, has_recording_conflict=has_recording_conflict)
 
 
 def search_queries_from_cache_record(record: Mapping[str, object]) -> tuple[str, ...]:
@@ -293,11 +298,14 @@ def spotify_candidate_from_cache_record(
         isrc=normalize_spotify_isrc(record.get("spotify_isrc")),
         is_playable=is_playable if isinstance(is_playable, bool) else None,
         observed_recording_metadata=observed_metadata,
+        version_title_review_only=record.get("version_title_review_only") is True,
     )
 
 
-def review_candidates_from_cache_record(record: Mapping[str, object]) -> tuple[SpotifyTrackCandidate, ...]:
-    candidate_records = record.get("review_candidates", ())
+def review_candidates_from_cache_record(
+    record: Mapping[str, object], *, field_name: str = "review_candidates",
+) -> tuple[SpotifyTrackCandidate, ...]:
+    candidate_records = record.get(field_name)
     if not isinstance(candidate_records, list):
         return ()
     candidates: list[SpotifyTrackCandidate] = []
@@ -349,7 +357,10 @@ def album_lookup_candidates_from_cache_record(
         candidate = spotify_candidate_from_cache_record(record)
         return (candidate,) if candidate else ()
     if match_status in {AMBIGUOUS, UNMATCHED}:
-        return review_candidates_from_cache_record(record)
+        return tuple(
+            candidate for candidate in review_candidates_from_cache_record(record)
+            if not candidate.version_title_review_only
+        )
     return ()
 
 
@@ -437,7 +448,7 @@ def cache_track_match(
     timestamp = matched_at or utc_timestamp()
     track = decision.track
     candidate = decision.candidate
-    record = {
+    record: dict[str, object] = {
         "release_id": track.release_id,
         "track_number": track.track_number,
         "artist_name": track.artist_name,
@@ -499,11 +510,37 @@ def cache_track_match(
             {
                 "spotify_uri": "",
                 "spotify_url": "",
-                "review_candidates": [spotify_candidate_cache_record(candidate) for candidate in decision.review_candidates],
+                "review_candidates": [
+                    spotify_candidate_cache_record(candidate) for candidate in decision.review_candidates
+                    if not candidate.version_title_review_only
+                ],
                 "searched_at": timestamp,
             }
         )
+        _store_version_title_review_candidates(record, decision.review_candidates)
     matches[spotify_track_match_key(track)] = record
+
+
+def record_cached_version_title_review(record: dict[str, object], decision: TrackMatchDecision) -> None:
+    record["search_queries"] = list(decision.search_queries)
+    _store_version_title_review_candidates(record, decision.review_candidates)
+
+
+def _store_version_title_review_candidates(
+    record: dict[str, object], candidates: Sequence[SpotifyTrackCandidate],
+) -> None:
+    new_records = [
+        spotify_candidate_cache_record(candidate) for candidate in candidates if candidate.version_title_review_only
+    ]
+    if not new_records:
+        return
+    saved_records = record.get(VERSION_TITLE_REVIEW_CANDIDATES_FIELD)
+    combined_records = [*saved_records, *new_records] if isinstance(saved_records, list) else new_records
+    # A shared URI can carry different title or artist evidence for colliding source rows.
+    records_by_value = {
+        json.dumps(candidate_record, sort_keys=True): candidate_record for candidate_record in combined_records
+    }
+    record[VERSION_TITLE_REVIEW_CANDIDATES_FIELD] = list(records_by_value.values())
 
 
 def spotify_candidate_cache_record(candidate: SpotifyTrackCandidate) -> dict[str, object]:

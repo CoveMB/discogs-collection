@@ -446,10 +446,9 @@ rtk proxy python3 scripts/publishers/spotify/publish_playlist.py \
 ```
 
 Spacing applies to searches, pagination, playlist reads, writes and retries.
-Cached match decisions need no search request, while playlist safety reads
-still run. Retry waits also satisfy the spacing interval; they do not add a
-second full interval after an already-long wait. Pacing does not change the
-search budget or guarantee that Spotify will avoid throttling. Normal sessions
+Playlist safety reads still run for cached decisions. Retry waits count toward
+the spacing interval, so a long retry wait can satisfy it. The search budget
+still applies with pacing, and Spotify may still throttle requests. Normal sessions
 renew tokens after waiting, immediately before the next Web API attempt, using
 the existing 60-second expiry leeway. Rotated tokens are saved atomically before
 use. An explicit 401 triggers one forced refresh and one retry; a second 401,
@@ -513,10 +512,12 @@ interval up to `max(initial interval, 30)` seconds, without speeding up again
 during the invocation. No interval guarantees freedom from throttling.
 
 `--max-new-searches-per-run` becomes the budget for each pass, still defaulting
-to 500; `0` removes the cap. Started search ladders may exceed the budget. Saved
-matches and completed album lookup attempts advance later passes, and the run
-returns success only after a full pass. Completion may leave ambiguous or
-unmatched music: the report says `processing complete; matches need review`.
+to 500. Use `0` to remove the cap. A fresh row that starts its track search can
+finish its ladder and any eligible version-title review query after reaching the
+cap. A cached miss needs remaining budget for its review query. Saved decisions,
+completed album lookups, and completed review queries advance later passes.
+The run returns success only after a full pass and reports
+`processing complete; matches need review` if any rows need review.
 
 A 429 checkpoints completed work before waiting. Any finite positive server
 cooldown is honored in full, including hours; checkpoint time counts toward
@@ -625,10 +626,10 @@ an album mismatch does not block the release. An album API failure stops the run
 instead of starting many fallback searches. Rate-limit stops use the same
 saved-cache and partial-report behavior described below.
 
-When an earlier track search cached a Spotify album ID with the same normalized
-album name, a later run can use that ID if the normal album search still misses
-the album. The publisher fetches at most five distinct cached album IDs and runs
-the same sequence validation. Cached track candidates are ignored with
+When an earlier ordinary track search cached a Spotify album ID with the same
+normalized album name, a later run can use that ID if album search misses the
+album. The publisher fetches at most five distinct cached album IDs and runs the
+same sequence validation. Cached track candidates are ignored with
 `--refresh-match-cache`, which always requests fresh Spotify search results.
 
 The track search ladder starts with a structured Spotify query using `Track
@@ -711,11 +712,22 @@ with a recognized version label also get base-title search queries, but the
 matcher finishes the ordinary search ladder before accepting a substitute. An
 exact candidate returned by a later query therefore wins.
 
+After album lookup and ordinary track matching, an eligible unmatched row can
+run one additional query using its base title and full artist credit. The source
+title must end in a recognized version label, such as `(2019 Remaster)`, and an
+ordinary candidate must share the base title and full artist credits. This also
+applies to cached misses. The report lists compatible new candidates for manual
+review, and the row stays unmatched. Album lookup uses the ordinary candidates.
+
+The cache records the extra query after a successful response, including an
+empty result, or when Spotify rejects it for length. A pause or temporary search
+error preserves the ordinary miss for a later retry. Once you verify a candidate
+against the source recording, use the [manual Spotify match importer](#import-manual-spotify-matches).
+
 The Spotify match cache stores `matched`, `ambiguous`, and `unmatched` decisions.
-Later runs reuse those decisions instead of searching Spotify again. Search
-errors are not cached, since they usually mean Spotify or the network failed
-temporarily. Typo-derived matches, position-derived album matches,
-letter-number spacing matches, Spotify Original annotation matches, albums
+Later runs reuse those decisions and completed review queries. Searches that
+fail temporarily can be retried. Typo-derived matches, position-derived album
+matches, letter-number spacing matches, Spotify Original annotation matches, albums
 recovered from cached track candidates, version substitutes, and resolved
 edition ties are version-sensitive.
 A matcher update can recheck them without invalidating ordinary exact matches.
@@ -746,7 +758,7 @@ then adds the planned new tracks. In replace mode it shows the replacement
 playlist. Ambiguous, unmatched, and error rows are not added to the final planned
 state.
 
-For an unmatched row, the report ranks the returned Spotify candidates for
+For an unmatched row, the report ranks the ordinary Spotify candidates for
 diagnostic review instead of displaying the first search result. It prefers the
 candidate with the strongest exact title, artist-set, and album evidence, then
 uses title edit distance and stable text fields to break ties. The report labels

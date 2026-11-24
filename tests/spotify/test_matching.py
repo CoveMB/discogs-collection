@@ -9,8 +9,14 @@ SCRIPTS_DIRECTORY = PROJECT_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 
 from publishers.spotify.matching import (
+    AMBIGUOUS,
+    ERROR,
+    MATCHED,
+    UNMATCHED,
     PlaylistTrack,
     SpotifyTrackCandidate,
+    TrackMatchDecision,
+    build_base_title_version_review_query,
     build_spotify_track_search_queries,
     build_spotify_track_search_query,
     choose_best_track_match,
@@ -96,6 +102,82 @@ class SpotifyMatchingTests(unittest.TestCase):
         query = build_spotify_track_search_query(track)
 
         self.assertEqual(query, 'track:"Alpha One" artist:"Alpha Artist" album:"Alpha Album"')
+
+    def test_base_title_review_query_requires_version_and_candidate_evidence(self):
+        track = source_track(track_name="Signal (2019 Remaster)", artist_name="Harbour Lines", album_name="Signals")
+        candidate = SpotifyTrackCandidate("spotify:track:other", "Signal - 2020 Remaster", ("Harbour Lines",), "Other")
+        decision = TrackMatchDecision(track, UNMATCHED, "", "ordinary miss", review_candidates=(candidate,))
+        expected_query = 'track:"Signal" artist:"Harbour Lines"'
+        self.assertEqual(build_base_title_version_review_query(decision), expected_query)
+
+        for version_title in (
+            "Signal [Demo]", "Signal – Acoustic Version", "Signal — Vocal Rework",
+            "Signal (Remaster (2019))", "Signal [Rework (Club)]",
+        ):
+            with self.subTest(version_title=version_title):
+                self.assertEqual(
+                    build_base_title_version_review_query(replace(decision, track=replace(track, track_name=version_title))),
+                    expected_query,
+                )
+        for ineligible_title in (
+            "Signal (Part Two)", "Signal [Deliverance]", "Signal (2019 Remaster]", "Signal-Remaster",
+            "Signal - 2019 Remaster - Part Two", "(2019 Remaster)",
+        ):
+            with self.subTest(ineligible_title=ineligible_title):
+                self.assertIsNone(
+                    build_base_title_version_review_query(replace(decision, track=replace(track, track_name=ineligible_title)))
+                )
+        self.assertEqual(
+            build_base_title_version_review_query(replace(
+                decision,
+                track=replace(track, track_name="Signal - Part Two - 2019 Remaster"),
+                review_candidates=(replace(candidate, name="Signal - Part Two"),),
+            )),
+            'track:"Signal - Part Two" artist:"Harbour Lines"',
+        )
+        self.assertIsNone(build_base_title_version_review_query(replace(decision, track=replace(track, artist_name=" "))))
+        self.assertIsNone(build_base_title_version_review_query(replace(decision, review_candidates=())))
+        for extra_artist in ("Guest", "星"):
+            with self.subTest(extra_artist=extra_artist):
+                self.assertIsNone(build_base_title_version_review_query(replace(
+                    decision, review_candidates=(replace(candidate, artists=("Harbour Lines", extra_artist)),),
+                )))
+        self.assertIsNone(build_base_title_version_review_query(replace(
+            decision,
+            track=replace(track, track_name="Signal 東 (2019 Remaster)"),
+            review_candidates=(replace(candidate, name="Signal 西 - 2020 Remaster"),),
+        )))
+        self.assertIsNone(build_base_title_version_review_query(replace(
+            decision,
+            track=replace(track, track_name="Signal! (2019 Remaster)"),
+            review_candidates=(replace(candidate, name="Signal? - 2020 Remaster"),),
+        )))
+        self.assertEqual(build_base_title_version_review_query(replace(
+            decision,
+            track=replace(track, track_name="Café Signal (2019 Remaster)", artist_name="Harbour Lines, 星"),
+            review_candidates=(replace(candidate, name="CAFE\u0301   Signal", artists=("星", "harbour  lines")),),
+        )), 'track:"Café Signal" artist:"Harbour Lines, 星"')
+        self.assertEqual(build_base_title_version_review_query(replace(
+            decision,
+            track=replace(track, artist_name="Earth, Wind\t&\tFire"),
+            review_candidates=(replace(candidate, artists=("Earth, Wind & Fire",)),),
+        )), 'track:"Signal" artist:"Earth, Wind & Fire"')
+        self.assertIsNone(build_base_title_version_review_query(replace(
+            decision, search_queries=('  track:"Signal"\tartist:"Harbour   Lines" ',),
+        )))
+        for status in (MATCHED, AMBIGUOUS, ERROR):
+            with self.subTest(status=status):
+                self.assertIsNone(build_base_title_version_review_query(replace(decision, status=status)))
+
+        for query_length in (250, 251):
+            base_title = "東" * (query_length - len('track:"" artist:"Harbour Lines"'))
+            query = f'track:"{base_title}" artist:"Harbour Lines"'
+            with self.subTest(query_length=query_length):
+                self.assertEqual(build_base_title_version_review_query(replace(
+                    decision,
+                    track=replace(track, track_name=f"{base_title} (2019 Remaster)"),
+                    review_candidates=(replace(candidate, name=base_title),),
+                )), query if query_length == 250 else None)
 
     def test_builds_search_query_ladder_from_track_artist_album_and_raw_query(self):
         track = source_track(

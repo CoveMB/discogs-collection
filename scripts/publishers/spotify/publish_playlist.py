@@ -43,6 +43,7 @@ from publishers.spotify.match_cache import (  # noqa: E402
     load_spotify_track_match_cache,
     record_album_recovery_attempt,
     record_cached_recording_conflict,
+    record_cached_version_title_review,
     save_spotify_track_match_cache,
     spotify_track_match_key,
     utc_timestamp,
@@ -65,8 +66,10 @@ from publishers.spotify.matching import (  # noqa: E402
     SpotifyRecordingMetadata,
     TrackMatchDecision,
     SpotifyTrackCandidate,
+    build_base_title_version_review_query,
     build_spotify_track_search_queries,
     choose_best_track_match,
+    complete_version_title_review,
     normalize_music_text,
     normalize_spotify_isrc,
     normalized_identity_artists,
@@ -579,10 +582,15 @@ def publish_spotify_playlists(
                                         cache_track_match(match_cache, resolved_decision, matched_at=timestamp)
                                     save_spotify_track_match_cache(match_cache_path, match_cache)
                                     album_decision = album_decisions_by_track_key.get(track_cache_key)
+                    cached_review_query = (
+                        build_base_title_version_review_query(cached_match.decision)
+                        if cached_match is not None and album_decision is None
+                        else None
+                    )
                     if (
                         not cached_match_is_protected
                         and album_decision is None
-                        and cached_match is None
+                        and (cached_match is None or cached_review_query is not None)
                         and new_search_budget_reached(search_count, max_new_searches_per_run)
                     ):
                         if publisher_sync_mode == APPEND_SYNC_MODE:
@@ -647,7 +655,6 @@ def publish_spotify_playlists(
                                 decision = cached_match.decision
                                 match_source = MATCH_SOURCE_CACHE
                                 track_search_count = 0
-                                cache_hit_count += 1
                         elif album_decision is not None:
                             decision = album_decision
                             match_source = MATCH_SOURCE_ALBUM
@@ -673,6 +680,48 @@ def publish_spotify_playlists(
                                     decision,
                                     reason=f"{decision.reason}; album lookup: {album_lookup_diagnostic}",
                                 )
+                        review_query = (
+                            build_base_title_version_review_query(decision)
+                            if match_source == MATCH_SOURCE_SEARCH
+                            else cached_review_query
+                        )
+                        if review_query is not None:
+                            if match_source == MATCH_SOURCE_SEARCH:
+                                # A stop during the next request can checkpoint the completed ordinary search.
+                                cache_track_match(match_cache, decision, matched_at=timestamp)
+                                resume_progress_made = True
+                            review_error: SpotifyApiError | None = None
+                            try:
+                                review_candidates = spotify_client.search_tracks(
+                                    access_token=access_token,
+                                    query=review_query,
+                                    limit=search_limit,
+                                )
+                            except (
+                                SpotifyAuthenticationError, SpotifyRateLimitPauseError,
+                                SpotifyRateLimitDeferredError, SpotifyRateLimitRetriesExhaustedError,
+                            ):
+                                raise
+                            except SpotifyApiError as error:
+                                review_candidates = ()
+                                if not is_query_specific_spotify_search_error(error):
+                                    review_error = error
+                            search_count += 1
+                            if not track_search_count:
+                                searched_row_count += 1
+                            match_source = MATCH_SOURCE_SEARCH
+                            if review_error is None:
+                                decision = complete_version_title_review(decision, review_query, review_candidates)
+                                record_cached_version_title_review(match_cache[track_cache_key], decision)
+                                resume_progress_made = True
+                            elif invocation is not None:
+                                raise review_error
+                            else:
+                                decision = track_match_error(
+                                    track, str(review_error), search_queries=(*decision.search_queries, review_query),
+                                )
+                        if match_source == MATCH_SOURCE_CACHE:
+                            cache_hit_count += 1
                         observed_candidates = recording_candidates_for_match(decision)
                         edition_proof = decision.match_strategy == SAME_RECORDING_EDITION_MATCH_STRATEGY
                         recording_conflict = recording_observations.conflict(observed_candidates, edition_proof=edition_proof)
@@ -727,7 +776,7 @@ def publish_spotify_playlists(
                             else:
                                 planned_write_uris.append(publish_decision.spotify_uri)
                                 final_items.append(final_playlist_item_from_decision(len(final_items) + 1, publish_decision))
-                        if match_source in {MATCH_SOURCE_ALBUM, MATCH_SOURCE_SEARCH}:
+                        if review_query is None and match_source in {MATCH_SOURCE_ALBUM, MATCH_SOURCE_SEARCH}:
                             cache_track_match(match_cache, decision, matched_at=timestamp)
                             if cached_match is None and cached_track_match(track, match_cache) is not None:
                                 resume_progress_made = True

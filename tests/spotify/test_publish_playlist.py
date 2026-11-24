@@ -51,6 +51,8 @@ from publishers.spotify.publish_playlist import (
     publish_spotify_playlists,
 )
 from publishers.spotify.publish_state import record_spotify_publish_state_track, save_spotify_publish_state
+from publishers.spotify.publish_types import SpotifyPublishInvocation
+from publishers.spotify.request_control import SpotifyRequestControl
 from shared.progress import ProgressReporter
 from shared.publisher_config import PublisherConfig
 from shared.tunemymusic import TUNEMYMUSIC_COLUMNS
@@ -449,6 +451,17 @@ def cached_negative_match_record(
     return record
 
 
+def cached_version_title_miss(
+    row: dict[str, str], ordinary_candidate: SpotifyTrackCandidate, *, attempted_album_ids: tuple[str, ...] = (),
+) -> dict[str, object]:
+    record = cached_negative_match_record(row, (), attempted_album_ids=attempted_album_ids)
+    record["review_candidates"] = [spotify_candidate_cache_record(ordinary_candidate)]
+    record["search_queries"] = [
+        f'track:"{row["Track Name"]}" artist:"{row["Artist Name"]}" album:"{row["Album Name"]}"',
+    ]
+    return record
+
+
 def saved_edition_match_record(
     row: dict[str, str],
     cohort: tuple[SpotifyTrackCandidate, ...],
@@ -636,6 +649,376 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         )
         config_patcher.start()
         self.addCleanup(config_patcher.stop)
+
+    def test_cached_unmatched_version_review_uses_one_query_and_reports_candidates(self):
+        row = playlist_row("111", "Tidal Signals", "Signal 東 (2019 Remaster)", "Harbour Lines")
+        track = playlist_track("Test", "111", "Tidal Signals", "Signal 東 (2019 Remaster)", "Harbour Lines")
+        ordinary = replace(matching_candidate(row), uri="spotify:track:ordinary", name="Signal 東 - 2020 Remaster")
+        review_candidate = replace(matching_candidate(row), uri="spotify:track:review", album_id="review-album")
+        incompatible = (
+            replace(review_candidate, uri="spotify:track:wrong-title", name="Signal 西 - 2019 Remaster"),
+            replace(review_candidate, uri="spotify:track:extra-artist", artists=("Harbour Lines", "星")),
+            replace(review_candidate, uri="spotify:track:cover", artists=("Cover Band",)),
+            replace(review_candidate, uri=ordinary.uri, album_id="duplicate-uri-album"),
+        )
+        review_query = 'track:"Signal 東" artist:"Harbour Lines"'
+        for compatible_candidates in ((), (review_candidate,)):
+            with self.subTest(found=bool(compatible_candidates)), tempfile.TemporaryDirectory() as temporary_directory:
+                directory = Path(temporary_directory)
+                master = directory / "Test" / "Test.csv"
+                write_playlist_master(master, [row])
+                cache_path = directory / "matches.json"
+                report_path = directory / "report.txt"
+                key = spotify_track_match_key(track)
+                starting_record = cached_version_title_miss(row, ordinary)
+                save_spotify_track_match_cache(cache_path, {key: starting_record})
+                client = PublishingSpotifyClient(
+                    {review_query: compatible_candidates + incompatible},
+                    playlists=(SpotifyPlaylist("existing", "Test", "", "current-user", False),),
+                    playlist_items_by_id={"existing": [SpotifyPlaylistItem(
+                        review_candidate.uri, review_candidate.name, review_candidate.artists, review_candidate.album_name,
+                    )]},
+                )
+
+                def publish():
+                    return publish_spotify_playlists(
+                        directory, report_path, client, "synthetic-token", playlist_master_paths=(master,),
+                        match_cache_path=cache_path, publisher_config=PublisherConfig("spotify", "", ""), apply=False,
+                    )
+
+                summary = publish()
+                self.assertEqual(client.searches, [("synthetic-token", review_query, 10)])
+                self.assertEqual((summary.search_count, summary.searched_row_count), (1, 1))
+                self.assertEqual(summary.cache_hit_count, 0)
+                self.assertTrue(summary.resume_progress_made)
+                self.assertEqual((summary.matched_count, summary.already_present_count, summary.would_add_count), (0, 0, 0))
+                self.assertEqual(tuple(item.spotify_uri for item in summary.final_items), (review_candidate.uri,))
+                decision = summary.decisions[0]
+                self.assertEqual(decision.track, track)
+                self.assertEqual((decision.status, decision.spotify_uri, decision.candidate), ("unmatched", "", None))
+                self.assertEqual(tuple(candidate.uri for candidate in decision.review_candidates), (
+                    ordinary.uri, *(candidate.uri for candidate in compatible_candidates),
+                ))
+                self.assertEqual(decision.review_candidates[0].name, ordinary.name)
+                self.assertFalse(decision.review_candidates[0].version_title_review_only)
+                report = report_path.read_text(encoding="utf-8")
+                if compatible_candidates:
+                    self.assertTrue(decision.review_candidates[1].version_title_review_only)
+                    self.assertIn("Version-title candidates for manual review", report)
+                    self.assertIn("spotify:track:review | Harbour Lines | Signal 東 (2019 Remaster) | Tidal Signals", report)
+                for excluded in incompatible[:3]:
+                    self.assertNotIn(excluded.uri, report)
+                record = load_spotify_track_match_cache(cache_path)[key]
+                self.assertEqual(record["track_name"], row["Track Name"])
+                self.assertEqual(record["search_queries"], [
+                    'track:"Signal 東 (2019 Remaster)" artist:"Harbour Lines" album:"Tidal Signals"', review_query,
+                ])
+                self.assertEqual(record["review_candidates"], starting_record["review_candidates"])
+                if compatible_candidates:
+                    review_record = spotify_candidate_cache_record(review_candidate)
+                    self.assertEqual(record["version_title_review_candidates"], [review_record])
+                    record["version_title_review_candidates"] = [
+                        spotify_candidate_cache_record(replace(ordinary, album_id="duplicate-review-album")),
+                        review_record,
+                        spotify_candidate_cache_record(incompatible[0]),
+                    ]
+                    save_spotify_track_match_cache(cache_path, {key: record})
+                else:
+                    self.assertNotIn("version_title_review_candidates", record)
+
+                client.searches.clear()
+                replay = publish()
+                self.assertEqual(client.searches, [])
+                self.assertEqual((replay.search_count, replay.searched_row_count, replay.already_present_count), (0, 0, 0))
+                self.assertEqual(replay.cache_hit_count, 1)
+                self.assertEqual(replay.decisions[0].review_candidates, decision.review_candidates)
+                self.assertFalse(client.created_playlists or client.add_calls or client.replace_calls)
+
+    def test_cached_version_title_review_revalidates_colliding_source_rows(self):
+        artist = "Harbour Lines"
+        title = "Signal 東 (2019 Remaster)"
+        album = "Tidal Signals"
+        row = playlist_row("111", album, title, artist)
+        key = spotify_track_match_key(playlist_track("Test", "111", album, title, artist))
+        ordinary = SpotifyTrackCandidate("spotify:track:ordinary-east", "Signal 東 - 2020 Remaster", (artist,), album)
+        widened = SpotifyTrackCandidate("spotify:track:review-east", title, (artist,), album, "review-album")
+        search_history = [
+            'track:"Signal 東 (2019 Remaster)" artist:"Harbour Lines" album:"Tidal Signals"',
+            'track:"Signal 東" artist:"Harbour Lines"',
+        ]
+        saved = cached_version_title_miss(row, ordinary, attempted_album_ids=("existing-album-hint",))
+        saved["search_queries"] = search_history
+        saved["version_title_review_candidates"] = [spotify_candidate_cache_record(widened)]
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            master_path = directory / "Test" / "Test.csv"
+            report_path = directory / "report.txt"
+            cache_path = directory / "matches.json"
+            save_spotify_track_match_cache(cache_path, {key: saved})
+            client = PublishingSpotifyClient({})
+
+            for case, source_title, source_artist, expected_uris in (
+                ("different non-Latin base", "Signal 西 (2019 Remaster)", artist, (ordinary.uri,)),
+                ("added non-Latin credit", title, "Harbour Lines, 星", (ordinary.uri,)),
+                ("missing label delimiters", "Signal 東 2019 Remaster", artist, (ordinary.uri,)),
+                ("original source", title, artist, (ordinary.uri, widened.uri)),
+            ):
+                with self.subTest(case=case):
+                    source = playlist_track("Test", "111", album, source_title, source_artist)
+                    self.assertEqual(spotify_track_match_key(source), key)
+                    write_playlist_master(master_path, [playlist_row("111", album, source_title, source_artist)])
+                    summary = publish_spotify_playlists(
+                        directory, report_path, client, "synthetic-token", playlist_master_paths=(master_path,),
+                        match_cache_path=cache_path, apply=False,
+                    )
+                    self.assertEqual((summary.search_count, summary.cache_hit_count), (0, 1))
+                    decision = summary.decisions[0]
+                    self.assertEqual(decision.track, source)
+                    self.assertEqual((decision.status, decision.spotify_uri), ("unmatched", ""))
+                    self.assertEqual(decision.search_queries, tuple(search_history))
+                    self.assertEqual(tuple(candidate.uri for candidate in decision.review_candidates), expected_uris)
+                    self.assertEqual(
+                        widened.uri in report_path.read_text(encoding="utf-8"), widened.uri in expected_uris,
+                    )
+
+            self.assertEqual(client.searches, [])
+            self.assertFalse(client.created_playlists or client.add_calls or client.replace_calls)
+            record = load_spotify_track_match_cache(cache_path)[key]
+            for field in (
+                "review_candidates", "version_title_review_candidates", "search_queries",
+                ALBUM_RECOVERY_ATTEMPT_MATCHER_VERSION_FIELD, ALBUM_RECOVERY_ATTEMPT_ALBUM_IDS_FIELD,
+            ):
+                self.assertEqual(record[field], saved[field])
+
+    def test_version_title_review_keeps_each_cached_source_variant(self):
+        east_title = "Signal 東 (2019 Remaster)"
+        west_title = "Signal 西 (2019 Remaster)"
+        east_query = 'track:"Signal 東" artist:"Harbour Lines"'
+        west_query = 'track:"Signal 西" artist:"Harbour Lines"'
+        east = playlist_track("Test", "111", "Signals", east_title, "Harbour Lines")
+        west = playlist_track("Test", "111", "Signals", west_title, "Harbour Lines")
+        key = spotify_track_match_key(east)
+        self.assertEqual(spotify_track_match_key(west), key)
+
+        ordinary_east = SpotifyTrackCandidate(
+            "spotify:track:ordinary-east", "Signal 東 - 2020 Remaster", ("Harbour Lines",), "Signals", "ordinary-album",
+        )
+        ordinary_west = replace(ordinary_east, uri="spotify:track:ordinary-west", name="Signal 西 - 2020 Remaster")
+        review_east = replace(ordinary_east, uri="spotify:track:shared-review", name=east_title, album_id="review-album")
+        review_west = replace(review_east, name=west_title)
+        row = playlist_row("111", "Signals", east_title, "Harbour Lines")
+        saved = cached_version_title_miss(row, ordinary_east, attempted_album_ids=("ordinary-album",))
+        saved["review_candidates"] = [spotify_candidate_cache_record(candidate) for candidate in (ordinary_east, ordinary_west)]
+        client = PublishingSpotifyClient({east_query: (review_east,), west_query: (review_west,)})
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            master_path = directory / "Test" / "Test.csv"
+            cache_path = directory / "matches.json"
+            report_path = directory / "report.txt"
+            save_spotify_track_match_cache(cache_path, {key: saved})
+
+            for pass_number, (source, candidate, expected_searches) in enumerate((
+                (east, review_east, 1), (west, review_west, 1), (east, review_east, 0), (west, review_west, 0),
+            ), start=1):
+                with self.subTest(pass_number=pass_number):
+                    write_playlist_master(master_path, [playlist_row(
+                        source.release_id, source.album_name, source.track_name, source.artist_name, source.track_number,
+                    )])
+                    summary = publish_spotify_playlists(
+                        directory, report_path, client, "synthetic-token", playlist_master_paths=(master_path,),
+                        match_cache_path=cache_path, apply=False,
+                    )
+                    self.assertEqual((summary.search_count, summary.searched_row_count), (expected_searches, expected_searches))
+                    decision = summary.decisions[0]
+                    self.assertEqual((decision.track, decision.status, decision.spotify_uri), (source, "unmatched", ""))
+                    review_only = tuple(item for item in decision.review_candidates if item.version_title_review_only)
+                    self.assertEqual(review_only, (replace(candidate, version_title_review_only=True),))
+                    self.assertIn(
+                        f"{candidate.uri} | Harbour Lines | {candidate.name} | Signals", report_path.read_text(encoding="utf-8"),
+                    )
+
+            self.assertEqual([query for _, query, _ in client.searches], [east_query, west_query])
+            self.assertFalse(client.created_playlists or client.add_calls or client.replace_calls)
+            record = load_spotify_track_match_cache(cache_path)[key]
+            self.assertEqual(record["version_title_review_candidates"], [
+                spotify_candidate_cache_record(candidate) for candidate in (review_east, review_west)
+            ])
+            self.assertEqual(record["search_queries"], [
+                'track:"Signal 東 (2019 Remaster)" artist:"Harbour Lines" album:"Signals"', east_query, west_query,
+            ])
+            for field in ("review_candidates", ALBUM_RECOVERY_ATTEMPT_MATCHER_VERSION_FIELD, ALBUM_RECOVERY_ATTEMPT_ALBUM_IDS_FIELD):
+                self.assertEqual(record[field], saved[field])
+
+    def test_version_title_review_cannot_seed_album_matching(self):
+        rows = [
+            playlist_row("111", "Tidal Signals", "Signal (2019 Remaster)", "Harbour Lines", "1"),
+            playlist_row("111", "Tidal Signals", "Middle", "Harbour Lines", "2"),
+            playlist_row("111", "Tidal Signals", "Closing", "Harbour Lines", "3"),
+        ]
+        ordinary = replace(matching_candidate(rows[0]), name="Signal - 2020 Remaster", album_id="ordinary-album")
+        widened = replace(matching_candidate(rows[0]), uri="spotify:track:widened", album_id="widened-only-album")
+        query = 'track:"Signal" artist:"Harbour Lines"'
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            master = directory / "Test" / "Test.csv"
+            cache_path = directory / "matches.json"
+            write_playlist_master(master, rows)
+            keys = [spotify_track_match_key(playlist_track(
+                "Test", row["Release Id"], row["Album Name"], row["Track Name"], row["Artist Name"], row["Track Number"],
+            )) for row in rows]
+            records = {key: cached_negative_match_record(row, ()) for key, row in zip(keys, rows)}
+            records[keys[0]] = cached_version_title_miss(rows[0], ordinary, attempted_album_ids=(ordinary.album_id,))
+            save_spotify_track_match_cache(cache_path, records)
+
+            def publish(client: AlbumPublishingSpotifyClient):
+                return publish_spotify_playlists(
+                    directory, directory / "report.txt", client, "synthetic-token", playlist_master_paths=(master,),
+                    match_cache_path=cache_path, apply=False,
+                )
+
+            album_tracklists = {"ordinary-album": (), "widened-only-album": (), "sibling-album": ()}
+            first_client = AlbumPublishingSpotifyClient((), album_tracklists, {query: (widened,)})
+            first = publish(first_client)
+            self.assertEqual((first.search_count, first.unmatched_count), (1, 3))
+            self.assertEqual(first_client.album_searches, [])
+            records = load_spotify_track_match_cache(cache_path)
+            self.assertEqual(records[keys[0]][ALBUM_RECOVERY_ATTEMPT_MATCHER_VERSION_FIELD], MATCHER_VERSION)
+            self.assertEqual(records[keys[0]][ALBUM_RECOVERY_ATTEMPT_ALBUM_IDS_FIELD], [ordinary.album_id])
+            self.assertNotIn(ALBUM_RECOVERY_ATTEMPT_ALBUM_IDS_FIELD, records[keys[1]])
+
+            replay_client = AlbumPublishingSpotifyClient((), album_tracklists)
+            replay = publish(replay_client)
+            self.assertEqual((replay.search_count, replay.unmatched_count), (0, 3))
+            self.assertTrue(replay.decisions[0].review_candidates[1].version_title_review_only)
+            self.assertEqual(replay_client.album_searches, [])
+            self.assertEqual(replay_client.album_track_requests, [])
+
+            records[keys[1]]["review_candidates"] = [spotify_candidate_cache_record(replace(widened, album_id="sibling-album"))]
+            save_spotify_track_match_cache(cache_path, records)
+            sibling_client = AlbumPublishingSpotifyClient((), album_tracklists)
+            with_sibling = publish(sibling_client)
+            self.assertEqual((with_sibling.search_count, with_sibling.unmatched_count), (1, 3))
+            self.assertEqual(sibling_client.searches, [])
+            self.assertCountEqual(sibling_client.album_track_requests, [
+                ("synthetic-token", "ordinary-album"), ("synthetic-token", "sibling-album"),
+            ])
+
+    def test_version_title_review_preserves_publish_precedence_and_replace_guards(self):
+        rows = [
+            playlist_row("111", "Signals", "Manual (2019 Remaster)", "Harbour Lines"),
+            playlist_row("222", "Signals", "Ordinary (2019 Remaster)", "Harbour Lines"),
+            playlist_row("333", "Signals", "Tie (2019 Remaster)", "Harbour Lines"),
+            playlist_row("444", "Signals", "Legacy (Remastered)", "Harbour Lines"),
+            playlist_row("555", "Signals", "Review (2019 Remaster)", "Harbour Lines"),
+        ]
+        manual, ordinary, tied, legacy, review = tuple(matching_candidate(row) for row in rows)
+        review_query = 'track:"Review" artist:"Harbour Lines"'
+        legacy_substitute_query = 'track:"Legacy" artist:"Harbour Lines"'
+        client = PublishingSpotifyClient({
+            'track:"Ordinary (2019 Remaster)" artist:"Harbour Lines" album:"Signals"': (ordinary,),
+            'track:"Tie (2019 Remaster)" artist:"Harbour Lines" album:"Signals"': (
+                tied, replace(tied, uri="spotify:track:another-tie"),
+            ),
+            legacy_substitute_query: (replace(legacy, name="Legacy"),),
+            'track:"Review (2019 Remaster)" artist:"Harbour Lines" album:"Signals"': (
+                replace(review, uri="spotify:track:ordinary-miss", name="Review - 2020 Remaster"),
+            ),
+            review_query: (review,),
+        })
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            master = directory / "Test" / "Test.csv"
+            cache_path = directory / "matches.json"
+            write_playlist_master(master, rows)
+            manual_track = playlist_track("Test", "111", "Signals", "Manual (2019 Remaster)", "Harbour Lines")
+            save_spotify_track_match_cache(cache_path, {spotify_track_match_key(manual_track): {
+                **cached_negative_match_record(rows[0], ()),
+                **spotify_candidate_cache_record(manual),
+                "match_status": "manual",
+            }})
+
+            def publish(*, apply: bool):
+                return publish_spotify_playlists(
+                    directory, directory / "report.txt", client, "synthetic-token", playlist_master_paths=(master,),
+                    match_cache_path=cache_path, apply=apply, publisher_sync_mode="replace",
+                )
+
+            summary = publish(apply=False)
+            expected_statuses = ["would_include", "would_include", "ambiguous", "would_include", "unmatched"]
+            self.assertEqual([decision.status for decision in summary.decisions], expected_statuses)
+            self.assertEqual([item.spotify_uri for item in summary.final_items], [manual.uri, ordinary.uri, legacy.uri])
+            self.assertEqual(summary.decisions[4].review_candidates[-1].uri, review.uri)
+            queries = [query for _, query, _ in client.searches]
+            self.assertEqual(queries.count(review_query), 1)
+            self.assertEqual(queries.count(legacy_substitute_query), 1)
+            self.assertFalse(any(query in queries for query in (
+                'track:"Manual" artist:"Harbour Lines"', 'track:"Ordinary" artist:"Harbour Lines"',
+                'track:"Tie" artist:"Harbour Lines"',
+            )))
+            self.assertFalse(client.created_playlists or client.add_calls or client.replace_calls)
+
+            # Resolve the ordinary tie so only the review-only row blocks replacement.
+            tie_track = playlist_track("Test", "333", "Signals", "Tie (2019 Remaster)", "Harbour Lines")
+            records = load_spotify_track_match_cache(cache_path)
+            records[spotify_track_match_key(tie_track)].update(spotify_candidate_cache_record(tied), match_status="manual")
+            save_spotify_track_match_cache(cache_path, records)
+            client.searches.clear()
+            with self.assertRaisesRegex(ValueError, r"\(unmatched=1\)"):
+                publish(apply=True)
+            self.assertEqual(client.searches, [])
+            self.assertFalse(client.created_playlists or client.add_calls or client.replace_calls)
+
+    def test_version_title_review_handles_generic_api_error_by_mode(self):
+        row = playlist_row("111", "Signals", "Signal (2019 Remaster)", "Harbour Lines")
+        track = playlist_track("Test", "111", "Signals", "Signal (2019 Remaster)", "Harbour Lines")
+        ordinary = replace(matching_candidate(row), name="Signal - 2020 Remaster")
+        query = 'track:"Signal" artist:"Harbour Lines"'
+        for continuous in (False, True):
+            with self.subTest(continuous=continuous), tempfile.TemporaryDirectory() as temporary_directory:
+                directory = Path(temporary_directory)
+                master = directory / "Test" / "Test.csv"
+                cache_path = directory / "matches.json"
+                report_path = directory / "report.txt"
+                write_playlist_master(master, [row])
+                key = spotify_track_match_key(track)
+                starting_record = cached_version_title_miss(row, ordinary)
+                save_spotify_track_match_cache(cache_path, {key: starting_record})
+                client = PublishingSpotifyClient({})
+                invocation = SpotifyPublishInvocation(SpotifyRequestControl()) if continuous else None
+
+                def publish():
+                    return publish_spotify_playlists(
+                        directory, report_path, client, "synthetic-token", playlist_master_paths=(master,),
+                        match_cache_path=cache_path, apply=False, invocation=invocation,
+                    )
+
+                error = SpotifyApiError("synthetic targeted search failure")
+                with patch.object(client, "search_tracks", side_effect=error) as failed_search:
+                    if invocation is None:
+                        summary = publish()
+                        self.assertEqual(summary.error_count, 1)
+                        self.assertEqual(summary.decisions[0].match_source, "search")
+                        self.assertEqual(summary.decisions[0].search_queries[-1], query)
+                    else:
+                        with self.assertRaises(SpotifyApiError) as stopped:
+                            publish()
+                        self.assertIs(stopped.exception, error)
+                        summary = invocation.latest_summary
+                        assert summary is not None
+                        self.assertEqual(summary.run_state, "failed")
+                    failed_search.assert_called_once_with(access_token="synthetic-token", query=query, limit=10)
+                    self.assertEqual((summary.search_count, summary.searched_row_count), (1, 1))
+                saved = load_spotify_track_match_cache(cache_path)[key]
+                self.assertEqual(saved["match_status"], "unmatched")
+                self.assertEqual(saved["search_queries"], starting_record["search_queries"])
+                self.assertEqual(saved["review_candidates"], starting_record["review_candidates"])
+
+                retry = publish()
+                self.assertEqual(client.searches, [("synthetic-token", query, 10)])
+                self.assertEqual((retry.error_count, retry.unmatched_count), (0, 1))
+                self.assertTrue(retry.resume_progress_made)
 
     def test_publish_same_recording_edition_tie_uses_existing_searches_and_cache(self):
         row = playlist_row("111", "Tidal Signals", "After Light", "Harbour Lines")
@@ -4384,7 +4767,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         self.assertEqual(summary.search_count, 2)
         self.assertEqual(summary.searched_row_count, 1)
         self.assertEqual(summary.would_add_count, 1)
-        self.assertIn("Rows searched with ladder: 1", report_text)
+        self.assertIn("Rows searched: 1", report_text)
         self.assertEqual(cache_payload["matches"]["111|1|alpha artist|discogs ep|alpha one"]["match_status"], "matched")
         self.assertEqual(
             cache_payload["matches"]["111|1|alpha artist|discogs ep|alpha one"]["match_reason"],
@@ -8256,6 +8639,150 @@ class SpotifyContinuousPublishingTests(unittest.TestCase):
         with patch("sys.stderr", stream):
             summary = self.run_publish()
         return summary, snapshots, stream.getvalue()
+
+    def test_version_title_review_resumes_after_pause(self):
+        row = playlist_row("", "Synthetic Album", "Signal (2019 Remaster)", "Synthetic Artist")
+        track = playlist_track("Synthetic", "", "Synthetic Album", "Signal (2019 Remaster)", "Synthetic Artist")
+        write_playlist_master(self.master, [row])
+        self.args.apply = False
+        self.args.max_new_searches_per_run = 1
+        key = spotify_track_match_key(track)
+        ordinary_queries = [
+            'track:"Signal (2019 Remaster)" artist:"Synthetic Artist" album:"Synthetic Album"',
+            'track:"Signal (2019 Remaster)" artist:"Synthetic Artist"',
+            "Synthetic Artist Signal (2019 Remaster)",
+            "Synthetic Artist Signal (2019 Remaster) Synthetic Album",
+        ]
+        review_query = 'track:"Signal" artist:"Synthetic Artist"'
+        ordinary_candidate = {**self.track_payload("ordinary"), "name": "Signal - 2020 Remaster"}
+        for failure in ("pause", "overlength"):
+            with self.subTest(failure=failure):
+                self.args.match_cache = self.directory / f"matches-{failure}.json"
+                self.requests.clear()
+                self.reports.clear()
+                queries: list[str] = []
+                paused_checkpoint_observed = False
+
+                def response(request, parsed, query):
+                    if parsed.path != "/v1/search":
+                        return None
+                    search_query = query["q"][0]
+                    queries.append(search_query)
+                    if search_query == review_query:
+                        if failure == "overlength":
+                            return HttpResponse(400, {}, '{"error":{"message":"Query exceeds maximum length of 250 characters"}}')
+                        if queries.count(review_query) == 1:
+                            return HttpResponse(429, {"Retry-After": "4"}, "{}")
+                    items = [ordinary_candidate] if search_query == ordinary_queries[0] else []
+                    return HttpResponse(200, {}, json.dumps({"tracks": {"items": items}}))
+
+                def observe_checkpoint(_seconds):
+                    nonlocal paused_checkpoint_observed
+                    if paused_checkpoint_observed or not self.reports or self.reports[-1].run_state != "waiting":
+                        return
+                    paused = self.reports[-1]
+                    self.assertEqual((paused.search_count, paused.searched_row_count), (len(ordinary_queries), 1))
+                    self.assertEqual(paused.request_count, 2 + len(ordinary_queries) + 1)
+                    self.assertTrue(paused.resume_progress_made)
+                    checkpoint = load_spotify_track_match_cache(self.args.match_cache)[key]
+                    self.assertEqual(checkpoint["match_status"], "unmatched")
+                    self.assertEqual(checkpoint["search_queries"], ordinary_queries)
+                    self.assertEqual(checkpoint["review_candidates"], [spotify_candidate_cache_record(SpotifyTrackCandidate(
+                        "spotify:track:ordinary", "Signal - 2020 Remaster", ("Synthetic Artist",), "Synthetic Album", "album",
+                    ))])
+                    paused_checkpoint_observed = True
+
+                self.before_transport = response
+                self.on_sleep = observe_checkpoint
+                summary = self.run_publish()
+                if failure == "pause":
+                    self.assertTrue(paused_checkpoint_observed)
+                    self.assertEqual(queries, [*ordinary_queries, review_query, review_query])
+                    self.assertEqual(summary.search_count, 1)
+                else:
+                    self.assertEqual(queries, [*ordinary_queries, review_query])
+                    self.assertEqual(summary.search_count, len(ordinary_queries) + 1)
+                self.assertEqual((summary.searched_row_count, summary.unmatched_count), (1, 1))
+                self.assertEqual(summary.request_count, len(self.requests))
+                self.assertTrue(summary.resume_progress_made)
+                self.assertEqual(summary.decisions[0].search_queries, (*ordinary_queries, review_query))
+                record = load_spotify_track_match_cache(self.args.match_cache)[key]
+                self.assertEqual(record["track_name"], row["Track Name"])
+                self.assertEqual(record["search_queries"], [*ordinary_queries, review_query])
+
+                queries.clear()
+                replay = self.run_publish()
+                self.assertEqual(queries, [])
+                self.assertEqual((replay.search_count, replay.searched_row_count, replay.unmatched_count), (0, 0, 1))
+                self.assertEqual(self.writes, [])
+
+    def test_version_title_review_checks_budget_after_album_search(self):
+        rows = [
+            playlist_row("release", "Synthetic Album", "Opening", "Synthetic Artist", "1"),
+            playlist_row("release", "Synthetic Album", "Middle", "Synthetic Artist", "2"),
+            playlist_row("release", "Synthetic Album", "Signal (2019 Remaster)", "Synthetic Artist", "3"),
+            playlist_row("release", "Synthetic Album", "Closing", "Synthetic Artist", "4"),
+        ]
+        write_playlist_master(self.master, rows)
+        self.args.apply = False
+        self.args.max_new_searches_per_run = 1
+        keys = [spotify_track_match_key(playlist_track(
+            "Synthetic", row["Release Id"], row["Album Name"], row["Track Name"], row["Artist Name"], row["Track Number"],
+        )) for row in rows]
+        ordinary = replace(
+            matching_candidate(rows[2]), uri="spotify:track:ordinary-miss", name="Signal - 2020 Remaster", album_id="cached-album",
+        )
+        starting_record = cached_version_title_miss(rows[2], ordinary)
+        records = {
+            key: {
+                **cached_negative_match_record(row, ()),
+                **spotify_candidate_cache_record(replace(matching_candidate(row), uri=f"spotify:track:{row['Track Number']}")),
+                "match_status": "matched",
+            }
+            for key, row in zip(keys, rows) if row is not rows[2]
+        }
+        records[keys[2]] = starting_record
+        save_spotify_track_match_cache(self.args.match_cache, records)
+        queries: list[tuple[str, str]] = []
+        review_query = 'track:"Signal" artist:"Synthetic Artist"'
+        review_candidate = {
+            **self.track_payload("review"),
+            "name": rows[2]["Track Name"],
+            "album": {"id": "review-album", "name": "Synthetic Album"},
+        }
+
+        def response(request, parsed, query):
+            if parsed.path == "/v1/albums/cached-album/tracks":
+                return HttpResponse(200, {}, '{"items":[],"next":null}')
+            if parsed.path != "/v1/search":
+                return None
+            query_type, search_query = query["type"][0], query["q"][0]
+            queries.append((query_type, search_query))
+            if query_type == "album":
+                return HttpResponse(200, {}, '{"albums":{"items":[]}}')
+            self.assertEqual(search_query, review_query)
+            first_pass = self.reports[-1]
+            self.assertEqual(first_pass.stop_reason, "search_budget")
+            self.assertEqual((first_pass.search_count, first_pass.searched_row_count), (1, 0))
+            self.assertEqual([decision.track.track_name for decision in first_pass.decisions], ["Opening", "Middle"])
+            checkpoint = load_spotify_track_match_cache(self.args.match_cache)[keys[2]]
+            self.assertEqual(checkpoint["search_queries"], starting_record["search_queries"])
+            self.assertEqual(checkpoint[ALBUM_RECOVERY_ATTEMPT_ALBUM_IDS_FIELD], ["cached-album"])
+            return HttpResponse(200, {}, json.dumps({"tracks": {"items": [review_candidate]}}))
+
+        self.before_transport = response
+        summary = self.run_publish()
+        self.assertEqual(queries, [("album", 'album:"Synthetic Album"'), ("track", review_query)])
+        self.assertEqual((summary.completed_pass_count, summary.search_count, summary.searched_row_count), (3, 0, 0))
+        review_pass = next(report for report in self.reports if report.searched_row_count == 1)
+        self.assertEqual(review_pass.search_count, 1)
+        self.assertTrue(review_pass.resume_progress_made)
+        final_review_row = summary.decisions[2]
+        self.assertEqual((final_review_row.status, final_review_row.spotify_uri), ("unmatched", ""))
+        self.assertTrue(final_review_row.review_candidates[1].version_title_review_only)
+        self.assertNotIn("/v1/albums/review-album/tracks", [request[2] for request in self.requests])
+        self.assertEqual(summary.request_count, len(self.requests))
+        self.assertEqual(self.writes, [])
 
     def test_progress_distinguishes_reads_and_writes_across_capped_passes(self):
         summary, snapshots, output = self.run_with_progress()

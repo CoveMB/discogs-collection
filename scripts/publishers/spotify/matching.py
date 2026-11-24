@@ -56,6 +56,12 @@ TRAILING_DASHED_VERSION_PATTERN = re.compile(
     r"\s*[-\u2013\u2014]\s*(?P<label>remaster(?:ed)?|live|(?:radio\s+)?edit)\s*$",
     re.IGNORECASE,
 )
+DASHED_VERSION_REVIEW_LABEL_PATTERN = re.compile(r"^(.*)\s[-\u2013\u2014]\s([^()\[\]]+)$", re.DOTALL)
+VERSION_REVIEW_TERM_PATTERN = re.compile(
+    r"\b(?:acoustic|club|demo|dub|edit|extended|instrumental|live|mix|original|radio|"
+    r"remaster|remastered|remix|rework|version|vocal)\b"
+)
+SPOTIFY_TRACK_SEARCH_QUERY_CHARACTER_LIMIT = 250
 PROTECTED_TITLE_TOKENS = frozenset(
     (
         "acoustic",
@@ -122,6 +128,7 @@ class SpotifyTrackCandidate:
     is_playable: bool | None = None
     has_complete_recording_metadata: bool = field(default=True, compare=False)
     observed_recording_metadata: SpotifyRecordingMetadata | None = field(default=None, compare=False)
+    version_title_review_only: bool = False
 
     def recording_metadata(self) -> SpotifyRecordingMetadata:
         if self.observed_recording_metadata is not None:
@@ -196,9 +203,13 @@ def build_spotify_track_search_queries(track: PlaylistTrack) -> tuple[str, ...]:
 
 
 def append_unique_search_query(queries: list[str], query: str) -> None:
-    clean_query = re.sub(r"\s+", " ", query).strip()
+    clean_query = _normalize_search_query(query)
     if clean_query and clean_query not in queries:
         queries.append(clean_query)
+
+
+def _normalize_search_query(query: str) -> str:
+    return re.sub(r"\s+", " ", query).strip()
 
 
 def append_title_variant_search_queries(
@@ -318,6 +329,105 @@ def split_source_artist_names(artist_name: str) -> tuple[str, ...]:
     if any(" & " in part or " and " in part.casefold() for part in parts):
         return ()
     return parts
+
+
+def _version_review_base_title(title: str) -> str | None:
+    clean_title = title.strip()
+    if clean_title.endswith((")", "]")):
+        expected_openers: list[str] = []
+        for index in range(len(clean_title) - 1, -1, -1):
+            delimiter = clean_title[index]
+            if delimiter in (")", "]"):
+                expected_openers.append("(" if delimiter == ")" else "[")
+            elif delimiter in ("(", "["):
+                if expected_openers.pop() != delimiter:
+                    return None
+                if not expected_openers:
+                    base_title, label = clean_title[:index].strip(), clean_title[index + 1:-1]
+                    break
+        else:
+            return None
+    else:
+        dashed = DASHED_VERSION_REVIEW_LABEL_PATTERN.fullmatch(clean_title)
+        if not dashed:
+            return None
+        base_title, label = dashed.group(1).strip(), dashed.group(2)
+    if base_title and VERSION_REVIEW_TERM_PATTERN.search(normalize_recording_evidence_text(label)):
+        return base_title
+    return None
+
+
+def _candidate_matches_version_review(
+    base_title: str, artist_name: str, candidate: SpotifyTrackCandidate,
+) -> bool:
+    normalized_artist_name = normalize_recording_evidence_text(artist_name)
+    source_artists = set(split_source_artist_names(normalized_artist_name) or (normalized_artist_name,))
+    candidate_metadata = candidate.recording_metadata()
+    candidate_base_title = _version_review_base_title(candidate_metadata.title) or candidate_metadata.title
+    return (
+        "" not in source_artists
+        and source_artists == set(candidate_metadata.artist_names)
+        and normalize_recording_evidence_text(base_title) == normalize_recording_evidence_text(candidate_base_title)
+    )
+
+
+def _prepare_version_title_review_query(decision: TrackMatchDecision) -> tuple[str, str] | None:
+    if decision.status != UNMATCHED:
+        return None
+    track = decision.track
+    base_title = _version_review_base_title(track.track_name)
+    if base_title is None:
+        return None
+    quoted_title = quote_search_filter_value(base_title)
+    quoted_artist = quote_search_filter_value(track.artist_name)
+    if not quoted_title or not quoted_artist:
+        return None
+    query = f'track:"{quoted_title}" artist:"{quoted_artist}"'
+    if len(query) > SPOTIFY_TRACK_SEARCH_QUERY_CHARACTER_LIMIT:
+        return None
+    for candidate in decision.review_candidates:
+        if not candidate.version_title_review_only and _candidate_matches_version_review(base_title, track.artist_name, candidate):
+            return base_title, query
+    return None
+
+
+def build_base_title_version_review_query(decision: TrackMatchDecision) -> str | None:
+    prepared = _prepare_version_title_review_query(decision)
+    if prepared is None:
+        return None
+    _, query = prepared
+    if any(query == _normalize_search_query(previous_query) for previous_query in decision.search_queries):
+        return None
+    return query
+
+
+def with_version_title_review_candidates(
+    decision: TrackMatchDecision, candidates: tuple[SpotifyTrackCandidate, ...],
+) -> TrackMatchDecision:
+    if not candidates:
+        return decision
+    prepared = _prepare_version_title_review_query(decision)
+    if prepared is None:
+        return decision
+    base_title, _ = prepared
+    known_uris = {candidate.uri for candidate in decision.review_candidates}
+    new_candidates = deduplicate_spotify_track_candidates(tuple(
+        replace(candidate, version_title_review_only=True)
+        for candidate in candidates
+        if candidate.uri not in known_uris
+        and spotify_track_uri_is_structurally_valid(candidate.uri)
+        and _candidate_matches_version_review(base_title, decision.track.artist_name, candidate)
+    ))
+    return replace(decision, review_candidates=(*decision.review_candidates, *new_candidates))
+
+
+def complete_version_title_review(
+    decision: TrackMatchDecision, query: str, candidates: tuple[SpotifyTrackCandidate, ...],
+) -> TrackMatchDecision:
+    return replace(
+        with_version_title_review_candidates(decision, candidates),
+        search_queries=(*decision.search_queries, query),
+    )
 
 
 def _decision_from_candidates(
