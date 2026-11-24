@@ -1,5 +1,6 @@
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 
@@ -21,6 +22,7 @@ from publishers.spotify.release_matching import (
     TRACK_CANDIDATE_ALBUM_EXACT_MATCH_STRATEGY,
     SpotifyAlbumCandidate,
     SpotifyAlbumTrack,
+    SpotifyReleaseAlbumMatchResult,
     analyze_album_sequence,
     build_spotify_album_search_query,
     choose_validated_album_match,
@@ -621,6 +623,260 @@ class SpotifyReleaseMatchingTests(unittest.TestCase):
             "Spotify returned no album candidate with a matching title",
         )
         self.assertEqual(client.album_track_requests, [])
+
+
+class SpotifyCachedAlbumFallbackTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.source_tracks = (
+            source_track(1, "Anchor One"),
+            source_track(2, "Anchor Two", "Example Artist, Guest"),
+            source_track(3, "Anchor Three"),
+        )
+        self.exact_tracks = (
+            album_track(1, "Anchor One"),
+            album_track(2, "Anchor Two", ("Example Artist", "Guest")),
+            album_track(3, "Anchor Three"),
+        )
+        self.rejected_tracks = tuple(
+            album_track(number, f"Wrong Track {number}", ("Other Artist",))
+            for number in range(1, 4)
+        )
+        self.partial_tracks = (*self.exact_tracks[:2], self.rejected_tracks[2])
+
+    def resolve(
+        self,
+        direct_ids: tuple[str, ...],
+        tracks_by_id: dict[str, tuple[SpotifyAlbumTrack, ...]],
+        hints: tuple[SpotifyTrackCandidate, ...],
+        *,
+        tracks: tuple[PlaylistTrack, ...] | None = None,
+    ) -> tuple[SpotifyReleaseAlbumMatchResult, FakeAlbumLookupClient]:
+        if tracks is None:
+            tracks = self.source_tracks
+        client = FakeAlbumLookupClient(
+            candidates=tuple(album_candidate(album_id, tracks[0].album_name) for album_id in direct_ids),
+            tracks_by_album_id=tracks_by_id,
+        )
+        result = resolve_release_with_album(
+            tracks,
+            client,
+            "access-token",
+            fallback_track_candidates=hints,
+        )
+        return result, client
+
+    def hint(
+        self, album_id: str, album_name: str = "Numbers and Colours",
+    ) -> SpotifyTrackCandidate:
+        return SpotifyTrackCandidate(
+            uri=f"spotify:track:{album_id}-hint",
+            name="Anchor One",
+            artists=("Example Artist",),
+            album_name=album_name,
+            album_id=album_id,
+        )
+
+    def test_recovers_cached_album_after_rejected_direct_result(self) -> None:
+        cached_hint = self.hint("recovered-album")
+        result, client = self.resolve(
+            ("direct-album",),
+            {"direct-album": self.rejected_tracks, "recovered-album": self.exact_tracks},
+            (
+                self.hint("direct-album"),
+                cached_hint,
+                replace(cached_hint, uri="spotify:track:another-hint"),
+            ),
+        )
+
+        self.assertEqual(result.search_count, 1)
+        self.assertEqual(client.searches, [("access-token", 'album:"Numbers and Colours"', 10)])
+        self.assertEqual(
+            client.album_track_requests,
+            [("access-token", "direct-album"), ("access-token", "recovered-album")],
+        )
+        self.assertEqual(tuple(decision.track for decision in result.decisions), self.source_tracks)
+        self.assertEqual(
+            [decision.spotify_uri for decision in result.decisions],
+            ["spotify:track:1", "spotify:track:2", "spotify:track:3"],
+        )
+        self.assertEqual(
+            [decision.match_strategy for decision in result.decisions],
+            [TRACK_CANDIDATE_ALBUM_EXACT_MATCH_STRATEGY] * 3,
+        )
+        self.assertTrue(result.used_fallback_track_candidates)
+        self.assertEqual(result.diagnostic, "")
+
+    def test_valid_direct_results_take_precedence_over_cached_hints(self) -> None:
+        cases = (
+            ("complete", {"direct-album": self.exact_tracks}, 3),
+            ("partial", {"direct-album": self.partial_tracks}, 2),
+            ("ambiguous", {"direct-album": self.exact_tracks, "other-direct": self.partial_tracks}, 0),
+        )
+        for label, direct_tracks_by_id, expected_count in cases:
+            with self.subTest(label=label):
+                result, client = self.resolve(
+                    tuple(direct_tracks_by_id),
+                    {**direct_tracks_by_id, "recovered-album": self.exact_tracks},
+                    (self.hint("recovered-album"),),
+                )
+
+                self.assertEqual(len(result.decisions), expected_count)
+                self.assertFalse(result.used_fallback_track_candidates)
+                self.assertEqual(
+                    [album_id for _, album_id in client.album_track_requests],
+                    list(direct_tracks_by_id),
+                )
+                if label == "ambiguous":
+                    self.assertIn("2 Spotify album editions passed sequence validation", result.diagnostic)
+
+    def test_records_assessment_when_cached_id_was_already_checked(self) -> None:
+        result, client = self.resolve(
+            ("direct-album",),
+            {"direct-album": self.rejected_tracks},
+            (self.hint("direct-album"),),
+        )
+
+        self.assertEqual(result.decisions, ())
+        self.assertTrue(result.used_fallback_track_candidates)
+        self.assertEqual(client.album_track_requests, [("access-token", "direct-album")])
+
+    def test_competing_validated_cached_editions_block_recovery(self) -> None:
+        for label, competing_tracks in (("complete", self.exact_tracks), ("partial", self.partial_tracks)):
+            with self.subTest(second_edition=label):
+                result, client = self.resolve(
+                    ("direct-album",),
+                    {
+                        "direct-album": self.rejected_tracks,
+                        "recovered-album": self.exact_tracks,
+                        "other-cached": competing_tracks,
+                    },
+                    (self.hint("recovered-album"), self.hint("other-cached")),
+                )
+
+                self.assertEqual(result.decisions, ())
+                self.assertIn("2 Spotify album editions passed sequence validation", result.diagnostic)
+                self.assertEqual(
+                    [album_id for _, album_id in client.album_track_requests],
+                    ["direct-album", "recovered-album", "other-cached"],
+                )
+
+    def test_cached_album_requires_full_ordered_usable_exact_anchors(self) -> None:
+        first, second, third = self.exact_tracks
+        cases = (
+            ("partial", self.partial_tracks),
+            ("positional", (first, replace(second, name="Alternate Title"), third)),
+            ("out of order", (second, first, third)),
+            ("unplayable", (first, replace(second, is_playable=False), third)),
+            ("missing track ID", (first, replace(second, uri="spotify:track:"), third)),
+            ("conflicting track ID", (first, replace(second, uri=first.uri), third)),
+            ("extra track", (*self.exact_tracks, album_track(4, "Extra Track"))),
+        )
+        for label, cached_tracks in cases:
+            with self.subTest(label=label):
+                result, client = self.resolve(
+                    ("direct-album",),
+                    {"direct-album": self.rejected_tracks, "recovered-album": cached_tracks},
+                    (self.hint("recovered-album"),),
+                )
+
+                self.assertEqual(result.decisions, ())
+                self.assertTrue(result.used_fallback_track_candidates)
+                self.assertTrue(result.diagnostic)
+                self.assertEqual(
+                    [album_id for _, album_id in client.album_track_requests],
+                    ["direct-album", "recovered-album"],
+                )
+
+    def test_cached_album_requires_strict_unicode_recording_identity(self) -> None:
+        album_name = "Numbers and Colours 夜"
+        first, second, third = self.exact_tracks
+        source_tracks = (
+            replace(self.source_tracks[0], album_name=album_name),
+            replace(
+                self.source_tracks[1],
+                album_name=album_name,
+                track_name="Anchor Two (Live) 夜",
+                artist_name="Example Artist, Guest 夜",
+            ),
+            replace(self.source_tracks[2], album_name=album_name),
+        )
+        strict_second = replace(second, name="Anchor Two (Live) 夜", artists=("Example Artist", "Guest 夜"))
+        cases = (
+            ("album", "Numbers and Colours 日", strict_second),
+            ("track", album_name, replace(strict_second, name="Anchor Two (Live) 日")),
+            ("artist", album_name, replace(strict_second, artists=("Example Artist", "Guest 日"))),
+            ("version punctuation", album_name, replace(strict_second, name="Anchor Two [Live] 夜")),
+        )
+        for label, cached_album_name, cached_second in cases:
+            with self.subTest(label=label):
+                result, client = self.resolve(
+                    ("direct-album",),
+                    {"direct-album": self.rejected_tracks, "recovered-album": (first, cached_second, third)},
+                    (self.hint("recovered-album", cached_album_name),),
+                    tracks=source_tracks,
+                )
+
+                self.assertEqual(result.decisions, ())
+                self.assertTrue(result.used_fallback_track_candidates)
+                self.assertEqual(result.validation_diagnostics[-1].exact_anchor_count, 3)
+                self.assertTrue(result.diagnostic)
+                self.assertEqual(client.album_track_requests[-1], ("access-token", "recovered-album"))
+
+    def test_cached_album_requires_consistent_titles_for_the_same_id(self) -> None:
+        source_album = "Numbers and Colours 夜"
+        source_tracks = tuple(replace(track, album_name=source_album) for track in self.source_tracks)
+        matching_hint = self.hint("recovered-album", source_album)
+        conflicting_hint = replace(
+            matching_hint, uri="spotify:track:other-hint", album_name="Numbers and Colours 日",
+        )
+        cases = (
+            ("matching cached title first", (matching_hint, conflicting_hint), ()),
+            ("conflicting cached title first", (conflicting_hint, matching_hint), ()),
+            ("conflicting direct title", (matching_hint,), (album_candidate("recovered-album", "Different Album"),)),
+        )
+        for label, hints, additional_direct in cases:
+            with self.subTest(label=label):
+                client = FakeAlbumLookupClient(
+                    (album_candidate("direct-album", source_album), *additional_direct),
+                    {"direct-album": self.rejected_tracks, "recovered-album": self.exact_tracks},
+                )
+                result = resolve_release_with_album(
+                    source_tracks, client, "access-token", fallback_track_candidates=hints,
+                )
+
+                self.assertEqual(result.decisions, ())
+                self.assertEqual(
+                    [album_id for _, album_id in client.album_track_requests],
+                    ["direct-album", "recovered-album"],
+                )
+                self.assertTrue(result.used_fallback_track_candidates)
+                self.assertTrue(result.diagnostic)
+
+
+    def test_direct_and_cached_album_fetches_share_one_limit(self) -> None:
+        direct_ids = ("direct-one", "direct-two")
+        cached_ids = ("cached-one", "cached-two", "cached-three", "cached-four")
+        tracks_by_id: dict[str, tuple[SpotifyAlbumTrack, ...]] = {
+            album_id: self.rejected_tracks for album_id in (*direct_ids, *cached_ids)
+        }
+        tracks_by_id["cached-one"] = self.exact_tracks
+
+        at_limit, at_limit_client = self.resolve(
+            direct_ids, tracks_by_id, tuple(self.hint(album_id) for album_id in cached_ids[:3]),
+        )
+        over_limit, over_limit_client = self.resolve(
+            direct_ids, tracks_by_id, tuple(self.hint(album_id) for album_id in cached_ids),
+        )
+
+        self.assertEqual(len(at_limit.decisions), 3)
+        self.assertEqual(
+            [album_id for _, album_id in at_limit_client.album_track_requests],
+            [*direct_ids, *cached_ids[:3]],
+        )
+        self.assertEqual(over_limit.decisions, ())
+        self.assertTrue(over_limit.used_fallback_track_candidates)
+        self.assertIn("safe maximum is 5", over_limit.diagnostic)
+        self.assertEqual([album_id for _, album_id in over_limit_client.album_track_requests], list(direct_ids))
 
 
 if __name__ == "__main__":

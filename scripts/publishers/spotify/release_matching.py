@@ -15,9 +15,12 @@ from publishers.spotify.matching import (
     music_values_match_only_after_alphanumeric_spacing,
     normalize_alphanumeric_spacing,
     normalize_music_text,
+    normalize_recording_evidence_text,
     normalized_candidate_artist_set,
     normalized_source_artist_set,
     quote_search_filter_value,
+    split_source_artist_names,
+    spotify_track_uri_is_structurally_valid,
 )
 
 
@@ -75,6 +78,14 @@ class SpotifyAlbumValidationDiagnostic:
     oversized_gap_count: int
     positional_artist_mismatch_count: int
     unusable_spotify_track_count: int
+
+
+@dataclass(frozen=True)
+class _AlbumAssessment:
+    album: SpotifyAlbumCandidate
+    spotify_tracks: tuple[SpotifyAlbumTrack, ...]
+    diagnostic: SpotifyAlbumValidationDiagnostic
+    decisions: tuple[TrackMatchDecision, ...]
 
 
 @dataclass(frozen=True)
@@ -176,33 +187,49 @@ def resolve_release_with_album(
             used_fallback_track_candidates=candidates_came_from_track_search,
         )
 
-    candidate_matches: list[tuple[TrackMatchDecision, ...]] = []
-    validation_diagnostics: list[SpotifyAlbumValidationDiagnostic] = []
-    for album in exact_album_candidates:
+    def assess_album(album: SpotifyAlbumCandidate) -> _AlbumAssessment:
         spotify_tracks = spotify_client.get_album_tracks(
             access_token=access_token,
             album_id=album.album_id,
         )
-        validation_diagnostics.append(
-            analyze_album_sequence(
-                source_tracks=source_tracks,
-                album=album,
-                spotify_tracks=spotify_tracks,
-            )
-        )
-        decisions_for_candidate = match_release_tracks_to_album(
-            source_tracks=source_tracks,
+        return _AlbumAssessment(
             album=album,
             spotify_tracks=spotify_tracks,
-            album_search_query=album_search_query,
+            diagnostic=analyze_album_sequence(source_tracks, album, spotify_tracks),
+            decisions=match_release_tracks_to_album(
+                source_tracks,
+                album,
+                spotify_tracks,
+                album_search_query,
+            ),
         )
-        if candidates_came_from_track_search:
-            decisions_for_candidate = mark_track_candidate_album_decisions(
-                decisions_for_candidate
+
+    assessments = tuple(assess_album(album) for album in exact_album_candidates)
+    checking_cached_after_direct_rejection = False
+    if exact_album_candidates_by_id and not any(assessment.decisions for assessment in assessments):
+        cached_candidates = album_candidates_from_track_candidates(source_tracks, fallback_track_candidates)
+        checking_cached_after_direct_rejection = bool(cached_candidates)
+        candidates_came_from_track_search = checking_cached_after_direct_rejection
+        remaining_candidates = tuple(
+            album for album in cached_candidates if album.album_id not in exact_album_candidates_by_id
+        )
+        candidate_count = len(assessments) + len(remaining_candidates)
+        if candidate_count > MAXIMUM_EXACT_ALBUM_CANDIDATES_TO_FETCH:
+            return SpotifyReleaseAlbumMatchResult(
+                decisions=(),
+                search_count=1,
+                diagnostic=(
+                    f"Direct and cached matching-title Spotify album candidates total {candidate_count}. "
+                    f"The safe maximum is {MAXIMUM_EXACT_ALBUM_CANDIDATES_TO_FETCH}, so no cached album was fetched."
+                ),
+                validation_diagnostics=tuple(assessment.diagnostic for assessment in assessments),
+                used_fallback_track_candidates=True,
             )
-        candidate_matches.append(decisions_for_candidate)
-    validated_matches = tuple(decisions for decisions in candidate_matches if decisions)
-    decisions = choose_validated_album_match(tuple(candidate_matches))
+        assessments += tuple(assess_album(album) for album in remaining_candidates)
+
+    validation_diagnostics = tuple(assessment.diagnostic for assessment in assessments)
+    validated_matches = [assessment for assessment in assessments if assessment.decisions]
+    decisions = choose_validated_album_match(tuple(assessment.decisions for assessment in assessments))
     if not validated_matches:
         diagnostic = (
             "matching-title Spotify albums failed sequence validation: "
@@ -213,24 +240,77 @@ def resolve_release_with_album(
             f"{len(validated_matches)} Spotify album editions passed sequence validation, so none was selected; "
             f"validation details: {format_album_validation_diagnostics(validation_diagnostics)}"
         )
-    elif len(decisions) < len(source_tracks):
-        selected_index = next(
-            index
-            for index, candidate_decisions in enumerate(candidate_matches)
-            if candidate_decisions
+    elif checking_cached_after_direct_rejection and not _has_complete_ordered_recording_evidence(
+        source_tracks, validated_matches[0], candidates, fallback_track_candidates,
+    ):
+        decisions = ()
+        diagnostic = (
+            "cached Spotify album failed complete ordered recording identity validation. "
+            f"Fetched album details follow. {format_album_validation_diagnostics(validation_diagnostics)}"
         )
+    elif len(decisions) < len(source_tracks):
         diagnostic = (
             f"validated Spotify album resolved {len(decisions)} of {len(source_tracks)} release tracks; "
-            f"validation details: {format_album_validation_diagnostic(validation_diagnostics[selected_index])}"
+            f"validation details: {format_album_validation_diagnostic(validated_matches[0].diagnostic)}"
         )
     else:
         diagnostic = ""
+    if candidates_came_from_track_search:
+        decisions = mark_track_candidate_album_decisions(
+            decisions, strict_album_recovery=checking_cached_after_direct_rejection,
+        )
     return SpotifyReleaseAlbumMatchResult(
         decisions=decisions,
         search_count=1,
         diagnostic=diagnostic,
-        validation_diagnostics=tuple(validation_diagnostics),
+        validation_diagnostics=validation_diagnostics,
         used_fallback_track_candidates=candidates_came_from_track_search,
+    )
+
+
+def _has_complete_ordered_recording_evidence(
+    source_tracks: Sequence[PlaylistTrack],
+    assessment: _AlbumAssessment,
+    direct_album_candidates: Sequence[SpotifyAlbumCandidate],
+    fallback_track_candidates: Sequence[SpotifyTrackCandidate],
+) -> bool:
+    spotify_tracks = assessment.spotify_tracks
+    if (
+        len(spotify_tracks) != len(source_tracks)
+        or assessment.diagnostic.exact_anchor_count != len(source_tracks)
+        or not assessment.diagnostic.anchor_order_is_valid
+        or len({track.uri for track in spotify_tracks}) != len(spotify_tracks)
+    ):
+        return False
+
+    album_id = assessment.album.album_id
+    album_title = normalize_recording_evidence_text(assessment.album.name)
+    observed_titles = (
+        *(candidate.name for candidate in direct_album_candidates if candidate.album_id == album_id),
+        *(candidate.album_name for candidate in fallback_track_candidates if candidate.album_id == album_id),
+    )
+    if not album_title or any(
+        normalize_recording_evidence_text(title) != album_title for title in observed_titles if title.strip()
+    ):
+        return False
+    return all(
+        normalize_recording_evidence_text(source_track.album_name) == album_title
+        and _track_recording_evidence_matches(source_track, spotify_track)
+        for source_track, spotify_track in zip(source_tracks, spotify_tracks, strict=True)
+    )
+
+
+def _track_recording_evidence_matches(source_track: PlaylistTrack, spotify_track: SpotifyAlbumTrack) -> bool:
+    source_title = normalize_recording_evidence_text(source_track.track_name)
+    source_artist_names = split_source_artist_names(source_track.artist_name) or (source_track.artist_name,)
+    source_artists = sorted(normalize_recording_evidence_text(artist) for artist in source_artist_names)
+    spotify_artists = sorted(normalize_recording_evidence_text(artist) for artist in spotify_track.artists)
+    return (
+        spotify_track_uri_is_structurally_valid(spotify_track.uri)
+        and bool(source_title)
+        and normalize_recording_evidence_text(spotify_track.name) == source_title
+        and all(source_artists)
+        and spotify_artists == source_artists
     )
 
 
@@ -265,6 +345,8 @@ def album_candidates_from_track_candidates(
 
 def mark_track_candidate_album_decisions(
     decisions: Sequence[TrackMatchDecision],
+    *,
+    strict_album_recovery: bool = False,
 ) -> tuple[TrackMatchDecision, ...]:
     strategy_by_album_strategy = {
         ALBUM_EXACT_TRACK_MATCH_STRATEGY: TRACK_CANDIDATE_ALBUM_EXACT_MATCH_STRATEGY,
@@ -276,6 +358,7 @@ def mark_track_candidate_album_decisions(
             decision,
             reason=f"{decision.reason}; {TRACK_CANDIDATE_ALBUM_REASON_SUFFIX}",
             match_strategy=strategy_by_album_strategy[decision.match_strategy],
+            strict_album_recovery=strict_album_recovery,
         )
         for decision in decisions
     )

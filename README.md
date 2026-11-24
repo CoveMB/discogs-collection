@@ -626,11 +626,23 @@ an album mismatch does not block the release. An album API failure stops the run
 instead of starting many fallback searches. Rate-limit stops use the same
 saved-cache and partial-report behavior described below.
 
-When an earlier ordinary track search cached a Spotify album ID with the same
-normalized album name, a later run can use that ID if album search misses the
-album. The publisher fetches at most five distinct cached album IDs and runs the
-same sequence validation. Cached track candidates are ignored with
-`--refresh-match-cache`, which always requests fresh Spotify search results.
+If an ordinary track search cached a Spotify album ID with the same normalized
+album name, the publisher can validate that album when album search returns no
+matching title. If every fetched matching-title album fails sequence validation,
+the publisher considers eligible cached IDs it has yet to fetch. It fetches at
+most five distinct tracklists across the search results and cached IDs. If the
+cached group would exceed that limit, it skips the entire group.
+
+After direct results fail validation, exactly one cached edition must pass
+sequence validation. The returned tracklist must match the source in count and
+order. The cached album title, track titles, and full artist credits must agree
+with the source after normalizing case and whitespace. The comparison preserves
+Unicode, punctuation, and edition text. Conflicting album titles for the same
+Spotify ID block recovery. Recovered matches apply only to the exact source
+identity they proved, including when the cache is reused. Older versions skip
+these saved matches. The publisher records completed cached assessments that
+leave rows unresolved so it can skip repeat attempts with the same hints.
+`--refresh-match-cache` requests fresh Spotify search results.
 
 The track search ladder starts with a structured Spotify query using `Track
 Name`, `Artist Name`, and `Album Name`. If that does not find a match, it tries
