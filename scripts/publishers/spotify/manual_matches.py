@@ -16,6 +16,7 @@ if str(SCRIPTS_DIRECTORY) not in sys.path:
 
 from publishers.spotify.match_cache import (  # noqa: E402
     MATCHER_VERSION,
+    clear_manual_collision_cache_entry,
     compare_cached_manual_source,
     compare_manual_source,
     load_spotify_track_match_cache,
@@ -126,6 +127,7 @@ def import_manual_match_overrides(
         if override.spotify_album_id:
             record["spotify_album_id"] = override.spotify_album_id
         match_cache[spotify_track_match_key(track)] = record
+        clear_manual_collision_cache_entry(track, match_cache)
     save_spotify_track_match_cache(match_cache_path, match_cache)
     return ManualMatchImportSummary(
         planned_count=len(overrides),

@@ -835,10 +835,11 @@ rows share the cache key for an override, the entire import fails before any
 cache write.
 
 An applied manual match remains authoritative across matcher updates for the
-verified source. An ordinary publish can search for a colliding row while
-keeping the manual choice for the verified source. Use `--replace-existing` to
-replace a different matched or manual Spotify URI or to bind a manual match to
-a different source that shares the same cache key.
+verified source. If another row shares the cache key, the publisher keeps that
+row's automatic decision separately by source identity. Later passes and restarts
+can reuse that decision. Use `--replace-existing` to replace a different matched
+or manual Spotify URI or to bind a manual match to a different source that
+shares the same cache key.
 
 Normal publishing holds rows with incomplete manual records for review. To
 restore a manual match, fill the five source fields from the verified playlist

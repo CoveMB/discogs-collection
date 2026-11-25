@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 
 
@@ -14,11 +15,13 @@ sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 from publishers.spotify.manual_matches import import_manual_match_overrides
 from publishers.spotify.match_cache import (
     MATCHER_VERSION,
+    cache_track_match,
     cached_track_match,
     load_spotify_track_match_cache,
     save_spotify_track_match_cache,
+    spotify_track_match_key,
 )
-from publishers.spotify.matching import PlaylistTrack
+from publishers.spotify.matching import MATCHED, UNMATCHED, PlaylistTrack, TrackMatchDecision
 from shared.tunemymusic import TUNEMYMUSIC_COLUMNS
 
 
@@ -308,6 +311,33 @@ class SpotifyManualMatchTests(unittest.TestCase):
         self.assertEqual(summary.applied_count, 1)
         self.assertEqual(record["spotify_uri"], "spotify:track:x")
 
+    def test_cached_automatic_collision_requires_explicit_source_strings(self) -> None:
+        source = PlaylistTrack("Mix", "release-1", "Source Album", "1", "Source Track", "Source Artist", "")
+        for field in ("track_name", "artist_name", "album_name"):
+            with self.subTest(field=field):
+                ordinary = replace(source, **{field: ""})
+                verified = replace(source, **{field: "月"})
+                manual_key = spotify_track_match_key(verified)
+                self.assertEqual(spotify_track_match_key(ordinary), manual_key)
+                records: dict[str, dict[str, object]] = {manual_key: {
+                    "release_id": verified.release_id, "track_number": verified.track_number,
+                    "track_name": verified.track_name, "artist_name": verified.artist_name, "album_name": verified.album_name,
+                    "match_status": "manual", "spotify_uri": "spotify:track:verified",
+                }}
+                self.assertTrue(cache_track_match(records, TrackMatchDecision(ordinary, UNMATCHED, "", "no candidates")))
+                replay = cached_track_match(ordinary, records)
+                self.assertIsNotNone(replay)
+                assert replay is not None
+                self.assertEqual(replay.decision.status, UNMATCHED)
+
+                saved_record = records[replay.cache_key]
+                records[replay.cache_key] = {key: value for key, value in saved_record.items() if key != field}
+                self.assertIsNone(cached_track_match(ordinary, records))
+                for malformed in (None, 0, [], "月"):
+                    with self.subTest(saved_value=malformed):
+                        records[replay.cache_key] = {**saved_record, field: malformed}
+                        self.assertIsNone(cached_track_match(ordinary, records))
+
     def test_rebinding_manual_match_with_same_uri_requires_explicit_flag(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
@@ -323,6 +353,12 @@ class SpotifyManualMatchTests(unittest.TestCase):
 
             write_playlist_master(master, source_values={"Track Name": "Signal 月"})
             write_override_file(overrides_path, source_values={"track_name": "Signal 月"})
+            colliding_track = PlaylistTrack("Mix", "release-1", "Source Album", "1", "Signal 月", "Source Artist", "")
+            records = load_spotify_track_match_cache(cache_path)
+            self.assertTrue(cache_track_match(records, TrackMatchDecision(
+                colliding_track, MATCHED, "spotify:track:earlier-automatic", "synthetic earlier search",
+            )))
+            save_spotify_track_match_cache(cache_path, records)
             original_cache = cache_path.read_bytes()
             for apply in (False, True):
                 with self.subTest(apply=apply), self.assertRaisesRegex(ValueError, "use --replace-existing"):
@@ -335,6 +371,11 @@ class SpotifyManualMatchTests(unittest.TestCase):
             self.assertEqual(result.applied_count, 1)
             record = load_spotify_track_match_cache(cache_path)["release-1|1|source artist|source album|signal"]
             self.assertEqual((record["track_name"], record["spotify_uri"]), ("Signal 月", "spotify:track:manual-one"))
+
+            write_playlist_master(master, source_values={"Track Name": "Signal 星"})
+            write_override_file(overrides_path, source_values={"track_name": "Signal 星"})
+            import_manual_match_overrides(overrides_path, directory, cache_path, apply=True, replace_existing=True)
+            self.assertIsNone(cached_track_match(colliding_track, load_spotify_track_match_cache(cache_path)))
 
     def test_replacing_different_matched_record_requires_explicit_flag(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

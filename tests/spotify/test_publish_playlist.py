@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from dataclasses import replace
+from itertools import product
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
@@ -2029,8 +2030,6 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             key = "111|1|harbour lines|tidal signals|signal 2019 remaster"
             records = load_spotify_track_match_cache(cache)
             records[key]["matcher_version"] = MATCHER_VERSION - 1
-            save_spotify_track_match_cache(cache, records)
-            original_cache = cache.read_bytes()
 
             def preview(client, *, refresh=False):
                 return publish_spotify_playlists(
@@ -2044,13 +2043,22 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
                 (mismatch, "unmatched", ""),
             ):
                 with self.subTest(status=expected_status):
+                    save_spotify_track_match_cache(cache, records)
                     client = PublishingSpotifyClient({ordinary_query: (search_candidate,), review_query: (review,)})
                     decision = preview(client)
                     self.assertEqual(
                         (decision.match_source, decision.status, decision.spotify_uri),
                         ("search", expected_status, expected_uri),
                     )
-                    self.assertEqual(cache.read_bytes(), original_cache)
+                    self.assertEqual(load_spotify_track_match_cache(cache)[key], records[key])
+                    replay_client = PublishingSpotifyClient({})
+                    replay = preview(replay_client)
+                    self.assertEqual(
+                        (replay.match_source, replay.status, replay.spotify_uri),
+                        ("cache", expected_status, expected_uri),
+                    )
+                    self.assertEqual(replay.review_candidates, decision.review_candidates)
+                    self.assertEqual(replay_client.searches, [])
                     if expected_status == "unmatched":
                         self.assertEqual(
                             [item.uri for item in decision.review_candidates if item.version_title_review_only],
@@ -2064,9 +2072,16 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             self.assertEqual(client.searches, [])
 
             write_playlist_master(master, [changed_row])
-            decision = preview(PublishingSpotifyClient({ordinary_query: (fresh,)}), refresh=True)
-            self.assertEqual((decision.match_source, decision.spotify_uri), ("search", fresh.uri))
-            self.assertEqual(load_spotify_track_match_cache(cache)[key]["spotify_uri"], fresh.uri)
+            refreshed = replace(fresh, uri="spotify:track:refreshed")
+            decision = preview(PublishingSpotifyClient({ordinary_query: (refreshed,)}), refresh=True)
+            self.assertEqual((decision.match_source, decision.spotify_uri), ("search", refreshed.uri))
+            self.assertEqual(load_spotify_track_match_cache(cache)[key]["spotify_uri"], refreshed.uri)
+
+            write_playlist_master(master, [verified_row])
+            import_manual_match_overrides(override, directory, cache, apply=True, replace_existing=True)
+            write_playlist_master(master, [changed_row])
+            decision = preview(PublishingSpotifyClient({ordinary_query: (refreshed,)}))
+            self.assertEqual((decision.match_source, decision.spotify_uri), ("search", refreshed.uri))
 
     def test_publish_holds_incomplete_manual_record_until_verified_reimport(self):
         from publishers.spotify.manual_matches import import_manual_match_overrides
@@ -2092,6 +2107,14 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
                 playlist_row("111", album, "Middle", artist, "2"),
                 playlist_row("111", album, "Closing", artist, "3"),
             ])
+            records = {key: {
+                **cached_negative_match_record(playlist_row("111", album, "Middle東", artist, "2"), ()),
+                "match_status": "manual", "spotify_uri": manual_uri,
+            }}
+            self.assertTrue(cache_track_match(records, TrackMatchDecision(
+                playlist_track("Test", "111", album, "Middle", artist, "2"),
+                MATCHED, "spotify:track:retained-automatic", "synthetic earlier search",
+            )))
 
             def publish(client, *, apply):
                 return publish_spotify_playlists(
@@ -2099,10 +2122,14 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
                     match_cache_path=cache, apply=apply, publisher_sync_mode="replace",
                 )
 
-            for source_fields in ({"release_id": "111", "track_number": "2"}, {}):
+            for source_fields in (
+                {"release_id": "111", "track_number": "2"},
+                {"release_id": "111", "track_number": "2", "track_name": "Middle", "artist_name": artist, "album_name": ""},
+                {},
+            ):
                 with self.subTest(source_fields=source_fields):
                     record = {"match_status": "manual", "spotify_uri": manual_uri, **source_fields}
-                    save_spotify_track_match_cache(cache, {key: record})
+                    save_spotify_track_match_cache(cache, {**records, key: record})
                     client = AlbumPublishingSpotifyClient((album_candidate,), {"album": album_tracks})
 
                     with self.assertRaisesRegex(ValueError, "replace mode aborted before writing"):
@@ -2136,6 +2163,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         album = "Tidal Signals"
         verified = playlist_row("111", album, "Signal 東", artist)
         changed = playlist_row("111", album, "Signal 西", artist)
+        other = playlist_row("111", album, "Signal 南", artist)
         manual_uri = "spotify:track:manual"
         album_uri = "spotify:track:album-signal"
         key = "111|1|harbour lines|tidal signals|signal"
@@ -2153,6 +2181,11 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
                     SpotifyAlbumTrack("spotify:track:closing", "Closing", (artist,), 3, 1, True),
                 ),
             },
+            candidates_by_query={
+                'track:"Signal 南" artist:"Harbour Lines" album:"Tidal Signals"': (
+                    replace(matching_candidate(other), uri="spotify:track:other"),
+                ),
+            },
         )
 
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -2165,7 +2198,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
                 playlist_row("111", album, "Middle", artist, "2"),
                 playlist_row("111", album, "Closing", artist, "3"),
             ])
-            write_playlist_master(verified_master, [verified])
+            write_playlist_master(verified_master, [other, verified])
             save_spotify_track_match_cache(cache, {key: starting_record})
 
             summary = publish_spotify_playlists(
@@ -2174,12 +2207,59 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
                 apply=False, publisher_sync_mode="replace",
             )
             saved_record = load_spotify_track_match_cache(cache)[key]
+            replay = publish_spotify_playlists(
+                directory, directory / "report.txt", PublishingSpotifyClient({}), "synthetic-token",
+                playlist_master_paths=(changed_master, verified_master), match_cache_path=cache,
+                apply=False, publisher_sync_mode="replace",
+            )
 
         self.assertEqual((summary.decisions[0].match_source, summary.decisions[0].spotify_uri), ("album", album_uri))
+        self.assertEqual((summary.decisions[-2].match_source, summary.decisions[-2].spotify_uri),
+                         ("search", "spotify:track:other"))
         self.assertEqual((summary.decisions[-1].match_source, summary.decisions[-1].spotify_uri), ("cache", manual_uri))
+        self.assertEqual(replay.search_count, 0)
+        self.assertEqual([item.spotify_uri for item in replay.decisions], [item.spotify_uri for item in summary.decisions])
         self.assertEqual(saved_record["match_status"], "manual")
         self.assertEqual(saved_record["track_name"], "Signal 東")
         self.assertEqual(saved_record["spotify_uri"], manual_uri)
+
+    def test_publish_replays_recording_conflict_for_colliding_automatic_match(self):
+        album = "Tidal Signals"
+        artist = "Harbour Lines"
+        earlier = playlist_row("111", album, "North Bridge", artist)
+        colliding = playlist_row("222", album, "Signal 西", artist)
+        verified = playlist_row("222", album, "Signal 東", artist)
+        earlier_copies, colliding_copies = overlapping_edition_candidates(earlier, colliding)
+        manual_key = "222|1|harbour lines|tidal signals|signal"
+        manual_record = {
+            **cached_negative_match_record(verified, ()),
+            "match_status": "manual",
+            "spotify_uri": "spotify:track:verified",
+        }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            master = directory / "Test" / "Test.csv"
+            cache = directory / "matches.json"
+            save_spotify_track_match_cache(cache, {manual_key: manual_record})
+            write_playlist_master(master, [earlier, colliding])
+            client = PublishingSpotifyClient({
+                'track:"North Bridge" artist:"Harbour Lines" album:"Tidal Signals"': earlier_copies,
+                'track:"Signal 西" artist:"Harbour Lines" album:"Tidal Signals"': colliding_copies,
+            })
+            result = publish_spotify_playlists(
+                directory, directory / "report.txt", client, "synthetic-token", match_cache_path=cache, apply=False,
+            )
+            write_playlist_master(master, [colliding])
+            replay = publish_spotify_playlists(
+                directory, directory / "report.txt", PublishingSpotifyClient({}), "synthetic-token",
+                match_cache_path=cache, apply=False,
+            )
+            self.assertEqual(load_spotify_track_match_cache(cache)[manual_key], manual_record)
+
+        self.assertEqual([item.status for item in result.decisions], ["would_add", "ambiguous"])
+        self.assertEqual((replay.search_count, replay.decisions[0].status, replay.decisions[0].spotify_uri), (0, "ambiguous", ""))
+        self.assertIn("different ISRC", replay.decisions[0].reason)
 
     def test_publish_edition_tie_keeps_manual_override_after_a_mixed_run_conflict(self):
         from publishers.spotify.manual_matches import import_manual_match_overrides
@@ -9720,6 +9800,47 @@ class SpotifyContinuousPublishingTests(unittest.TestCase):
         self.assertEqual(summary.cache_hit_count, 101)
         self.assertEqual(summary.completed_pass_count, 1)
         self.assertEqual([len(r[3]["uris"]) for r in self.writes if r[2].endswith("/items")], [100,1])
+
+    def test_manual_collision_retains_progress_in_bounded_and_continuous_append(self):
+        self.names = ["pulse西", "bravo"]
+        self.args.max_new_searches_per_run = 1
+        self.args.apply = False
+
+        for continuous, source_album in product((False, True), ("Synthetic Album", "")):
+            with self.subTest(continuous=continuous, source_album=source_album):
+                write_playlist_master(self.master, [
+                    playlist_row("release-1", source_album, self.names[0], "Synthetic Artist"),
+                    playlist_row("release-1", "Synthetic Album", self.names[1], "Synthetic Artist", "2"),
+                ])
+                manual_key = f"release-1|1|synthetic artist|{source_album.casefold()}|pulse"
+                manual_record = {
+                    "release_id": "release-1", "track_number": "1",
+                    "track_name": "pulse東" if source_album else self.names[0],
+                    "artist_name": "Synthetic Artist", "album_name": source_album or "月",
+                    "match_status": "manual", "spotify_uri": "spotify:track:verified",
+                }
+                self.args.continuous = continuous
+                self.args.match_cache = self.directory / f"matches-{continuous}.json"
+                self.search_names.clear()
+                save_spotify_track_match_cache(self.args.match_cache, {manual_key: manual_record})
+
+                summary = self.run_publish()
+                if continuous:
+                    self.assertEqual(summary.completed_pass_count, 2)
+                else:
+                    self.assertEqual((summary.stop_reason, summary.search_count), ("search_budget", 1))
+                    self.assertTrue(summary.resume_progress_made)
+                    summary = self.run_publish()
+                self.assertEqual((summary.stop_reason, summary.search_count), ("complete", 1))
+                self.assertEqual(self.search_names, self.names)
+                self.assertEqual(
+                    [(row.match_source, row.spotify_uri) for row in summary.decisions],
+                    [("cache", "spotify:track:pulse西"), ("search", "spotify:track:bravo")],
+                )
+                restarted = self.run_publish()
+                self.assertEqual((restarted.stop_reason, restarted.search_count, restarted.cache_hit_count), ("complete", 0, 2))
+                self.assertEqual(self.search_names, self.names)
+                self.assertEqual(load_spotify_track_match_cache(self.args.match_cache)[manual_key], manual_record)
 
     def test_strict_album_collision_version_review_stops_after_one_capped_pass(self):
         self.args.max_new_searches_per_run = 1

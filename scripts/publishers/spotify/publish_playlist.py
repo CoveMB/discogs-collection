@@ -46,6 +46,7 @@ from publishers.spotify.match_cache import (  # noqa: E402
     record_cached_version_title_review,
     save_spotify_track_match_cache,
     spotify_track_match_key,
+    track_match_cache_entry,
     utc_timestamp,
 )
 from publishers.spotify.matching import (  # noqa: E402
@@ -496,7 +497,9 @@ def publish_spotify_playlists(
                 existing_incomplete_spotify_uris = incomplete_spotify_playlist_item_uris(existing_items)
                 existing_complete_items_by_uri = complete_playlist_items_by_uri(existing_items)
                 for source_position, track in enumerate(playlist_tracks, start=1):
-                    track_cache_key = spotify_track_match_key(track)
+                    track_cache_key, _ = track_match_cache_entry(
+                        track, match_cache, refresh_match_cache=refresh_match_cache,
+                    )
                     cached_match = None
                     if not refresh_match_cache:
                         cached_match = cached_track_match(track, match_cache, seen_at=timestamp)
@@ -579,10 +582,12 @@ def publish_spotify_playlists(
                                             cached_album_ids,
                                         )
                                     for resolved_decision in album_result.decisions:
-                                        resolved_key = spotify_track_match_key(resolved_decision.track)
+                                        resolved_key, resolved_record = track_match_cache_entry(
+                                            resolved_decision.track, match_cache, refresh_match_cache=refresh_match_cache,
+                                        )
                                         if resolved_key in preexisting_matched_cache_keys or (
                                             not refresh_match_cache
-                                            and cache_record_has_recording_conflict(match_cache.get(resolved_key))
+                                            and cache_record_has_recording_conflict(resolved_record)
                                         ):
                                             continue
                                         album_decisions_by_track_key[resolved_key] = resolved_decision
@@ -725,7 +730,8 @@ def publish_spotify_playlists(
                             match_source = MATCH_SOURCE_SEARCH
                             if review_error is None:
                                 decision = complete_version_title_review(decision, review_query, review_candidates)
-                                if record_cached_version_title_review(match_cache[track_cache_key], decision):
+                                _, record = track_match_cache_entry(track, match_cache)
+                                if record is not None and record_cached_version_title_review(record, decision):
                                     resume_progress_made = True
                             elif invocation is not None:
                                 raise review_error
@@ -795,8 +801,10 @@ def publish_spotify_playlists(
                             )
                             if cached_match is None and cached_track_match(track, match_cache) is not None:
                                 resume_progress_made = True
-                        if recording_conflict and (record := match_cache.get(track_cache_key)) is not None:
-                            record_cached_recording_conflict(record, recording_conflict)
+                        if recording_conflict:
+                            _, record = track_match_cache_entry(track, match_cache)
+                            if record is not None:
+                                record_cached_recording_conflict(record, recording_conflict)
                         if len(decisions) % 25 == 0:
                             save_spotify_track_match_cache(match_cache_path, match_cache)
                         if publisher_sync_mode == APPEND_SYNC_MODE and apply and len(append_candidates) >= 100:
@@ -1136,7 +1144,7 @@ def cached_review_candidates_for_release(
 ) -> tuple[SpotifyTrackCandidate, ...]:
     candidates_by_album_observation: dict[tuple[str, str, str], SpotifyTrackCandidate] = {}
     for track in release_tracks:
-        record = match_cache.get(spotify_track_match_key(track))
+        _, record = track_match_cache_entry(track, match_cache)
         if record is None:
             continue
         candidates = album_lookup_candidates_from_cache_record(track, record)
@@ -1178,7 +1186,7 @@ def release_has_current_album_recovery_attempt(
     return any(
         cache_record_has_current_album_recovery_attempt(track, record, album_ids)
         for track in release_tracks
-        if (record := match_cache.get(spotify_track_match_key(track))) is not None
+        if (record := track_match_cache_entry(track, match_cache)[1]) is not None
     )
 
 
@@ -1188,7 +1196,7 @@ def record_album_recovery_attempt_for_release(
     album_ids: Sequence[str],
 ) -> None:
     for track in release_tracks:
-        record = match_cache.get(spotify_track_match_key(track))
+        _, record = track_match_cache_entry(track, match_cache)
         if record is not None:
             record_album_recovery_attempt(track, record, album_ids)
 
