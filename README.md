@@ -824,6 +824,43 @@ recordings. Verify the performance before using a URI in a manual override.
 The command leaves the generated masters, track caches, publisher state,
 and Spotify playlists untouched.
 
+## Propose a manual match for a tied Spotify recording
+
+Add `--proposals` to verify a tie using the source recording's ISRC and save
+the result for manual review. Use a new JSON filename in an existing directory.
+
+```sh
+python3 scripts/publishers/spotify/review_track_matches.py \
+  --release-id 123456789 \
+  --playlist-output-directory collection/playlists/release-playlists \
+  --proposals ./spotify-recording-proposals.json
+```
+
+This works for saved ambiguous rows with competing candidates, including tracks
+with one artist spelling, and for previously unmatched rows where the spelling
+search finds a tie. A single new suggestion stays in the stdout report.
+
+The command looks up the exact Discogs pressing in MusicBrainz. It checks the
+links in both directions, the barcode and label/catalogue pair, and the ordered
+CD tracks or vinyl sides. The recording must have a single ISRC that MusicBrainz
+links back to that recording alone. Spotify must return a complete first page
+for that code and confirm that the recording is playable. The title, artist
+credits, and durations must agree. A verified recording can come from another
+album. When multiple editions qualify, the report explains the choice and shows
+the other verified editions. The file keeps one override per printed track
+position when the same recording appears more than once.
+
+The JSON file contains only the overrides for the importer. It can be empty if
+no track qualifies. Read the stdout report for tracks held for review or
+incomplete catalog requests. Preview the file with the same playlist root and
+match cache you used for the review.
+
+```sh
+python3 scripts/publishers/spotify/manual_matches.py \
+  --overrides ./spotify-recording-proposals.json \
+  --playlist-output-directory collection/playlists/release-playlists
+```
+
 ## Import manual Spotify matches
 
 Use a manual override when the report identifies the correct Spotify track but

@@ -31,6 +31,7 @@ from publishers.spotify.client import (
     parse_search_track_items,
 )
 from publishers.spotify.env import DEFAULT_ENV_PATH, DEFAULT_TOKEN_CACHE_PATH, load_spotify_settings
+from publishers.spotify.manual_matches import ManualMatchOverride
 from publishers.spotify.match_cache import (
     cache_record_has_recording_conflict,
     cached_track_match,
@@ -49,14 +50,36 @@ from publishers.spotify.matching import (
     PlaylistTrack,
     SpotifyRecordingMetadata,
     SpotifyTrackCandidate,
+    artist_spelling,
     build_spotify_track_search_query,
     normalize_recording_evidence_text,
     spotify_track_uri_is_structurally_valid,
 )
+from publishers.spotify.musicbrainz_recordings import (
+    DiscogsTrackEvidence,
+    IncompleteMusicBrainzEvidence,
+    MusicBrainzClient,
+    UnverifiedPressing,
+    conflicting_recording_claims,
+    discogs_duration_ms,
+)
 from publishers.spotify.publish_playlist import read_playlist_tracks
+from publishers.spotify.recording_proposals import (
+    SpotifyRecordingHit,
+    check_spotify_recordings,
+    ordered_editions,
+    proposal_destination,
+    write_proposals,
+)
 from publishers.spotify.session import SpotifySession, get_spotify_access_token, load_existing_token
 from shared.discogs_api import DEFAULT_REQUEST_INTERVAL_SECONDS, DiscogsRateLimiter, default_discogs_rate_limit
-from shared.workflow_paths import DEFAULT_SPOTIFY_MATCH_CACHE_PATH
+from shared.workflow_paths import (
+    DEFAULT_PROCESSING_CACHE_PATH,
+    DEFAULT_SEEN_TERMS_CACHE_PATH,
+    DEFAULT_SPOTIFY_MATCH_CACHE_PATH,
+    DEFAULT_SPOTIFY_PUBLISH_STATE_CACHE_PATH,
+    DEFAULT_TRACKLIST_CACHE_PATH,
+)
 
 
 SEARCH_LIMIT = 10
@@ -81,23 +104,47 @@ class ReviewRow:
     discogs_credits: tuple[DiscogsCredit, ...] = ()
     queries: list[dict[str, str]] = field(default_factory=list)
     candidates: list[dict[str, object]] = field(default_factory=list)
+    recording_proof: dict[str, object] | None = None
+
+
+@dataclass
+class CandidateEvidence:
+    prior_status: str
+    cached_hits: tuple[SpotifyTrackCandidate, ...]
+    discovery_hits: list[SpotifyTrackCandidate] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class RawSearchPage:
+    tracks: Mapping[str, object] | None = None
+    reason: str = ""
+    terminal: bool = False
 
 
 @dataclass(frozen=True)
 class SearchPage:
     hits: tuple[SpotifyTrackCandidate, ...] = ()
     reason: str = ""
-    terminal: bool = False
+
+
+@dataclass(frozen=True)
+class RecordingLookup:
+    code: str
+    durations: tuple[int, int]
+    candidate_uris: set[str]
+    items: list[object]
+
+
+@dataclass(frozen=True)
+class RecordingProposal:
+    track: PlaylistTrack
+    row: ReviewRow
+    code: str
+    editions: tuple[SpotifyRecordingHit, ...]
 
 
 def strict_text(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
-
-
-def artist_spelling(value: str) -> str:
-    text = normalize_recording_evidence_text(value)
-    text = re.sub(r"\s*\.\s*", ".", text)
-    return re.sub(r"(?<=[^\W_])\s*[-\u2010\u2011]\s*(?=[^\W_])", " ", text)
 
 
 def discogs_credits(value: object) -> tuple[DiscogsCredit, ...]:
@@ -165,7 +212,9 @@ def source_groups(tracks: Sequence[PlaylistTrack], release_id: str) -> list[tupl
     return [source for sources in groups.values() for source in sources]
 
 
-def assess_row(track: PlaylistTrack, row: ReviewRow, matches: Mapping[str, Mapping[str, object]]) -> tuple[SpotifyTrackCandidate, ...]:
+def assess_row(
+    track: PlaylistTrack, row: ReviewRow, matches: Mapping[str, Mapping[str, object]], *, proposals: bool,
+) -> CandidateEvidence | None:
     primary = matches.get(spotify_track_match_key(track))
     _, selected = track_match_cache_entry(track, matches)
     records = (primary, selected)
@@ -173,6 +222,8 @@ def assess_row(track: PlaylistTrack, row: ReviewRow, matches: Mapping[str, Mappi
         row.status, row.reason = "manual_hold", "The match cache key has a manual owner."
     elif any(cache_record_has_recording_conflict(record) for record in records):
         row.status, row.reason = "recording_conflict", "The match cache has a recording-conflict hold."
+    elif proposals and any(record is not None and strict_text(record.get("match_status")) == MATCHED for record in records):
+        row.status, row.reason = "already_matched", "The match cache key has a positive match."
     elif (effective := cached_track_match(track, matches)) and effective.decision.status == MATCHED:
         row.status, row.reason = "already_matched", "The publisher has a current match."
     elif (
@@ -181,11 +232,11 @@ def assess_row(track: PlaylistTrack, row: ReviewRow, matches: Mapping[str, Mappi
         and effective.decision.status in {AMBIGUOUS, UNMATCHED}
         and compare_cached_manual_source(track, selected) is True
     ):
-        return source_bound_cached_candidates(selected)
+        return CandidateEvidence(effective.decision.status, source_bound_cached_candidates(selected))
     else:
         row.status = "unassessed"
         row.reason = "Run the ordinary publisher preview to obtain a current assessment for this exact source."
-    return ()
+    return None
 
 
 def source_bound_cached_candidates(record: Mapping[str, object]) -> tuple[SpotifyTrackCandidate, ...]:
@@ -331,27 +382,57 @@ def parse_review_hit(item: object) -> SpotifyTrackCandidate | None:
     )
 
 
-def search_first_page(client: SpotifyClient, access_token: str, query: str) -> SearchPage:
+def search_raw_page(client: SpotifyClient, access_token: str, query: str) -> RawSearchPage:
     if len(query) > SPOTIFY_TRACK_SEARCH_QUERY_CHARACTER_LIMIT:
-        return SearchPage(reason="The title and credit exceed Spotify’s query length limit.")
+        return RawSearchPage(reason="The title and credit exceed Spotify’s query length limit.")
     try:
         response = client.search_tracks_response(access_token, query, SEARCH_LIMIT)
     except SpotifyAuthenticationError:
-        return SearchPage(reason="Spotify authentication failed. Reauthorize before restarting.", terminal=True)
+        return RawSearchPage(reason="Spotify authentication failed. Reauthorize before restarting.", terminal=True)
     except (SpotifyRateLimitDeferredError, SpotifyRateLimitRetriesExhaustedError) as error:
-        return SearchPage(reason=f"Spotify rate limit. Retry after {format_wait_duration(error.retry_after_seconds)}.", terminal=True)
+        return RawSearchPage(reason=f"Spotify rate limit. Retry after {format_wait_duration(error.retry_after_seconds)}.", terminal=True)
     except UnicodeDecodeError:
-        return SearchPage(reason="Spotify returned a response that could not be decoded.")
+        return RawSearchPage(reason="Spotify returned a response that could not be decoded.")
     except (SpotifyApiError, OSError, http.client.HTTPException):
-        return SearchPage(reason="The Spotify search request failed.", terminal=True)
+        return RawSearchPage(reason="The Spotify search request failed.", terminal=True)
     if response.status != 200:
-        return SearchPage(reason=f"Spotify search returned HTTP {response.status}.", terminal=response.status != 400)
+        return RawSearchPage(reason=f"Spotify search returned HTTP {response.status}.", terminal=response.status != 400)
     try:
         payload = json.loads(response.body)
     except ValueError:
-        return SearchPage(reason="Spotify returned invalid JSON.")
+        return RawSearchPage(reason="Spotify returned invalid JSON.")
     tracks = payload.get("tracks") if isinstance(payload, dict) else None
-    if not isinstance(tracks, dict) or not isinstance(items := tracks.get("items"), list):
+    return RawSearchPage(tracks) if isinstance(tracks, dict) else RawSearchPage(reason="Spotify returned a malformed track page.")
+
+
+class SpotifySearch:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.client: SpotifyClient | None = None
+        self.access_token = ""
+        self.stopped = ""
+        self.pages: dict[str, RawSearchPage] = {}
+
+    def get(self, query: str) -> RawSearchPage | None:
+        if query not in self.pages and not self.stopped:
+            if self.client is None:
+                try:
+                    self.client, self.access_token = open_spotify_search(self.args)
+                except (SpotifyAuthenticationError, ValueError, OSError, http.client.HTTPException):
+                    self.stopped = "Spotify authentication could not start. Check the OAuth settings or reauthorize."
+            if self.client is not None:
+                page = search_raw_page(self.client, self.access_token, query)
+                self.pages[query] = page
+                if page.terminal:
+                    self.stopped = page.reason
+        return self.pages.get(query)
+
+
+def review_search_page(raw: RawSearchPage) -> SearchPage:
+    if raw.reason:
+        return SearchPage(reason=raw.reason)
+    tracks = raw.tracks
+    if tracks is None or not isinstance(items := tracks.get("items"), list):
         return SearchPage(reason="Spotify returned a malformed track page.")
     offset = tracks.get("offset", 0)
     total = tracks.get("total", len(items))
@@ -403,38 +484,26 @@ def report_candidates(
 
 
 def collect_candidates(
-    args: argparse.Namespace, rows: Sequence[tuple[PlaylistTrack, ReviewRow]],
-    cached_candidates: Mapping[PlaylistTrack, tuple[SpotifyTrackCandidate, ...]],
+    search: SpotifySearch, rows: Sequence[tuple[PlaylistTrack, ReviewRow]],
+    candidates: Mapping[PlaylistTrack, CandidateEvidence],
 ) -> None:
-    client: SpotifyClient | None = None
-    access_token = ""
-    stopped = ""
-    pages: dict[str, SearchPage] = {}
     for track, row in rows:
         credit = next(credit for credit in row.discogs_credits if credit.printed != credit.canonical)
+        evidence = candidates[track]
         observations: dict[tuple[SpotifyTrackCandidate, SpotifyRecordingMetadata], list[str]] = {
-            (hit, hit.recording_metadata()): ["cached_review"] for hit in cached_candidates[track]
+            (hit, hit.recording_metadata()): ["cached_review"] for hit in evidence.cached_hits
         }
         for origin, artist_name in (("printed_search", credit.printed), ("canonical_search", credit.canonical)):
             query = build_spotify_track_search_query(replace(track, artist_name=artist_name, album_name=""))
             entry = {"origin": origin, "credit": artist_name, "query": query}
             row.queries.append(entry)
-            if query not in pages and not stopped:
-                if client is None:
-                    try:
-                        client, access_token = open_spotify_search(args)
-                    except (SpotifyAuthenticationError, ValueError, OSError, http.client.HTTPException):
-                        stopped = "Spotify authentication could not start. Check the OAuth settings or reauthorize."
-                if client is not None:
-                    page = search_first_page(client, access_token, query)
-                    pages[query] = page
-                    if page.terminal:
-                        stopped = page.reason
-            page = pages.get(query)
-            if page is None:
-                entry.update(status="not_run", reason=stopped)
+            raw = search.get(query)
+            if raw is None:
+                entry.update(status="not_run", reason=search.stopped)
             else:
+                page = review_search_page(raw)
                 entry.update(status="incomplete" if page.reason else "complete", reason=page.reason)
+                evidence.discovery_hits.extend(page.hits)
                 for hit in page.hits:
                     origins = observations.setdefault((hit, hit.recording_metadata()), [])
                     if origin not in origins:
@@ -446,15 +515,241 @@ def collect_candidates(
             row.status = "suggestions" if row.candidates else "no_suggestions"
 
 
+def source_evidence(payload: Mapping[str, object]) -> tuple[DiscogsTrackEvidence, ...]:
+    items = included_track_items(payload.get("tracklist"), strict=True)
+    positions = Counter(normalize_recording_evidence_text(strict_text(item.get("position"))) for item, _ in items)
+    result: list[DiscogsTrackEvidence] = []
+    for item, parents in items:
+        position = strict_text(item.get("position"))
+        position_key = normalize_recording_evidence_text(position)
+        credits = item.get("artists", [])
+        if credits == []:
+            credits = payload.get("artists")
+        if parents or not position or positions[position_key] != 1:
+            raise UnverifiedPressing("The complete pressing has unsupported nested, anonymous or repeated positions.")
+        if issue := separate_credit_issue(item.get("extraartists", [])) or separate_credit_issue(
+            payload.get("extraartists", []), other_positions={key for key in positions if key and key != position_key},
+        ):
+            raise UnverifiedPressing(issue)
+        if not (structured_credits := discogs_credits(credits)):
+            raise UnverifiedPressing("The complete pressing has unverified structured artist credits.")
+        result.append(DiscogsTrackEvidence(
+            position, strict_text(item.get("title")), tuple(
+                frozenset(artist_spelling(name) for name in (credit.printed, credit.canonical))
+                for credit in structured_credits
+            ), tuple(credit.artist_id for credit in structured_credits), discogs_duration_ms(item.get("duration")),
+        ))
+    return tuple(result)
+
+
+def unresolved_uris(track: PlaylistTrack, row: ReviewRow, evidence: CandidateEvidence) -> set[str]:
+    if row.status == "no_variation" and evidence.prior_status != AMBIGUOUS:
+        return set()
+    return {
+        hit.uri for hit in (*evidence.cached_hits, *evidence.discovery_hits)
+        if matching_credits(track.track_name, row.discogs_credits, hit) is not None
+    }
+
+
+def complete_isrc_items(search: SpotifySearch, code: str) -> list[object]:
+    response = search.get(f"isrc:{code}")
+    if response is None or response.tracks is None:
+        raise ValueError(response.reason if response is not None else search.stopped)
+    tracks = response.tracks
+    items, total, offset = tracks.get("items"), tracks.get("total"), tracks.get("offset")
+    if (
+        not isinstance(items, list)
+        or type(total) is not int or total != len(items) or total > SEARCH_LIMIT
+        or type(offset) is not int or offset != 0
+        or "next" not in tracks or tracks["next"] is not None
+        or tracks.get("previous") is not None
+    ):
+        raise ValueError("Spotify did not return a complete single ISRC search page.")
+    return items
+
+
+def resolve_recording_proposals(
+    release_id: str, payload: object, rows: Sequence[tuple[PlaylistTrack, ReviewRow]],
+    candidates: Mapping[PlaylistTrack, CandidateEvidence], search: SpotifySearch,
+) -> list[RecordingProposal]:
+    ties: list[tuple[PlaylistTrack, ReviewRow, set[str]]] = []
+    for track, row in rows:
+        if row.status not in {"suggestions", "no_variation", "no_suggestions"}:
+            continue
+        evidence = candidates[track]
+        uris = unresolved_uris(track, row, evidence)
+        if len(uris) > 1:
+            if row.status == "no_variation":
+                report_candidates(track, row, {
+                    (hit, hit.recording_metadata()): ["cached_review"] for hit in evidence.cached_hits
+                })
+            ties.append((track, row, uris))
+    if not ties:
+        return []
+
+    musicbrainz = MusicBrainzClient()
+    try:
+        if not isinstance(payload, dict):
+            raise UnverifiedPressing("No Discogs pressing was available.")
+        source_tracks = source_evidence(payload)
+        pressing = musicbrainz.pressing(release_id, payload, source_tracks)
+    except (UnverifiedPressing, IncompleteMusicBrainzEvidence) as error:
+        for _, row, _ in ties:
+            row.status = "incomplete" if isinstance(error, IncompleteMusicBrainzEvidence) else "recording_unverified"
+            row.reason = str(error)
+        return []
+
+    conflicts = conflicting_recording_claims(source_tracks, pressing.tracks)
+    reverse_checks: dict[str, frozenset[str] | IncompleteMusicBrainzEvidence] = {}
+    lookups: list[tuple[PlaylistTrack, ReviewRow, RecordingLookup]] = []
+    for track, row, uris in ties:
+        index = int(track.track_number) - 1  # Source binding verified the flattened ordinal.
+        recording = pressing.tracks[index]
+        source = source_tracks[index]
+        row.status = "recording_unverified"
+        row.recording_proof = {
+            "musicbrainz_release_id": pressing.release_id,
+            "musicbrainz_recording_id": recording.recording_id,
+            "musicbrainz_medium": recording.medium,
+            "musicbrainz_track_number": recording.number,
+            "discogs_duration_ms": source.duration_ms,
+            "musicbrainz_track_duration_ms": recording.duration_ms,
+        }
+        if recording.reason:
+            row.reason = recording.reason
+            continue
+        code, = recording.isrcs
+        row.recording_proof["source_isrc"] = code
+        if conflict := conflicts.get(index):
+            row.reason = conflict
+            continue
+        if code not in reverse_checks:
+            try:
+                reverse_checks[code] = musicbrainz.recordings_for_isrc(code)
+            except IncompleteMusicBrainzEvidence as error:
+                reverse_checks[code] = error
+        reverse = reverse_checks[code]
+        if isinstance(reverse, IncompleteMusicBrainzEvidence):
+            row.status, row.reason = "incomplete", str(reverse)
+            continue
+        if reverse != {recording.recording_id}:
+            row.reason = "The reverse MusicBrainz ISRC lookup does not identify only the linked source recording."
+            continue
+        if source.duration_ms is None or recording.duration_ms is None:
+            raise AssertionError("Verified source durations are required")
+        try:
+            items = complete_isrc_items(search, code)
+        except ValueError as error:
+            row.status, row.reason = "incomplete", str(error)
+            continue
+        lookups.append((track, row, RecordingLookup(code, (source.duration_ms, recording.duration_ms), uris, items)))
+
+    # An observation from another row's search can contradict a URI even if that row yields no proposal.
+    catalog_observations = tuple(
+        item for page in search.pages.values() if page.tracks is not None
+        and isinstance(items := page.tracks.get("items"), list)
+        for item in items
+    )
+    cached_observations = tuple(hit for evidence in candidates.values() for hit in evidence.cached_hits)
+    proposals: list[RecordingProposal] = []
+    for track, row, lookup in lookups:
+        hits, reason = check_spotify_recordings(
+            lookup.items, lookup.code, lookup.durations, lookup.candidate_uris, cached_observations, catalog_observations,
+            lambda hit: matching_credits(track.track_name, row.discogs_credits, hit) is not None,
+            observations_conflict,
+        )
+        if not hits:
+            row.reason = reason
+            continue
+        proposals.append(RecordingProposal(track, row, lookup.code, ordered_editions(track, hits)))
+    return proposals
+
+
+def source_is_importable(track: PlaylistTrack, same_key: Sequence[PlaylistTrack]) -> bool:
+    return bool(same_key) and all(
+        compare_manual_source(
+            source, release_id=track.release_id, track_number=track.track_number, title=track.track_name,
+            artist=track.artist_name, album=track.album_name,
+        ) is True for source in same_key
+    )
+
+
+def tracks_by_import_key(tracks: Sequence[PlaylistTrack]) -> dict[str, list[PlaylistTrack]]:
+    by_key: dict[str, list[PlaylistTrack]] = {}
+    for track in tracks:
+        by_key.setdefault(spotify_track_match_key(track), []).append(track)
+    return by_key
+
+
+def spotify_recording_report(hit: SpotifyRecordingHit) -> dict[str, str | int]:
+    return {
+        "uri": hit.track.uri,
+        "album": hit.track.album_name,
+        "album_id": hit.track.album_id,
+        "isrc": hit.track.isrc,
+        "duration_ms": hit.duration_ms,
+    }
+
+
+def importable_proposals(
+    args: argparse.Namespace, proofs: Sequence[RecordingProposal],
+) -> list[ManualMatchOverride]:
+    if not proofs:
+        return []
+    codes_by_uri: dict[str, set[str]] = {}
+    for proof in proofs:
+        for hit in proof.editions:
+            codes_by_uri.setdefault(hit.track.uri, set()).add(proof.code)
+    sources = tracks_by_import_key(read_playlist_tracks(args.playlist_output_directory))
+    matches = load_spotify_track_match_cache(args.match_cache)
+    overrides: list[ManualMatchOverride] = []
+    for proof in proofs:
+        track, row, editions = proof.track, proof.row, proof.editions
+        if any(len(codes_by_uri[hit.track.uri]) > 1 for hit in editions):
+            row.reason = "A verified Spotify URI was also found for a different source recording."
+            continue
+        if not source_is_importable(track, sources.get(spotify_track_match_key(track), ())):
+            row.status, row.reason = "source_collision", "The generated source changed or shares a conflicting import key."
+            continue
+        if assess_row(track, row, matches, proposals=True) is None:
+            continue
+
+        preferred, *alternatives = editions
+        hit = preferred.track
+        if not alternatives:
+            selection = "Only one unresolved candidate verified the source recording."
+        elif normalize_recording_evidence_text(hit.album_name) == normalize_recording_evidence_text(track.album_name):
+            selection = "Preferred the matching source album, with Spotify URI as the tie-breaker."
+        else:
+            selection = "Selected the first Spotify URI in sorted order among proven editions."
+        row.status, row.reason = "proposal", selection
+        assert row.recording_proof is not None
+        row.recording_proof.update(
+            chosen=spotify_recording_report(preferred),
+            alternatives=[spotify_recording_report(other) for other in alternatives],
+        )
+        overrides.append(ManualMatchOverride(track, hit.uri, hit.name, hit.artists, hit.album_name, hit.album_id))
+    return overrides
+
+
 def review_release(args: argparse.Namespace) -> list[ReviewRow]:
     tracks = read_playlist_tracks(args.playlist_output_directory)
     rows = source_groups(tracks, args.release_id)
     matches = load_spotify_track_match_cache(args.match_cache)
-    cached_candidates: dict[PlaylistTrack, tuple[SpotifyTrackCandidate, ...]] = {}
+    proposals = args.proposals is not None
+    all_sources = tracks_by_import_key(tracks) if proposals else {}
+    candidates: dict[PlaylistTrack, CandidateEvidence] = {}
     for track, row in rows:
-        if row.status == "pending":
-            cached_candidates[track] = assess_row(track, row, matches)
+        if row.status != "pending":
+            continue
+        if proposals and not source_is_importable(track, all_sources[spotify_track_match_key(track)]):
+            row.status, row.reason = "source_collision", "Conflicting or incomplete generated rows share the manual import key."
+            continue
+        if assessment := assess_row(track, row, matches, proposals=proposals):
+            candidates[track] = assessment
     pending = [(track, row) for track, row in rows if row.status == "pending"]
+    search = SpotifySearch(args)
+    payload = None
     if pending:
         token = os.environ.get("DISCOGS_TOKEN", "")
         rate_limiter = DiscogsRateLimiter(DEFAULT_REQUEST_INTERVAL_SECONDS, default_discogs_rate_limit(token))
@@ -470,7 +765,12 @@ def review_release(args: argparse.Namespace) -> list[ReviewRow]:
         except (RuntimeError, OSError, http.client.HTTPException):
             for _, row in pending:
                 row.status, row.reason = "incomplete", "The Discogs pressing request failed."
-        collect_candidates(args, [(track, row) for track, row in pending if row.status == "pending"], cached_candidates)
+        collect_candidates(search, [(track, row) for track, row in pending if row.status == "pending"], candidates)
+    if proposals:
+        proofs = resolve_recording_proposals(args.release_id, payload, pending, candidates, search)
+        write_proposals(
+            args.proposals, importable_proposals(args, proofs), args.playlist_output_directory, args.match_cache,
+        )
     return [row for _, row in rows]
 
 
@@ -488,8 +788,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--match-cache", type=Path, default=DEFAULT_SPOTIFY_MATCH_CACHE_PATH)
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_PATH)
     parser.add_argument("--token-cache", type=Path, default=DEFAULT_TOKEN_CACHE_PATH)
+    parser.add_argument("--proposals", type=Path, help="Write verified recording ties to a new manual-import JSON file.")
     args = parser.parse_args(argv)
     try:
+        if args.proposals is not None:
+            args.proposals = proposal_destination(args.proposals, protected=(
+                args.playlist_output_directory, args.match_cache, args.token_cache, args.env_file,
+                DEFAULT_SPOTIFY_MATCH_CACHE_PATH, DEFAULT_TOKEN_CACHE_PATH, DEFAULT_ENV_PATH,
+                DEFAULT_PROCESSING_CACHE_PATH, DEFAULT_SEEN_TERMS_CACHE_PATH,
+                DEFAULT_TRACKLIST_CACHE_PATH, DEFAULT_SPOTIFY_PUBLISH_STATE_CACHE_PATH,
+            ))
         rows = review_release(args)
     except (ValueError, OSError) as error:
         print(f"Spotify track match review: {error}", file=sys.stderr)
@@ -498,8 +806,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "release_id": args.release_id,
         "search_scope": {"pages_per_query": 1, "max_hits_per_query": SEARCH_LIMIT},
         "status": "review_only" if rows else "no_generated_rows",
-        "rows": [asdict(row) for row in rows],
+        "rows": [{key: value for key, value in asdict(row).items() if key != "recording_proof" or value is not None}
+                 for row in rows],
     }
+    if args.proposals is not None:
+        report["proposals"] = {"path": str(args.proposals), "count": sum(row.status == "proposal" for row in rows)}
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return int(any(row.status == "incomplete" for row in rows))
 
