@@ -505,7 +505,11 @@ def publish_spotify_playlists(
                     )
                     cached_match_is_protected = (
                         cached_match is not None
-                        and (track_cache_key in preexisting_matched_cache_keys or cached_match.has_recording_conflict)
+                        and (
+                            cached_match.is_manual
+                            or track_cache_key in preexisting_matched_cache_keys
+                            or cached_match.has_recording_conflict
+                        )
                     )
                     if (
                         not cached_match_is_protected

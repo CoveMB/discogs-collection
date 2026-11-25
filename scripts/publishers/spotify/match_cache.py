@@ -61,6 +61,7 @@ class CachedSpotifyTrackMatch:
     cache_key: str
     decision: TrackMatchDecision
     has_recording_conflict: bool = False
+    is_manual: bool = False
 
 
 def load_spotify_track_match_cache(path: Path) -> dict[str, dict[str, object]]:
@@ -113,6 +114,42 @@ def _match_record_for_storage(record: Mapping[str, object]) -> dict[str, object]
     return result
 
 
+def compare_manual_source(
+    track: PlaylistTrack,
+    *,
+    release_id: object,
+    track_number: object,
+    title: object,
+    artist: object,
+    album: object,
+) -> bool | None:
+    """Compare the source identity, or return None for incomplete source fields."""
+    if not (
+        isinstance(release_id, str) and (saved_release_id := release_id.strip())
+        and isinstance(track_number, str) and (saved_track_number := track_number.strip())
+        and isinstance(title, str) and title.strip()
+        and isinstance(artist, str) and artist.strip()
+        and isinstance(album, str) and album.strip()
+    ):
+        return None
+    return (
+        saved_release_id == track.release_id.strip()
+        and saved_track_number == track.track_number.strip()
+        and recording_proof_source_matches(track, title=title, artist=artist, album=album)
+    )
+
+
+def compare_cached_manual_source(track: PlaylistTrack, record: Mapping[str, object]) -> bool | None:
+    return compare_manual_source(
+        track,
+        release_id=record.get("release_id"),
+        track_number=record.get("track_number"),
+        title=record.get("track_name"),
+        artist=record.get("artist_name"),
+        album=record.get("album_name"),
+    )
+
+
 def cached_track_match(
     track: PlaylistTrack,
     matches: Mapping[str, Mapping[str, object]],
@@ -125,7 +162,25 @@ def cached_track_match(
     if cache_record_has_recording_conflict(record):
         return cached_review_decision(track, cache_key, record, AMBIGUOUS, seen_at=seen_at)
     match_status = clean_cell(record.get("match_status"))
-    if match_status in {"matched", "manual"}:
+    if match_status == "manual":
+        source_match = compare_cached_manual_source(track, record)
+        if source_match is None:
+            return CachedSpotifyTrackMatch(
+                cache_key=cache_key,
+                decision=TrackMatchDecision(
+                    track=track,
+                    status=AMBIGUOUS,
+                    spotify_uri="",
+                    reason=(
+                        "cached manual Spotify match has incomplete source fields. "
+                        "Re-import the verified source with manual_matches.py"
+                    ),
+                ),
+                is_manual=True,
+            )
+        if not source_match:
+            return None
+    if match_status in {MATCHED, "manual"}:
         if (
             match_status == MATCHED
             and (
@@ -237,6 +292,7 @@ def cached_matched_track(
             match_strategy=match_strategy,
             strict_album_recovery=match_status == MATCHED and record.get(STRICT_ALBUM_RECOVERY_FIELD) is True,
         ),
+        is_manual=match_status == "manual",
     )
 
 
@@ -481,14 +537,15 @@ def cache_track_match(
     track = decision.track
     cache_key = spotify_track_match_key(track)
     existing_record = matches.get(cache_key)
-    if (
-        not refresh_match_cache
-        and existing_record is not None
-        and existing_record.get(STRICT_ALBUM_RECOVERY_FIELD) is True
-        and cache_record_matcher_version(existing_record) == MATCHER_VERSION
-        and not cached_recording_proof_is_current(track, existing_record)
-    ):
-        return False
+    if existing_record is not None and not refresh_match_cache:
+        if clean_cell(existing_record.get("match_status")) == "manual":
+            return False
+        if (
+            existing_record.get(STRICT_ALBUM_RECOVERY_FIELD) is True
+            and cache_record_matcher_version(existing_record) == MATCHER_VERSION
+            and not cached_recording_proof_is_current(track, existing_record)
+        ):
+            return False
     candidate = decision.candidate
     record: dict[str, object] = {
         "release_id": track.release_id,
@@ -567,7 +624,7 @@ def cache_track_match(
 
 
 def record_cached_version_title_review(record: dict[str, object], decision: TrackMatchDecision) -> bool:
-    if not _strict_album_recovery_applies_to(decision.track, record):
+    if clean_cell(record.get("match_status")) == "manual" or not _strict_album_recovery_applies_to(decision.track, record):
         return False
     record["search_queries"] = list(decision.search_queries)
     _store_version_title_review_candidates(record, decision.review_candidates)

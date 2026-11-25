@@ -789,9 +789,10 @@ so directly.
 ## Import manual Spotify matches
 
 Use a manual override when the report identifies the correct Spotify track but
-the automatic rules cannot select it safely. The importer validates source rows
-against the generated playlist masters. Preview mode does not change the cache
-or call Spotify:
+the automatic rules cannot select it safely. The importer checks the release ID,
+track number, title, artist, and album against the generated playlist masters.
+The text comparison keeps accents and non-Latin characters. Preview mode does
+not change the cache or call Spotify:
 
 ```bash
 python3 scripts/publishers/spotify/manual_matches.py \
@@ -829,9 +830,19 @@ python3 scripts/publishers/spotify/manual_matches.py \
   --apply
 ```
 
-An applied manual match remains authoritative across matcher updates. The
-importer refuses to replace a different matched or manual Spotify URI unless
-you also pass `--replace-existing`.
+The same source track can appear in several playlist masters. If distinct source
+rows share the cache key for an override, the entire import fails before any
+cache write.
+
+An applied manual match remains authoritative across matcher updates for the
+verified source. An ordinary publish can search for a colliding row while
+keeping the manual choice for the verified source. Use `--replace-existing` to
+replace a different matched or manual Spotify URI or to bind a manual match to
+a different source that shares the same cache key.
+
+Normal publishing holds rows with incomplete manual records for review. To
+restore a manual match, fill the five source fields from the verified playlist
+row, preview the import, then run it again with `--apply`.
 
 For a bounded Spotify track search, the client waits one second after HTTP
 `502` and retries the same query once. The retry counts as an extra Web API

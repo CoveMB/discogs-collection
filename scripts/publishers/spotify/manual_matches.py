@@ -16,6 +16,8 @@ if str(SCRIPTS_DIRECTORY) not in sys.path:
 
 from publishers.spotify.match_cache import (  # noqa: E402
     MATCHER_VERSION,
+    compare_cached_manual_source,
+    compare_manual_source,
     load_spotify_track_match_cache,
     save_spotify_track_match_cache,
     spotify_track_match_key,
@@ -80,10 +82,9 @@ def import_manual_match_overrides(
     replace_existing: bool = False,
     timestamp: str | None = None,
 ) -> ManualMatchImportSummary:
-    source_tracks_by_key = {
-        spotify_track_match_key(track): track
-        for track in read_playlist_tracks(playlist_output_directory)
-    }
+    source_tracks_by_key: dict[str, list[PlaylistTrack]] = {}
+    for track in read_playlist_tracks(playlist_output_directory):
+        source_tracks_by_key.setdefault(spotify_track_match_key(track), []).append(track)
     overrides = load_manual_match_overrides(
         overrides_path,
         source_tracks_by_key=source_tracks_by_key,
@@ -135,7 +136,7 @@ def import_manual_match_overrides(
 def load_manual_match_overrides(
     path: Path,
     *,
-    source_tracks_by_key: Mapping[str, PlaylistTrack],
+    source_tracks_by_key: Mapping[str, Sequence[PlaylistTrack]],
 ) -> tuple[ManualMatchOverride, ...]:
     payload = load_json_file(path, malformed_label="Spotify manual match overrides")
     if not isinstance(payload, Mapping):
@@ -177,10 +178,26 @@ def load_manual_match_overrides(
             spotify_search_query="",
         )
         source_key = spotify_track_match_key(source_track)
-        matched_source_track = source_tracks_by_key.get(source_key)
-        if matched_source_track is None:
+        source_candidates = source_tracks_by_key.get(source_key, ())
+        matching_sources = [
+            candidate
+            for candidate in source_candidates
+            if compare_manual_source(
+                candidate,
+                release_id=source_track.release_id,
+                track_number=source_track.track_number,
+                title=source_track.track_name,
+                artist=source_track.artist_name,
+                album=source_track.album_name,
+            )
+        ]
+        if not matching_sources:
             raise ValueError(
                 f"Spotify manual match override {index} does not match a generated playlist row"
+            )
+        if len(matching_sources) != len(source_candidates):
+            raise ValueError(
+                f"Spotify manual match override {index} has conflicting generated playlist rows for its cache key"
             )
         if source_key in seen_keys:
             raise ValueError(
@@ -201,7 +218,7 @@ def load_manual_match_overrides(
         )
         overrides.append(
             ManualMatchOverride(
-                source_track=matched_source_track,
+                source_track=matching_sources[0],
                 spotify_uri=spotify_uri,
                 spotify_track_name=required_text(raw_match, "spotify_track_name", index),
                 spotify_artist_names=spotify_artist_names,
@@ -249,6 +266,8 @@ def validate_existing_matches(
     *,
     replace_existing: bool,
 ) -> None:
+    if replace_existing:
+        return
     for override in overrides:
         source_key = spotify_track_match_key(override.source_track)
         existing_record = match_cache.get(source_key)
@@ -256,15 +275,17 @@ def validate_existing_matches(
             continue
         existing_status = clean_cell(existing_record.get("match_status"))
         existing_uri = clean_cell(existing_record.get("spotify_uri"))
-        if (
-            existing_status in {"matched", "manual"}
-            and existing_uri
-            and existing_uri != override.spotify_uri
-            and not replace_existing
-        ):
+        if existing_status not in {"matched", "manual"} or not existing_uri:
+            continue
+        if existing_uri != override.spotify_uri:
             raise ValueError(
                 f"{source_key} already has a different {existing_status} Spotify URI; "
                 "use --replace-existing to replace it"
+            )
+        if existing_status == "manual" and compare_cached_manual_source(override.source_track, existing_record) is False:
+            raise ValueError(
+                f"{source_key} already has a manual Spotify match for a different source track; "
+                "use --replace-existing to bind it to this source"
             )
 
 
@@ -293,7 +314,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--replace-existing",
         action="store_true",
-        help="Allow a manual match to replace a different matched or manual Spotify URI.",
+        help="Allow replacing a matched or manual Spotify URI or binding a manual match to a different source.",
     )
     return parser.parse_args(argv)
 
