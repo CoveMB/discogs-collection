@@ -9842,6 +9842,33 @@ class SpotifyContinuousPublishingTests(unittest.TestCase):
                 self.assertEqual(self.search_names, self.names)
                 self.assertEqual(load_spotify_track_match_cache(self.args.match_cache)[manual_key], manual_record)
 
+    def test_continuous_holds_manual_record_with_unusable_track_uri(self):
+        self.names = ["alpha", "bravo"]
+        self.write_source(self.names, release_id="release-1")
+        self.args.max_new_searches_per_run = 1
+        self.args.apply = False
+        key = "release-1|1|synthetic artist|synthetic album|alpha"
+        for invalid_uri in (None, "spotify:album:old", "spotify:track:", "spotify:track:old:extra"):
+            with self.subTest(invalid_uri=invalid_uri):
+                record: dict[str, object] = {
+                    "release_id": "release-1", "track_number": "1", "track_name": "alpha",
+                    "artist_name": "Synthetic Artist", "album_name": "Synthetic Album", "match_status": "manual",
+                }
+                if invalid_uri is not None:
+                    record["spotify_uri"] = invalid_uri
+                save_spotify_track_match_cache(self.args.match_cache, {key: record})
+                self.search_names.clear()
+
+                summary = self.run_publish()
+
+                self.assertEqual((summary.stop_reason, summary.completed_pass_count), ("complete", 1))
+                self.assertEqual(self.search_names, ["bravo"])
+                held = summary.decisions[0]
+                self.assertEqual((held.match_source, held.status, held.spotify_uri), ("cache", "ambiguous", ""))
+                self.assertIn("invalid Spotify track URI", held.reason)
+                self.assertIn("Re-import the verified source with manual_matches.py", held.reason)
+                self.assertEqual(load_spotify_track_match_cache(self.args.match_cache)[key], record)
+
     def test_strict_album_collision_version_review_stops_after_one_capped_pass(self):
         self.args.max_new_searches_per_run = 1
         self.write_source(["Signal 西 (2019 Remaster)", "Next Track"], release_id="release-1")

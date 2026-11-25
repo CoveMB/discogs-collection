@@ -841,9 +841,10 @@ can reuse that decision. Use `--replace-existing` to replace a different matched
 or manual Spotify URI or to bind a manual match to a different source that
 shares the same cache key.
 
-Normal publishing holds rows with incomplete manual records for review. To
-restore a manual match, fill the five source fields from the verified playlist
-row, preview the import, then run it again with `--apply`.
+Normal publishing holds manual matches with incomplete source fields or an
+invalid Spotify track URI for review. To restore the match, supply the five
+verified source fields and the correct track URI, preview the import, then run
+it again with `--apply`.
 
 For a bounded Spotify track search, the client waits one second after HTTP
 `502` and retries the same query once. The retry counts as an extra Web API

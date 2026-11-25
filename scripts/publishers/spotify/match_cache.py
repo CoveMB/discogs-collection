@@ -31,6 +31,7 @@ from publishers.spotify.matching import (
     resolve_spotify_edition_tie,
     spotify_recording_metadata_from_values,
     spotify_recording_metadata_is_complete,
+    spotify_track_uri_is_structurally_valid,
     with_version_title_review_candidates,
 )
 from publishers.spotify.release_matching import (
@@ -223,31 +224,30 @@ def cached_track_match(
     match_status = clean_cell(record.get("match_status"))
     if match_status == "manual":
         source_match = compare_cached_manual_source(track, record)
-        if source_match is None:
-            return CachedSpotifyTrackMatch(
-                cache_key=cache_key,
-                decision=TrackMatchDecision(
-                    track=track,
-                    status=AMBIGUOUS,
-                    spotify_uri="",
-                    reason=(
-                        "cached manual Spotify match has incomplete source fields. "
-                        "Re-import the verified source with manual_matches.py"
-                    ),
-                ),
-                is_manual=True,
-            )
-        if not source_match:
+        if source_match is False:
             return None
-    if match_status in {MATCHED, "manual"}:
+        if source_match is None:
+            hold_reason = "cached manual Spotify match has incomplete source fields"
+        elif not spotify_track_uri_is_structurally_valid(clean_cell(record.get("spotify_uri"))):
+            hold_reason = "cached manual Spotify match has an invalid Spotify track URI"
+        else:
+            return cached_matched_track(track, cache_key, record, seen_at=seen_at)
+        return CachedSpotifyTrackMatch(
+            cache_key=cache_key,
+            decision=TrackMatchDecision(
+                track=track,
+                status=AMBIGUOUS,
+                spotify_uri="",
+                reason=f"{hold_reason}. Re-import the verified source with manual_matches.py",
+            ),
+            is_manual=True,
+        )
+    if match_status == MATCHED:
         if (
-            match_status == MATCHED
-            and (
-                not _strict_album_recovery_applies_to(track, record)
-                or (
-                    cache_record_is_version_sensitive(record)
-                    and cache_record_matcher_version(record) != MATCHER_VERSION
-                )
+            not _strict_album_recovery_applies_to(track, record)
+            or (
+                cache_record_is_version_sensitive(record)
+                and cache_record_matcher_version(record) != MATCHER_VERSION
             )
         ):
             return None
