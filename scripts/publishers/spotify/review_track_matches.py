@@ -33,7 +33,9 @@ from publishers.spotify.client import (
 from publishers.spotify.env import DEFAULT_ENV_PATH, DEFAULT_TOKEN_CACHE_PATH, load_spotify_settings
 from publishers.spotify.manual_matches import ManualMatchOverride
 from publishers.spotify.match_cache import (
+    MATCHER_VERSION,
     cache_record_has_recording_conflict,
+    cache_record_matcher_version,
     cached_track_match,
     compare_cached_manual_source,
     compare_manual_source,
@@ -134,14 +136,6 @@ class RecordingLookup:
     durations: tuple[int, int]
     candidate_uris: set[str]
     items: list[object]
-
-
-@dataclass(frozen=True)
-class RecordingProposal:
-    track: PlaylistTrack
-    row: ReviewRow
-    code: str
-    editions: tuple[SpotifyRecordingHit, ...]
 
 
 def strict_text(value: object) -> str:
@@ -570,22 +564,22 @@ def complete_isrc_items(search: SpotifySearch, code: str) -> list[object]:
 
 
 def resolve_recording_proposals(
-    release_id: str, payload: object, rows: Sequence[tuple[PlaylistTrack, ReviewRow]],
+    args: argparse.Namespace, payload: object, rows: Sequence[tuple[PlaylistTrack, ReviewRow]],
     candidates: Mapping[PlaylistTrack, CandidateEvidence], search: SpotifySearch,
-) -> list[RecordingProposal]:
-    ties: list[tuple[PlaylistTrack, ReviewRow, set[str]]] = []
+) -> list[ManualMatchOverride]:
+    rows_to_verify: list[tuple[PlaylistTrack, ReviewRow, set[str]]] = []
     for track, row in rows:
         if row.status not in {"suggestions", "no_variation", "no_suggestions"}:
             continue
         evidence = candidates[track]
         uris = unresolved_uris(track, row, evidence)
-        if len(uris) > 1:
+        if uris:
             if row.status == "no_variation":
                 report_candidates(track, row, {
                     (hit, hit.recording_metadata()): ["cached_review"] for hit in evidence.cached_hits
                 })
-            ties.append((track, row, uris))
-    if not ties:
+            rows_to_verify.append((track, row, uris))
+    if not rows_to_verify:
         return []
 
     musicbrainz = MusicBrainzClient()
@@ -593,9 +587,9 @@ def resolve_recording_proposals(
         if not isinstance(payload, dict):
             raise UnverifiedPressing("No Discogs pressing was available.")
         source_tracks = source_evidence(payload)
-        pressing = musicbrainz.pressing(release_id, payload, source_tracks)
+        pressing = musicbrainz.pressing(args.release_id, payload, source_tracks)
     except (UnverifiedPressing, IncompleteMusicBrainzEvidence) as error:
-        for _, row, _ in ties:
+        for _, row, _ in rows_to_verify:
             row.status = "incomplete" if isinstance(error, IncompleteMusicBrainzEvidence) else "recording_unverified"
             row.reason = str(error)
         return []
@@ -603,11 +597,10 @@ def resolve_recording_proposals(
     conflicts = conflicting_recording_claims(source_tracks, pressing.tracks)
     reverse_checks: dict[str, frozenset[str] | IncompleteMusicBrainzEvidence] = {}
     lookups: list[tuple[PlaylistTrack, ReviewRow, RecordingLookup]] = []
-    for track, row, uris in ties:
+    for track, row, uris in rows_to_verify:
         index = int(track.track_number) - 1  # Source binding verified the flattened ordinal.
         recording = pressing.tracks[index]
         source = source_tracks[index]
-        row.status = "recording_unverified"
         row.recording_proof = {
             "musicbrainz_release_id": pressing.release_id,
             "musicbrainz_recording_id": recording.recording_id,
@@ -617,12 +610,12 @@ def resolve_recording_proposals(
             "musicbrainz_track_duration_ms": recording.duration_ms,
         }
         if recording.reason:
-            row.reason = recording.reason
+            row.status, row.reason = "recording_unverified", recording.reason
             continue
         code, = recording.isrcs
         row.recording_proof["source_isrc"] = code
         if conflict := conflicts.get(index):
-            row.reason = conflict
+            row.status, row.reason = "recording_unverified", conflict
             continue
         if code not in reverse_checks:
             try:
@@ -634,6 +627,7 @@ def resolve_recording_proposals(
             row.status, row.reason = "incomplete", str(reverse)
             continue
         if reverse != {recording.recording_id}:
+            row.status = "recording_unverified"
             row.reason = "The reverse MusicBrainz ISRC lookup does not identify only the linked source recording."
             continue
         if source.duration_ms is None or recording.duration_ms is None:
@@ -643,7 +637,31 @@ def resolve_recording_proposals(
         except ValueError as error:
             row.status, row.reason = "incomplete", str(error)
             continue
+        # Keep the discovery status for the final eligibility check.
         lookups.append((track, row, RecordingLookup(code, (source.duration_ms, recording.duration_ms), uris, items)))
+    if not lookups:
+        return []
+
+    sources = tracks_by_import_key(read_playlist_tracks(args.playlist_output_directory))
+    matches = load_spotify_track_match_cache(args.match_cache)
+    latest_assessments: dict[PlaylistTrack, tuple[ReviewRow, CandidateEvidence | None]] = {}
+    cached_observations = [hit for evidence in candidates.values() for hit in evidence.cached_hits]
+    for track, row in rows:
+        latest_row = replace(row)
+        assessment = assess_row(track, latest_row, matches, proposals=True)
+        if assessment is not None:
+            assessment.discovery_hits = candidates[track].discovery_hits
+            cached_observations.extend(assessment.cached_hits)
+        elif latest_row.status != "unassessed":
+            # A held row can still contribute source-bound evidence against other proposals.
+            _, record = track_match_cache_entry(track, matches)
+            if (
+                record is not None
+                and cache_record_matcher_version(record) == MATCHER_VERSION
+                and compare_cached_manual_source(track, record) is True
+            ):
+                cached_observations.extend(source_bound_cached_candidates(record))
+        latest_assessments[track] = latest_row, assessment
 
     # An observation from another row's search can contradict a URI even if that row yields no proposal.
     catalog_observations = tuple(
@@ -651,8 +669,7 @@ def resolve_recording_proposals(
         and isinstance(items := page.tracks.get("items"), list)
         for item in items
     )
-    cached_observations = tuple(hit for evidence in candidates.values() for hit in evidence.cached_hits)
-    proposals: list[RecordingProposal] = []
+    overrides: list[ManualMatchOverride] = []
     for track, row, lookup in lookups:
         try:
             hits, reason = check_spotify_recordings(
@@ -664,10 +681,23 @@ def resolve_recording_proposals(
             row.status, row.reason = "incomplete", str(error)
             continue
         if not hits:
-            row.reason = reason
+            row.status, row.reason = "recording_unverified", reason
             continue
-        proposals.append(RecordingProposal(track, row, lookup.code, ordered_editions(track, hits)))
-    return proposals
+        if not source_is_importable(track, sources.get(spotify_track_match_key(track), ())):
+            row.status, row.reason = "source_collision", "The generated source changed or shares a conflicting import key."
+            continue
+        latest_row, assessment = latest_assessments[track]
+        if assessment is None:
+            row.status, row.reason = latest_row.status, latest_row.reason
+            continue
+
+        current_uris = unresolved_uris(track, row, assessment)
+        current_hits = tuple(hit for hit in hits if hit.track.uri in current_uris)
+        if not current_hits:
+            row.status, row.reason = "recording_unverified", "The verified candidates are no longer eligible."
+            continue
+        overrides.append(recording_override(track, row, current_hits))
+    return overrides
 
 
 def source_is_importable(track: PlaylistTrack, same_key: Sequence[PlaylistTrack]) -> bool:
@@ -696,45 +726,24 @@ def spotify_recording_report(hit: SpotifyRecordingHit) -> dict[str, str | int]:
     }
 
 
-def importable_proposals(
-    args: argparse.Namespace, proofs: Sequence[RecordingProposal],
-) -> list[ManualMatchOverride]:
-    if not proofs:
-        return []
-    codes_by_uri: dict[str, set[str]] = {}
-    for proof in proofs:
-        for hit in proof.editions:
-            codes_by_uri.setdefault(hit.track.uri, set()).add(proof.code)
-    sources = tracks_by_import_key(read_playlist_tracks(args.playlist_output_directory))
-    matches = load_spotify_track_match_cache(args.match_cache)
-    overrides: list[ManualMatchOverride] = []
-    for proof in proofs:
-        track, row, editions = proof.track, proof.row, proof.editions
-        if any(len(codes_by_uri[hit.track.uri]) > 1 for hit in editions):
-            row.reason = "A verified Spotify URI was also found for a different source recording."
-            continue
-        if not source_is_importable(track, sources.get(spotify_track_match_key(track), ())):
-            row.status, row.reason = "source_collision", "The generated source changed or shares a conflicting import key."
-            continue
-        if assess_row(track, row, matches, proposals=True) is None:
-            continue
-
-        preferred, *alternatives = editions
-        hit = preferred.track
-        if not alternatives:
-            selection = "Only one unresolved candidate verified the source recording."
-        elif normalize_recording_evidence_text(hit.album_name) == normalize_recording_evidence_text(track.album_name):
-            selection = "Preferred the matching source album, with Spotify URI as the tie-breaker."
-        else:
-            selection = "Selected the first Spotify URI in sorted order among proven editions."
-        row.status, row.reason = "proposal", selection
-        assert row.recording_proof is not None
-        row.recording_proof.update(
-            chosen=spotify_recording_report(preferred),
-            alternatives=[spotify_recording_report(other) for other in alternatives],
-        )
-        overrides.append(ManualMatchOverride(track, hit.uri, hit.name, hit.artists, hit.album_name, hit.album_id))
-    return overrides
+def recording_override(
+    track: PlaylistTrack, row: ReviewRow, hits: Sequence[SpotifyRecordingHit],
+) -> ManualMatchOverride:
+    preferred, *alternatives = ordered_editions(track, hits)
+    hit = preferred.track
+    if not alternatives:
+        selection = "Only one unresolved candidate verified the source recording."
+    elif normalize_recording_evidence_text(hit.album_name) == normalize_recording_evidence_text(track.album_name):
+        selection = "Preferred the matching source album, with Spotify URI as the tie-breaker."
+    else:
+        selection = "Selected the first Spotify URI in sorted order among proven editions."
+    row.status, row.reason = "proposal", selection
+    assert row.recording_proof is not None
+    row.recording_proof.update(
+        chosen=spotify_recording_report(preferred),
+        alternatives=[spotify_recording_report(other) for other in alternatives],
+    )
+    return ManualMatchOverride(track, hit.uri, hit.name, hit.artists, hit.album_name, hit.album_id)
 
 
 def review_release(args: argparse.Namespace) -> list[ReviewRow]:
@@ -772,10 +781,8 @@ def review_release(args: argparse.Namespace) -> list[ReviewRow]:
                 row.status, row.reason = "incomplete", "The Discogs pressing request failed."
         collect_candidates(search, [(track, row) for track, row in pending if row.status == "pending"], candidates)
     if proposals:
-        proofs = resolve_recording_proposals(args.release_id, payload, pending, candidates, search)
-        write_proposals(
-            args.proposals, importable_proposals(args, proofs), args.playlist_output_directory, args.match_cache,
-        )
+        overrides = resolve_recording_proposals(args, payload, pending, candidates, search)
+        write_proposals(args.proposals, overrides, args.playlist_output_directory, args.match_cache)
     return [row for _, row in rows]
 
 
@@ -793,7 +800,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--match-cache", type=Path, default=DEFAULT_SPOTIFY_MATCH_CACHE_PATH)
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_PATH)
     parser.add_argument("--token-cache", type=Path, default=DEFAULT_TOKEN_CACHE_PATH)
-    parser.add_argument("--proposals", type=Path, help="Write verified recording ties to a new manual-import JSON file.")
+    parser.add_argument(
+        "--proposals", type=Path,
+        help="Verify eligible Spotify candidates by recording code and write a new manual-import JSON file.",
+    )
     args = parser.parse_args(argv)
     try:
         if args.proposals is not None:

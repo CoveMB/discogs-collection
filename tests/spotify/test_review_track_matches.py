@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from collections.abc import Mapping, Sequence
 from contextlib import redirect_stderr, redirect_stdout
+from copy import deepcopy
 from dataclasses import replace
 from email.message import Message
 from pathlib import Path
@@ -23,7 +24,10 @@ from discogs_tracklists import release_tracklist_from_payload
 from publishers.spotify import manual_matches, review_track_matches
 from publishers.spotify.authorization_flow import DEFAULT_AUTHORIZE_SCOPES
 from publishers.spotify.client import HttpRequest, HttpResponse
-from publishers.spotify.match_cache import MATCHER_VERSION, cache_track_match, save_spotify_track_match_cache, spotify_track_match_key
+from publishers.spotify.match_cache import (
+    MATCHER_VERSION, cache_track_match, record_cached_recording_conflict, save_spotify_track_match_cache,
+    spotify_track_match_key,
+)
 from publishers.spotify.matching import AMBIGUOUS, UNMATCHED, PlaylistTrack, SpotifyTrackCandidate, TrackMatchDecision
 from publishers.spotify.publish_playlist import publish_spotify_playlists
 from publishers.spotify.token_cache import SpotifyToken, save_spotify_token
@@ -133,6 +137,7 @@ class SpotifyArtistReviewTests(unittest.TestCase):
         with (
             patch.dict(os.environ, {"DISCOGS_TOKEN": "fictional-discogs"}, clear=True),
             patch("discogs_tracklists.http_get", return_value=json.dumps(self.payload)) as discogs,
+            patch.object(review_track_matches, "MusicBrainzClient", side_effect=AssertionError("Unexpected recording lookup")),
             patch("publishers.spotify.client.urllib_transport", side_effect=self.transport),
             patch("publishers.spotify.session.refresh_access_token", side_effect=AssertionError("Unexpected OAuth refresh")),
             redirect_stdout(stdout),
@@ -279,26 +284,109 @@ class SpotifyArtistReviewTests(unittest.TestCase):
         self.assertEqual(artifact["matches"][0]["spotify_album_name"], "Field Notes")
         self.assertEqual(self.proposals.stat().st_mode & 0o777, 0o600)
 
-    def test_recording_proposal_spends_no_isrc_requests_on_new_singleton(self) -> None:
+    def test_single_candidate_on_another_album_produces_reviewable_override(self) -> None:
+        track, link, pressing, reverse = self.recording_fixture(alias=True)
+        self.cache_negative(track)
+        hit = self.recording_hit("studio", reverse["isrc"])
+        self.search_responses[CANONICAL_QUERY] = [hit]
+        self.set_isrc_hits(reverse["isrc"], hit)
+        for both_spellings in (False, True):
+            with self.subTest(both_spellings=both_spellings):
+                self.requests.clear()
+                self.search_responses[PRINTED_QUERY] = [hit] if both_spellings else []
+                report, paths = self.run_recording_review(
+                    link, pressing, reverse, output=self.directory / f"proposals-{both_spellings}.json",
+                )
+                self.assertEqual(report["rows"][0]["status"], "proposal")
+                self.assertEqual(len(paths), 3)
+                self.assertEqual(len(self.requests), 3)
+                row, = json.loads(self.proposals.read_text())["matches"]
+                self.assertEqual(row["spotify_uri"], "spotify:track:studio")
+                self.assertEqual(row["spotify_album_name"], "Field Notes")
+                preview = manual_matches.import_manual_match_overrides(self.proposals, self.root, self.cache)
+                self.assertEqual((preview.planned_count, preview.applied_count), (1, 0))
+
+    def test_recording_proposal_holds_single_candidate_when_code_verifies_a_different_uri(self) -> None:
         track, link, pressing, reverse = self.recording_fixture(alias=True)
         self.cache_negative(track)
         self.search_responses[PRINTED_QUERY] = []
-        self.search_responses[CANONICAL_QUERY] = [spotify_hit("studio", "Mara Vale")]
-        report, paths = self.run_recording_review(link, pressing, reverse)
-        self.assertEqual(paths, [])
-        self.assertEqual(len(self.requests), 2)
-        self.assertEqual(report["rows"][0]["status"], "suggestions")
-        self.assertEqual(json.loads(self.proposals.read_text())["matches"], [])
+        self.search_responses[CANONICAL_QUERY] = [spotify_hit("studio", "Mara Vale", album="Field Notes")]
+        self.set_isrc_hits(reverse["isrc"], self.recording_hit("other", reverse["isrc"]))
+        for new_manual_owner in (False, True):
+            with self.subTest(new_manual_owner=new_manual_owner):
+                self.requests.clear()
+                latest = deepcopy(self.matches)
+                if new_manual_owner:
+                    latest[spotify_track_match_key(track)]["match_status"] = "manual"
+                with patch.object(
+                    review_track_matches, "load_spotify_track_match_cache", side_effect=(self.matches, latest),
+                ):
+                    report, paths = self.run_recording_review(
+                        link, pressing, reverse, output=self.directory / f"wrong-uri-{new_manual_owner}.json",
+                    )
+                self.assertEqual((len(paths), len(self.requests)), (3, 3))
+                row, = report["rows"]
+                self.assertEqual(row["status"], "recording_unverified")
+                self.assertEqual(row["reason"], "The complete Spotify ISRC result does not verify an unresolved candidate.")
+                self.assertEqual(json.loads(self.proposals.read_text())["matches"], [])
 
     def test_recording_proposal_rejects_reverse_isrc_clash(self) -> None:
         track, link, pressing, reverse = self.recording_fixture()
-        self.seed_recording_tie(track)
+        self.cache_negative(track, SpotifyTrackCandidate(
+            "spotify:track:studio", "Night Signal", ("Mara Vale",), "Field Notes", "FieldNotes",
+        ))
         reverse["recordings"].append({"id": "00000000-1111-4111-8111-000000000004"})
         report, paths = self.run_recording_review(link, pressing, reverse)
         self.assertEqual(len(paths), 3)
         self.assertEqual(self.requests, [])
-        self.assertIn("ISRC", report["rows"][0]["reason"])
+        row, = report["rows"]
+        self.assertEqual(row["status"], "recording_unverified")
+        self.assertIn("reverse MusicBrainz ISRC lookup", row["reason"])
         self.assertEqual(json.loads(self.proposals.read_text())["matches"], [])
+
+    def test_single_candidate_without_proposals_only_runs_spelling_searches(self) -> None:
+        track, _, _, reverse = self.recording_fixture(alias=True)
+        self.cache_negative(track)
+        self.search_responses[PRINTED_QUERY] = []
+        self.search_responses[CANONICAL_QUERY] = [self.recording_hit("studio", reverse["isrc"])]
+        report, discogs_calls = self.run_review()
+        self.assertEqual((discogs_calls, len(self.requests)), (1, 2))
+        row, = report["rows"]
+        self.assertEqual(row["status"], "suggestions")
+        candidate, = row["candidates"]
+        self.assertEqual(candidate["uri"], "spotify:track:studio")
+        self.assertNotIn("recording_proof", row)
+
+    def test_recording_proposal_skips_catalog_proof_without_eligible_uris(self) -> None:
+        track, link, pressing, reverse = self.recording_fixture(alias=True)
+        self.cache_negative(track)
+        self.search_responses[PRINTED_QUERY] = []
+        self.search_responses[CANONICAL_QUERY] = [spotify_hit("cover", "Another Artist")]
+        with patch.object(review_track_matches, "MusicBrainzClient", side_effect=AssertionError("Unexpected recording lookup")):
+            report, paths = self.run_recording_review(link, pressing, reverse)
+        self.assertEqual((paths, len(self.requests)), ([], 2))
+        self.assertEqual(report["rows"][0]["status"], "no_suggestions")
+        self.assertEqual(json.loads(self.proposals.read_text())["matches"], [])
+
+    def test_recording_proposal_respects_prior_status_for_cached_single_candidate_without_variation(self) -> None:
+        track, link, pressing, reverse = self.recording_fixture()
+        record = self.cache_negative(track, SpotifyTrackCandidate(
+            "spotify:track:studio", "Night Signal", ("Mara Vale",), "Field Notes", "FieldNotes",
+        ))
+        record["match_status"] = UNMATCHED
+        with patch.object(review_track_matches, "MusicBrainzClient", side_effect=AssertionError("Unexpected recording lookup")):
+            report, paths = self.run_recording_review(link, pressing, reverse)
+        self.assertEqual((paths, self.requests), ([], []))
+        self.assertEqual(report["rows"][0]["status"], "no_variation")
+        self.assertEqual(json.loads(self.proposals.read_text())["matches"], [])
+
+        record["match_status"] = AMBIGUOUS
+        self.set_isrc_hits(reverse["isrc"], self.recording_hit("studio", reverse["isrc"]))
+        report, paths = self.run_recording_review(link, pressing, reverse, output=self.directory / "ambiguous.json")
+        self.assertEqual((len(paths), len(self.requests)), (3, 1))
+        self.assertEqual(report["rows"][0]["status"], "proposal")
+        row, = json.loads(self.proposals.read_text())["matches"]
+        self.assertEqual(row["spotify_uri"], "spotify:track:studio")
 
     def test_recording_proposal_rejects_incomplete_or_unplayable_isrc_page(self) -> None:
         track, link, pressing, reverse = self.recording_fixture()
@@ -485,6 +573,128 @@ class SpotifyArtistReviewTests(unittest.TestCase):
         ))
         return track, second_track, link, pressing, first_code, second_code
 
+    def test_recording_proposal_rechecks_new_cached_contradictions_without_holding_independent_rows(self) -> None:
+        track, second, link, pressing, first, other = self.two_track_recording_fixture()
+        self.set_isrc_hits(first["isrc"], self.recording_hit("studio", first["isrc"]))
+        self.set_isrc_hits(other["isrc"], {
+            **self.recording_hit("secondcopy", other["isrc"], album="Second"), "name": second.track_name,
+        })
+        for label, observed_track, uri, code in (
+            ("same-row", track, "studio", "ZZABC2600099"),
+            ("same-uri", second, "studio", "ZZABC2600099"),
+            ("same-isrc", second, "different", first["isrc"]),
+            ("held-source", second, "studio", "ZZABC2600099"),
+        ):
+            with self.subTest(contradiction=label):
+                latest = deepcopy(self.matches)
+                record = latest[spotify_track_match_key(observed_track)]
+                if label == "held-source":
+                    record_cached_recording_conflict(record, "Synthetic recording conflict")
+                observations = record["review_candidates"]
+                assert isinstance(observations, list)
+                observations.append({
+                    "spotify_uri": f"spotify:track:{uri}", "spotify_track_name": observed_track.track_name,
+                    "spotify_artist_names": ["Mara Vale"], "spotify_album_name": "Field Notes",
+                    "spotify_album_id": "FieldNotes", "spotify_isrc": code,
+                })
+                snapshots = iter((self.matches, latest))
+                requests_at_read: list[int] = []
+
+                def read_matches(_: Path) -> dict[str, dict[str, object]]:
+                    requests_at_read.append(len(self.requests))
+                    return next(snapshots)
+
+                self.requests.clear()
+                with patch.object(review_track_matches, "load_spotify_track_match_cache", side_effect=read_matches):
+                    report, paths = self.run_recording_review(
+                        link, pressing, first, other_recordings=(other,), output=self.directory / f"{label}.json",
+                    )
+                self.assertEqual(requests_at_read, [0, 2])
+                self.assertEqual((len(paths), len(self.requests)), (4, 2))
+                held, other_row = report["rows"]
+                self.assertEqual(held["status"], "recording_unverified")
+                self.assertIn("A cached observation", held["reason"])
+                overrides = json.loads(self.proposals.read_text())["matches"]
+                if label == "held-source":
+                    self.assertEqual(other_row["status"], "recording_conflict")
+                    self.assertEqual(overrides, [])
+                else:
+                    self.assertEqual(other_row["status"], "proposal")
+                    row, = overrides
+                    self.assertEqual(row["spotify_uri"], "spotify:track:secondcopy")
+
+    def test_recording_proposal_requires_eligibility_in_both_cache_snapshots(self) -> None:
+        track, link, pressing, reverse = self.recording_fixture()
+        code = reverse["isrc"]
+        original = SpotifyTrackCandidate(
+            "spotify:track:original", track.track_name, (track.artist_name,), track.album_name, "PaperCoast",
+        )
+        alternate = SpotifyTrackCandidate(
+            "spotify:track:studio", track.track_name, (track.artist_name,), "Field Notes", "FieldNotes",
+        )
+        new = replace(alternate, uri="spotify:track:new")
+        original_hit = self.recording_hit("original", code, album=track.album_name)
+        alternate_hit = self.recording_hit("studio", code)
+        new_hit = self.recording_hit("new", code)
+        self.cache_negative(track, original, alternate)
+        initial = self.matches
+        for label, current_candidates, isrc_hits, expected_uri in (
+            ("removed", (alternate,), (original_hit,), ""),
+            ("fallback", (alternate,), (original_hit, alternate_hit), alternate.uri),
+            ("added", (new,), (new_hit,), ""),
+            ("unmatched", (original, alternate), (original_hit,), ""),
+            ("timestamp", (original, alternate), (original_hit, alternate_hit), original.uri),
+        ):
+            with self.subTest(change=label):
+                self.requests.clear()
+                self.matches = {}
+                current_record = self.cache_negative(track, *current_candidates)
+                current_record["last_seen_at"] = "2026-11-25T00:00:00+00:00"
+                if label == "unmatched":
+                    current_record["match_status"] = UNMATCHED
+                latest = self.matches
+                self.matches = initial
+                self.set_isrc_hits(code, *isrc_hits)
+                with patch.object(review_track_matches, "load_spotify_track_match_cache", side_effect=(initial, latest)):
+                    report, paths = self.run_recording_review(
+                        link, pressing, reverse, output=self.directory / f"{label}.json",
+                    )
+                self.assertEqual((len(paths), len(self.requests)), (3, 1))
+                row, = report["rows"]
+                overrides = json.loads(self.proposals.read_text())["matches"]
+                if expected_uri:
+                    self.assertEqual(row["status"], "proposal")
+                    self.assertEqual([override["spotify_uri"] for override in overrides], [expected_uri])
+                    if label == "fallback":
+                        self.assertEqual(row["recording_proof"]["alternatives"], [])
+                else:
+                    self.assertEqual(row["status"], "recording_unverified")
+                    self.assertEqual(overrides, [])
+
+    def test_recording_proposal_honors_later_source_and_manual_ownership_holds(self) -> None:
+        track, link, pressing, reverse = self.recording_fixture()
+        self.seed_recording_tie(track)
+        self.set_isrc_hits(reverse["isrc"], self.recording_hit("studio", reverse["isrc"]))
+        for hold in ("source_collision", "manual_hold"):
+            with self.subTest(hold=hold):
+                self.requests.clear()
+                latest = deepcopy(self.matches)
+                current_track = track
+                if hold == "source_collision":
+                    current_track = replace(track, track_name="Changed title")
+                else:
+                    latest[spotify_track_match_key(track)]["match_status"] = "manual"
+                with (
+                    patch.object(review_track_matches, "read_playlist_tracks", side_effect=((track,), (current_track,))),
+                    patch.object(review_track_matches, "load_spotify_track_match_cache", side_effect=(self.matches, latest)),
+                ):
+                    report, paths = self.run_recording_review(
+                        link, pressing, reverse, output=self.directory / f"{hold}.json",
+                    )
+                self.assertEqual((len(paths), len(self.requests)), (3, 1))
+                self.assertEqual(report["rows"][0]["status"], hold)
+                self.assertEqual(json.loads(self.proposals.read_text())["matches"], [])
+
     def test_recording_proposal_rejects_code_reused_on_different_printed_tracks(self) -> None:
         _, _, link, pressing, first, _ = self.two_track_recording_fixture()
         pressing["media"][0]["tracks"][1]["recording"]["isrcs"] = [first["isrc"]]
@@ -582,6 +792,20 @@ class SpotifyArtistReviewTests(unittest.TestCase):
         medium["tracks"][1] = {**first, "position": 2, "number": "2", "recording": dict(first["recording"])}
         self.set_isrc_hits(reverse["isrc"], self.recording_hit("studio", reverse["isrc"]))
         return track, repeat, link, pressing, reverse
+
+    def test_recording_proposal_rejects_shared_candidate_with_two_catalog_codes(self) -> None:
+        _, _, link, pressing, first = self.repeat_recording_fixture()
+        other_id = "00000000-1111-4111-8111-000000000004"
+        other_code = "ZZABC2600002"
+        pressing["media"][0]["tracks"][1]["recording"].update(id=other_id, isrcs=[other_code])
+        other = {"isrc": other_code, "recordings": [{"id": other_id}]}
+        self.set_isrc_hits(other_code, self.recording_hit("studio", other_code))
+        report, paths = self.run_recording_review(link, pressing, first, other_recordings=(other,))
+        self.assertEqual((len(paths), len(self.requests)), (4, 2))
+        for row in report["rows"]:
+            self.assertEqual(row["status"], "recording_unverified")
+            self.assertIn("contradicts Spotify's ISRC evidence for one URI", row["reason"])
+        self.assertEqual(json.loads(self.proposals.read_text())["matches"], [])
 
     def test_recording_proposal_intentional_repeat_previews_one_override_per_printed_position(self) -> None:
         _, _, link, pressing, reverse = self.repeat_recording_fixture()

@@ -43,8 +43,9 @@ repo-managed publisher playlists by exact Spotify track URI. A manual-match
 importer validates override rows against generated playlist masters, previews
 by default without calling Spotify or writing the match cache, writes only in
 explicit apply mode, and stores authoritative manual cache records. The Spotify
-review command can verify unresolved ties against a recording ISRC corroborated
-on the exact Discogs pressing and export schema-v1 manual override proposals.
+review command can verify one or more eligible candidates against a recording
+ISRC corroborated on the exact Discogs pressing and export schema-v1 manual
+override proposals.
 The operator reviews proposals with the manual importer before choosing whether
 to apply them. A separate
 release-ID playlist script can create an isolated on-the-fly playlist from

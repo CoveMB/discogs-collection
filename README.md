@@ -824,10 +824,11 @@ recordings. Verify the performance before using a URI in a manual override.
 The command leaves the generated masters, track caches, publisher state,
 and Spotify playlists untouched.
 
-## Propose a manual match for a tied Spotify recording
+## Propose a manual Spotify match by recording code
 
-Add `--proposals` to verify a tie using the source recording's ISRC and save
-the result for manual review. Use a new JSON filename in an existing directory.
+Add `--proposals` to verify eligible candidates using the source recording's
+ISRC and save verified matches for manual review. Use a new JSON filename in an
+existing directory.
 
 ```sh
 python3 scripts/publishers/spotify/review_track_matches.py \
@@ -836,9 +837,11 @@ python3 scripts/publishers/spotify/review_track_matches.py \
   --proposals ./spotify-recording-proposals.json
 ```
 
-This works for saved ambiguous rows with competing candidates, including tracks
-with one artist spelling, and for previously unmatched rows where the spelling
-search finds a tie. A single new suggestion stays in the stdout report.
+A saved ambiguous row can qualify from cached candidates alone, including a
+track with one artist spelling. A previously unmatched row needs a documented
+artist name variation and at least one eligible candidate from the cache or
+spelling searches. One eligible Spotify URI is enough to trigger the recording
+lookup.
 
 The command looks up the exact Discogs pressing in MusicBrainz. It checks the
 links in both directions, the barcode and label/catalogue pair, and the ordered
@@ -850,10 +853,15 @@ album. When multiple editions qualify, the report explains the choice and shows
 the other verified editions. The file keeps one override per printed track
 position when the same recording appears more than once.
 
+Before writing proposals, the command rereads the generated masters and match
+cache. Source changes, new cache holds, and contradictory evidence can withhold
+a proposal.
+
 The JSON file contains only the overrides for the importer. It can be empty if
 no track qualifies. Read the stdout report for tracks held for review or
 incomplete catalog requests. Preview the file with the same playlist root and
-match cache you used for the review.
+match cache you used for the review. Review and approve each override before
+applying it.
 
 ```sh
 python3 scripts/publishers/spotify/manual_matches.py \
