@@ -65,6 +65,7 @@ from publishers.spotify.musicbrainz_recordings import (
 )
 from publishers.spotify.publish_playlist import read_playlist_tracks
 from publishers.spotify.recording_proposals import (
+    IncompleteSpotifyRecordingEvidence,
     SpotifyRecordingHit,
     check_spotify_recordings,
     ordered_editions,
@@ -653,11 +654,15 @@ def resolve_recording_proposals(
     cached_observations = tuple(hit for evidence in candidates.values() for hit in evidence.cached_hits)
     proposals: list[RecordingProposal] = []
     for track, row, lookup in lookups:
-        hits, reason = check_spotify_recordings(
-            lookup.items, lookup.code, lookup.durations, lookup.candidate_uris, cached_observations, catalog_observations,
-            lambda hit: matching_credits(track.track_name, row.discogs_credits, hit) is not None,
-            observations_conflict,
-        )
+        try:
+            hits, reason = check_spotify_recordings(
+                lookup.items, lookup.code, lookup.durations, lookup.candidate_uris, cached_observations, catalog_observations,
+                lambda hit: matching_credits(track.track_name, row.discogs_credits, hit) is not None,
+                observations_conflict,
+            )
+        except IncompleteSpotifyRecordingEvidence as error:
+            row.status, row.reason = "incomplete", str(error)
+            continue
         if not hits:
             row.reason = reason
             continue

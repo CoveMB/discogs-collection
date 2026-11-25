@@ -27,6 +27,10 @@ from publishers.spotify.matching import (
 from publishers.spotify.musicbrainz_recordings import comparable_durations, duration_ms
 
 
+class IncompleteSpotifyRecordingEvidence(ValueError):
+    """A Spotify ISRC response omitted or malformed evidence needed for a proposal."""
+
+
 @dataclass(frozen=True)
 class SpotifyRecordingHit:
     track: SpotifyTrackCandidate
@@ -85,25 +89,42 @@ def check_spotify_recordings(
     observations_conflict: Callable[[SpotifyTrackCandidate, SpotifyTrackCandidate], bool],
 ) -> tuple[tuple[SpotifyRecordingHit, ...], str]:
     by_uri: dict[str, list[SpotifyRecordingHit]] = {}
+    all_playable = True
     for item in items:
         if not isinstance(item, dict) or item.get("type") != "track":
-            return (), "Spotify returned a malformed ISRC search track."
+            raise IncompleteSpotifyRecordingEvidence("Spotify returned a malformed ISRC search track.")
         parsed = parse_search_track_items((item,))
         duration = duration_ms(item.get("duration_ms"))
-        if not parsed or duration is None or not parsed[0].has_complete_recording_metadata:
-            return (), "Spotify returned incomplete ISRC search track metadata."
+        if not parsed or duration is None or not parsed[0].has_complete_recording_metadata or not parsed[0].isrc:
+            raise IncompleteSpotifyRecordingEvidence("Spotify returned incomplete ISRC search track metadata.")
         track = parsed[0]
         identifier = track_id(track.uri)
         if not identifier or item.get("uri") != track.uri or item.get("id") != identifier or not spotify_id_valid(track.album_id):
-            return (), "Spotify returned invalid track or album identifiers."
-        if item.get("is_playable") is not True or unavailable(item):
-            return (), "Spotify did not confirm unrestricted playability for every ISRC result."
-        if track.isrc != isrc or not matches_source(track) or not comparable_durations(*durations, duration):
-            return (), "An ISRC result contradicts the source code, title, version, credits or duration."
+            raise IncompleteSpotifyRecordingEvidence("Spotify returned invalid track or album identifiers.")
         ids = artist_ids(item)
         if any(artist_id and not spotify_id_valid(artist_id) for artist_id in ids):
-            return (), "Spotify returned an invalid artist identifier."
+            raise IncompleteSpotifyRecordingEvidence("Spotify returned an invalid artist identifier.")
+        album = item.get("album")
+        if (
+            any(value is not None and not isinstance(value, dict) for value in (
+                item.get("restrictions"), item.get("linked_from"),
+                album.get("restrictions") if isinstance(album, dict) else None,
+            ))
+            or (item.get("is_playable") is not None and type(item["is_playable"]) is not bool)
+            or ("is_local" in item and type(item["is_local"]) is not bool)
+        ):
+            raise IncompleteSpotifyRecordingEvidence("Spotify returned malformed playability evidence.")
+
+        all_playable = all_playable and item.get("is_playable") is True and not unavailable(item)
         by_uri.setdefault(track.uri, []).append(SpotifyRecordingHit(track, duration, ids))
+
+    if not all_playable:
+        return (), "Spotify did not confirm unrestricted playability for every ISRC result."
+    if any(
+        hit.track.isrc != isrc or not matches_source(hit.track) or not comparable_durations(*durations, hit.duration_ms)
+        for variants in by_uri.values() for hit in variants
+    ):
+        return (), "An ISRC result contradicts the source code, title, version, credits or duration."
 
     # Keep duplicates through validation. The first result may hide a later disagreement.
     for variants in by_uri.values():

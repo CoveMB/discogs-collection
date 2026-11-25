@@ -350,27 +350,41 @@ def artist_ids(source: DiscogsTrackEvidence, credits: object) -> tuple[str, ...]
     return tuple(ids)
 
 
+def conflicting_live_disambiguation(title: str, comment: str) -> bool:
+    # MusicBrainz puts a live performance marker in disambiguation, outside the recording title.
+    qualifier = evidence_text(comment)
+    if qualifier.partition(",")[0].strip() != "live":
+        return False
+    return not title.endswith((f" ({qualifier})", f" [{qualifier}]", f" - {qualifier}"))
+
+
 def corroborate_recording(
     source: DiscogsTrackEvidence, track: Mapping[str, object], medium: int, number: str,
 ) -> RecordingEvidence:
-    if evidence_text(text_field(track.get("title"))) != evidence_text(source.title):
+    title = evidence_text(source.title)
+    if evidence_text(text_field(track.get("title"))) != title:
         raise UnverifiedPressing("The ordered track titles do not match the exact pressing.")
     track_artists = artist_ids(source, track.get("artist-credit"))
     if track_artists is None:
         raise UnverifiedPressing("The ordered track credits do not match the exact pressing.")
     recording = mapping(track.get("recording"))
     recording_id = musicbrainz_id(recording.get("id"))
+    comment = recording.get("disambiguation", "")
     linked_artists = artist_ids(source, recording.get("artist-credit"))
     codes = recording.get("isrcs")
     isrcs = frozenset(code for value in codes if (code := recording_code(value))) if isinstance(codes, list) else frozenset()
     length = duration_ms(track.get("length"))
     reason = ""
     if (
-        not recording_id or evidence_text(text_field(recording.get("title"))) != evidence_text(source.title)
+        not recording_id or evidence_text(text_field(recording.get("title"))) != title
         or linked_artists is None
         or any(left and right and left != right for left, right in zip(track_artists, linked_artists, strict=True))
     ):
         reason = "The linked MusicBrainz recording has conflicting title, version or credit evidence."
+    elif not isinstance(comment, str):
+        reason = "The linked MusicBrainz recording has malformed disambiguation."
+    elif conflicting_live_disambiguation(title, comment):
+        reason = "The MusicBrainz recording's live disambiguation does not match the printed title."
     elif not isinstance(codes, list) or len(isrcs) != 1 or any(not recording_code(value) for value in codes):
         reason = "The linked MusicBrainz recording does not establish a unique valid ISRC."
     elif length is None or source.duration_ms is None or not comparable_durations(length, source.duration_ms):

@@ -697,6 +697,56 @@ class SpotifyArtistReviewTests(unittest.TestCase):
                 self.assertIn("linked MusicBrainz recording", report["rows"][0]["reason"])
                 self.assertEqual(json.loads(self.proposals.read_text())["matches"], [])
 
+    def test_recording_proposal_holds_unmarked_live_disambiguation(self) -> None:
+        track, link, pressing, reverse = self.recording_fixture()
+        self.seed_recording_tie(track)
+        pressing["media"][0]["tracks"][0]["recording"]["disambiguation"] = "live, 2026-05-03: Harbour Hall"
+        self.set_isrc_hits(reverse["isrc"], self.recording_hit("studio", reverse["isrc"]))
+        report, paths = self.run_recording_review(link, pressing, reverse)
+        self.assertEqual(len(paths), 2)
+        self.assertFalse(self.requests)
+        self.assertIn("live disambiguation", report["rows"][0]["reason"])
+        self.assertEqual(json.loads(self.proposals.read_text())["matches"], [])
+
+    def test_recording_proposal_accepts_exactly_corroborated_live_disambiguation(self) -> None:
+        track, link, pressing, reverse = self.recording_fixture()
+        title = "Night Signal (Live, 2026-05-03: Harbour Hall)"
+        track = replace(track, track_name=title)
+        self.write_master("Fictional Shelf", (track,))
+        self.payload["tracklist"] = [discogs_track(title, "1", duration="3:02")]
+        mb_track = pressing["media"][0]["tracks"][0]
+        mb_track["title"] = title
+        mb_track["recording"].update(title=title, disambiguation="live, 2026-05-03: Harbour Hall")
+        self.cache_negative(track, *(
+            SpotifyTrackCandidate(f"spotify:track:{uri}", title, ("Mara Vale",), album, album_id)
+            for uri, album, album_id in (("studio", "Field Notes", "FieldNotes"), ("other", "Other Disc", "OtherDisc"))
+        ))
+        self.set_isrc_hits(reverse["isrc"], {**self.recording_hit("studio", reverse["isrc"]), "name": title})
+        report, _ = self.run_recording_review(link, pressing, reverse)
+        self.assertEqual(report["rows"][0]["status"], "proposal")
+
+    def test_recording_proposal_reports_missing_spotify_metadata_without_holding_other_rows(self) -> None:
+        _, second, link, pressing, first, other = self.two_track_recording_fixture()
+        self.set_isrc_hits(first["isrc"], self.recording_hit("studio", first["isrc"]))
+        complete_hit = {**self.recording_hit("secondcopy", other["isrc"], album="Second"), "name": second.track_name}
+        for field in ("duration_ms", "external_ids"):
+            with self.subTest(field=field):
+                incomplete_hit = dict(complete_hit)
+                del incomplete_hit[field]
+                self.set_isrc_hits(other["isrc"], incomplete_hit)
+                report, _ = self.run_recording_review(
+                    link, pressing, first, other_recordings=(other,), code=1, output=self.directory / f"missing-{field}.json",
+                )
+                self.assertEqual([row["status"] for row in report["rows"]], ["proposal", "incomplete"])
+                self.assertEqual(manual_matches.import_manual_match_overrides(self.proposals, self.root, self.cache).planned_count, 1)
+
+        complete_hit["external_ids"] = {"isrc": "ZZABC2600099"}
+        self.set_isrc_hits(other["isrc"], complete_hit)
+        report, _ = self.run_recording_review(
+            link, pressing, first, other_recordings=(other,), output=self.directory / "different-code.json",
+        )
+        self.assertEqual([row["status"] for row in report["rows"]], ["proposal", "recording_unverified"])
+
     def test_canonical_search_finds_recording_absent_from_printed_search(self) -> None:
         source = {"release_id": RELEASE_ID}
         tracklist = release_tracklist_from_payload(RELEASE_ID, self.payload, source)
