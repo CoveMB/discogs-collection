@@ -945,6 +945,103 @@ class SpotifyClientTests(unittest.TestCase):
                 uris=("spotify:track:alpha",),
             )
 
+    def test_track_search_retries_one_gateway_failure_and_parses_success(self):
+        responses = iter((
+            HttpResponse(502, {}, "first gateway failure"),
+            HttpResponse(
+                200,
+                {},
+                '{"tracks":{"items":[{"uri":"spotify:track:alpha","name":"Alpha One",'
+                '"artists":[{"name":"Alpha Artist"}],"album":{"name":"Alpha Album"}}]}}',
+            ),
+        ))
+        requests: list[HttpRequest] = []
+        sleeps: list[float] = []
+
+        def transport(request: HttpRequest) -> HttpResponse:
+            requests.append(request)
+            return next(responses)
+
+        client = SpotifyClient(transport=transport, sleep=sleeps.append)
+        candidates = client.search_tracks("token", 'track:"Alpha One" artist:"Alpha Artist"')
+
+        self.assertEqual(tuple(candidate.uri for candidate in candidates), ("spotify:track:alpha",))
+        self.assertEqual([request.method for request in requests], ["GET", "GET"])
+        self.assertEqual(requests[0], requests[1])
+        self.assertEqual(client.request_control.request_count, 2)
+        self.assertEqual(sleeps, [1.0])
+
+    def test_track_search_gateway_retry_budget_survives_rate_limit_retry(self):
+        first_failure = HttpResponse(502, {}, "first gateway failure")
+        last_failure = HttpResponse(502, {}, "last gateway failure")
+        rate_limit = HttpResponse(429, {"Retry-After": "2"}, "")
+        success = HttpResponse(200, {}, '{"tracks":{"items":[]}}')
+        for failures, expected_sleeps in (
+            ((first_failure, last_failure), [1.0]),
+            ((first_failure, rate_limit, last_failure), [1.0, 2.0]),
+        ):
+            with self.subTest(statuses=[response.status for response in failures]):
+                responses = iter((*failures, success))
+                sleeps: list[float] = []
+                client = SpotifyClient(transport=lambda request: next(responses), sleep=sleeps.append)
+
+                with self.assertRaisesRegex(SpotifyApiError, "status 502: last gateway failure"):
+                    client.search_tracks("token", "query")
+
+                self.assertEqual(client.request_control.request_count, len(failures))
+                self.assertEqual(sleeps, expected_sleeps)
+
+    def test_track_search_gateway_retry_skips_continuous_and_other_statuses(self):
+        from publishers.spotify.request_control import SpotifyRequestControl
+
+        for continuous, status in ((True, 502), (False, 503)):
+            with self.subTest(continuous=continuous, status=status):
+                responses = iter((HttpResponse(status, {}, ""), HttpResponse(200, {}, '{"tracks":{"items":[]}}')))
+                sleeps: list[float] = []
+                control = SpotifyRequestControl(continuous=continuous)
+                client = SpotifyClient(
+                    transport=lambda request: next(responses), sleep=sleeps.append, request_control=control,
+                )
+
+                with self.assertRaisesRegex(SpotifyApiError, f"status {status}"):
+                    client.search_tracks("token", "query")
+
+                self.assertEqual(control.request_count, 1)
+                self.assertEqual(sleeps, [])
+
+    def test_album_search_gateway_failure_is_not_retried(self):
+        responses = iter((HttpResponse(502, {}, ""), HttpResponse(200, {}, '{"albums":{"items":[]}}')))
+        sleeps: list[float] = []
+        client = SpotifyClient(transport=lambda request: next(responses), sleep=sleeps.append)
+
+        with self.assertRaisesRegex(SpotifyApiError, "status 502"):
+            client.search_albums("token", "query")
+
+        self.assertEqual(client.request_control.request_count, 1)
+        self.assertEqual(sleeps, [])
+
+    def test_gateway_retry_does_not_use_the_generic_request_default(self):
+        failure = HttpResponse(502, {}, "generic gateway failure")
+        responses = iter((failure, HttpResponse(200, {}, '{"id":"test-user"}')))
+        sleeps: list[float] = []
+        client = SpotifyClient(transport=lambda request: next(responses), sleep=sleeps.append)
+        request = HttpRequest("GET", "https://api.spotify.com/v1/me", {})
+
+        self.assertEqual(client.request_with_rate_limit_retries(request), failure)
+        self.assertEqual(client.request_control.request_count, 1)
+        self.assertEqual(sleeps, [])
+
+    def test_gateway_retry_does_not_replay_playlist_replace(self):
+        responses = iter((HttpResponse(502, {}, ""), HttpResponse(200, {}, "{}")))
+        sleeps: list[float] = []
+        client = SpotifyClient(transport=lambda request: next(responses), sleep=sleeps.append)
+
+        with self.assertRaisesRegex(SpotifyApiError, "status 502"):
+            client.replace_playlist_items("token", "playlist", ("spotify:track:alpha",))
+
+        self.assertEqual(client.request_control.request_count, 1)
+        self.assertEqual(sleeps, [])
+
     def test_search_tracks_honors_retry_after_before_retrying_rate_limit(self):
         responses = [
             HttpResponse(status=429, headers={"Retry-After": "2"}, body='{"error":"rate limited"}'),

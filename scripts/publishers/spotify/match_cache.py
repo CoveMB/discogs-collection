@@ -52,6 +52,8 @@ ALBUM_RECOVERY_ATTEMPT_ALBUM_IDS_FIELD = "album_recovery_attempt_album_ids"
 VERSION_TITLE_REVIEW_CANDIDATES_FIELD = "version_title_review_candidates"
 ALBUM_HINT_RECORDING_CONFLICT_FIELD = "album_hint_recording_conflict"
 RECORDING_CONFLICT_REASON_FIELD = "recording_conflict_reason"
+STRICT_ALBUM_RECOVERY_FIELD = "strict_album_recovery"
+STRICT_ALBUM_MATCH_STORAGE_STATUS = "strict_album_matched"
 
 
 @dataclass(frozen=True)
@@ -76,7 +78,7 @@ def load_spotify_track_match_cache(path: Path) -> dict[str, dict[str, object]]:
     if not isinstance(matches, Mapping):
         raise ValueError("Spotify track match cache field must be an object: matches")
     return {
-        clean_cell(cache_key): dict(record)
+        clean_cell(cache_key): _match_record_from_storage(record)
         for cache_key, record in matches.items()
         if clean_cell(cache_key) and isinstance(record, Mapping)
     }
@@ -88,9 +90,27 @@ def save_spotify_track_match_cache(path: Path, matches: Mapping[str, Mapping[str
         {
             "schema_version": MATCH_CACHE_SCHEMA_VERSION,
             "record_type": MATCH_CACHE_RECORD_TYPE,
-            "matches": dict(sorted((cache_key, dict(record)) for cache_key, record in matches.items())),
+            "matches": {
+                cache_key: _match_record_for_storage(record) for cache_key, record in sorted(matches.items())
+            },
         },
     )
+
+
+def _match_record_from_storage(record: Mapping[str, object]) -> dict[str, object]:
+    result = dict(record)
+    if result.get("match_status") == STRICT_ALBUM_MATCH_STORAGE_STATUS:
+        result["match_status"] = MATCHED
+        result[STRICT_ALBUM_RECOVERY_FIELD] = True
+    return result
+
+
+def _match_record_for_storage(record: Mapping[str, object]) -> dict[str, object]:
+    result = dict(record)
+    # Older readers skip this status because strict source verification is required.
+    if result.pop(STRICT_ALBUM_RECOVERY_FIELD, False) is True and result.get("match_status") == MATCHED:
+        result["match_status"] = STRICT_ALBUM_MATCH_STORAGE_STATUS
+    return result
 
 
 def cached_track_match(
@@ -108,8 +128,13 @@ def cached_track_match(
     if match_status in {"matched", "manual"}:
         if (
             match_status == MATCHED
-            and cache_record_is_version_sensitive(record)
-            and cache_record_matcher_version(record) != MATCHER_VERSION
+            and (
+                not _strict_album_recovery_applies_to(track, record)
+                or (
+                    cache_record_is_version_sensitive(record)
+                    and cache_record_matcher_version(record) != MATCHER_VERSION
+                )
+            )
         ):
             return None
         return cached_matched_track(track, cache_key, record, seen_at=seen_at)
@@ -155,6 +180,10 @@ def cached_recording_proof_is_current(track: PlaylistTrack, record: Mapping[str,
         and isinstance(album, str)
         and recording_proof_source_matches(track, title=title, artist=artist, album=album)
     )
+
+
+def _strict_album_recovery_applies_to(track: PlaylistTrack, record: Mapping[str, object]) -> bool:
+    return record.get(STRICT_ALBUM_RECOVERY_FIELD) is not True or cached_recording_proof_is_current(track, record)
 
 
 def cache_record_is_version_sensitive(record: Mapping[str, object]) -> bool:
@@ -206,6 +235,7 @@ def cached_matched_track(
             review_candidates=review_candidates,
             search_queries=search_queries_from_cache_record(record),
             match_strategy=match_strategy,
+            strict_album_recovery=match_status == MATCHED and record.get(STRICT_ALBUM_RECOVERY_FIELD) is True,
         ),
     )
 
@@ -348,7 +378,7 @@ def album_lookup_candidates_from_cache_record(
     track: PlaylistTrack,
     record: Mapping[str, object],
 ) -> tuple[SpotifyTrackCandidate, ...]:
-    if cache_record_has_recording_conflict(record):
+    if cache_record_has_recording_conflict(record) or not _strict_album_recovery_applies_to(track, record):
         return ()
     match_status = clean_cell(record.get("match_status"))
     if match_status == MATCHED:
@@ -424,7 +454,7 @@ def cache_record_can_store_album_recovery_attempt(
     track: PlaylistTrack,
     record: Mapping[str, object],
 ) -> bool:
-    if cache_record_has_recording_conflict(record):
+    if cache_record_has_recording_conflict(record) or not _strict_album_recovery_applies_to(track, record):
         return False
     match_status = clean_cell(record.get("match_status"))
     if match_status == MATCHED and clean_cell(record.get("match_strategy")) == SAME_RECORDING_EDITION_MATCH_STRATEGY:
@@ -442,11 +472,23 @@ def cache_track_match(
     matches: dict[str, dict[str, object]],
     decision: TrackMatchDecision,
     matched_at: str | None = None,
-) -> None:
+    *,
+    refresh_match_cache: bool = False,
+) -> bool:
     if decision.status not in CACHEABLE_MATCH_STATUSES:
-        return
+        return False
     timestamp = matched_at or utc_timestamp()
     track = decision.track
+    cache_key = spotify_track_match_key(track)
+    existing_record = matches.get(cache_key)
+    if (
+        not refresh_match_cache
+        and existing_record is not None
+        and existing_record.get(STRICT_ALBUM_RECOVERY_FIELD) is True
+        and cache_record_matcher_version(existing_record) == MATCHER_VERSION
+        and not cached_recording_proof_is_current(track, existing_record)
+    ):
+        return False
     candidate = decision.candidate
     record: dict[str, object] = {
         "release_id": track.release_id,
@@ -463,7 +505,7 @@ def cache_track_match(
     }
     if decision.status == MATCHED:
         if not decision.spotify_uri.startswith("spotify:track:"):
-            return
+            return False
         record.update(spotify_candidate_cache_record(
             candidate or SpotifyTrackCandidate(
                 uri=decision.spotify_uri,
@@ -484,6 +526,8 @@ def cache_track_match(
             match_strategy = CONSTRAINED_TYPO_MATCH_STRATEGY
         if match_strategy:
             record["match_strategy"] = match_strategy
+        if decision.strict_album_recovery:
+            record[STRICT_ALBUM_RECOVERY_FIELD] = True
         if match_strategy == SAME_RECORDING_EDITION_MATCH_STRATEGY:
             record["review_candidates"] = [
                 spotify_candidate_cache_record(candidate) for candidate in decision.review_candidates
@@ -518,12 +562,16 @@ def cache_track_match(
             }
         )
         _store_version_title_review_candidates(record, decision.review_candidates)
-    matches[spotify_track_match_key(track)] = record
+    matches[cache_key] = record
+    return True
 
 
-def record_cached_version_title_review(record: dict[str, object], decision: TrackMatchDecision) -> None:
+def record_cached_version_title_review(record: dict[str, object], decision: TrackMatchDecision) -> bool:
+    if not _strict_album_recovery_applies_to(decision.track, record):
+        return False
     record["search_queries"] = list(decision.search_queries)
     _store_version_title_review_candidates(record, decision.review_candidates)
+    return True
 
 
 def _store_version_title_review_candidates(

@@ -73,6 +73,7 @@ from publishers.spotify.matching import (  # noqa: E402
     normalize_music_text,
     normalize_spotify_isrc,
     normalized_identity_artists,
+    recording_proof_source_matches,
     resolve_spotify_edition_tie,
     spotify_candidate_identity_key,
     spotify_recording_metadata_from_values,
@@ -499,7 +500,9 @@ def publish_spotify_playlists(
                     cached_match = None
                     if not refresh_match_cache:
                         cached_match = cached_track_match(track, match_cache, seen_at=timestamp)
-                    album_decision = album_decisions_by_track_key.get(track_cache_key)
+                    album_decision = reusable_album_decision(
+                        track, album_decisions_by_track_key.get(track_cache_key),
+                    )
                     cached_match_is_protected = (
                         cached_match is not None
                         and (track_cache_key in preexisting_matched_cache_keys or cached_match.has_recording_conflict)
@@ -579,9 +582,13 @@ def publish_spotify_playlists(
                                         ):
                                             continue
                                         album_decisions_by_track_key[resolved_key] = resolved_decision
-                                        cache_track_match(match_cache, resolved_decision, matched_at=timestamp)
+                                        cache_track_match(
+                                            match_cache, resolved_decision, matched_at=timestamp, refresh_match_cache=refresh_match_cache,
+                                        )
                                     save_spotify_track_match_cache(match_cache_path, match_cache)
-                                    album_decision = album_decisions_by_track_key.get(track_cache_key)
+                                    album_decision = reusable_album_decision(
+                                        track, album_decisions_by_track_key.get(track_cache_key),
+                                    )
                     cached_review_query = (
                         build_base_title_version_review_query(cached_match.decision)
                         if cached_match is not None and album_decision is None
@@ -688,8 +695,10 @@ def publish_spotify_playlists(
                         if review_query is not None:
                             if match_source == MATCH_SOURCE_SEARCH:
                                 # A stop during the next request can checkpoint the completed ordinary search.
-                                cache_track_match(match_cache, decision, matched_at=timestamp)
-                                resume_progress_made = True
+                                if cache_track_match(
+                                    match_cache, decision, matched_at=timestamp, refresh_match_cache=refresh_match_cache,
+                                ):
+                                    resume_progress_made = True
                             review_error: SpotifyApiError | None = None
                             try:
                                 review_candidates = spotify_client.search_tracks(
@@ -712,8 +721,8 @@ def publish_spotify_playlists(
                             match_source = MATCH_SOURCE_SEARCH
                             if review_error is None:
                                 decision = complete_version_title_review(decision, review_query, review_candidates)
-                                record_cached_version_title_review(match_cache[track_cache_key], decision)
-                                resume_progress_made = True
+                                if record_cached_version_title_review(match_cache[track_cache_key], decision):
+                                    resume_progress_made = True
                             elif invocation is not None:
                                 raise review_error
                             else:
@@ -777,7 +786,9 @@ def publish_spotify_playlists(
                                 planned_write_uris.append(publish_decision.spotify_uri)
                                 final_items.append(final_playlist_item_from_decision(len(final_items) + 1, publish_decision))
                         if review_query is None and match_source in {MATCH_SOURCE_ALBUM, MATCH_SOURCE_SEARCH}:
-                            cache_track_match(match_cache, decision, matched_at=timestamp)
+                            cache_track_match(
+                                match_cache, decision, matched_at=timestamp, refresh_match_cache=refresh_match_cache,
+                            )
                             if cached_match is None and cached_track_match(track, match_cache) is not None:
                                 resume_progress_made = True
                         if recording_conflict and (record := match_cache.get(track_cache_key)) is not None:
@@ -1103,12 +1114,23 @@ def group_unique_tracks_by_release_id(
     }
 
 
+def reusable_album_decision(track: PlaylistTrack, decision: TrackMatchDecision | None) -> TrackMatchDecision | None:
+    if decision is None or not decision.strict_album_recovery:
+        return decision
+    proved_source = decision.track
+    if not recording_proof_source_matches(
+        track, title=proved_source.track_name, artist=proved_source.artist_name, album=proved_source.album_name,
+    ):
+        return None
+    return replace(decision, track=track)
+
+
 def cached_review_candidates_for_release(
     release_tracks: Sequence[PlaylistTrack],
     match_cache: dict[str, dict[str, object]],
     recording_observations: SourceRecordingObservations,
 ) -> tuple[SpotifyTrackCandidate, ...]:
-    candidates_by_uri: dict[str, SpotifyTrackCandidate] = {}
+    candidates_by_album_observation: dict[tuple[str, str, str], SpotifyTrackCandidate] = {}
     for track in release_tracks:
         record = match_cache.get(spotify_track_match_key(track))
         if record is None:
@@ -1122,8 +1144,9 @@ def cached_review_candidates_for_release(
                 record_cached_recording_conflict(record, conflict)
                 continue
         for candidate in candidates:
-            candidates_by_uri.setdefault(candidate.uri, candidate)
-    return tuple(candidates_by_uri.values())
+            observation = (candidate.uri, candidate.album_id, candidate.album_name)
+            candidates_by_album_observation.setdefault(observation, candidate)
+    return tuple(candidates_by_album_observation.values())
 
 
 def album_recovery_candidate_ids(

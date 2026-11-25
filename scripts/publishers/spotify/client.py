@@ -418,7 +418,13 @@ class SpotifyClient:
             raise SpotifyApiError(f"Spotify playlist replace items failed with status {response.status}: {response.body}")
         json.loads(response.body or "{}")
 
-    def request_with_rate_limit_retries(self, request: HttpRequest, operation_name: str = "spotify_search") -> HttpResponse:
+    def request_with_rate_limit_retries(
+        self, request: HttpRequest, operation_name: str | None = None,
+    ) -> HttpResponse:
+        can_retry_bad_gateway = request.method == "GET" and operation_name == "spotify_search"
+        # Keep the legacy diagnostics for direct callers that omit the operation.
+        if operation_name is None:
+            operation_name = "spotify_search"
         max_retries = max(0, self.retry_policy.max_rate_limit_retries)
         attempt_number = 0
         rate_limit_retries = 0
@@ -463,6 +469,10 @@ class SpotifyClient:
             if response.status != 429:
                 if self.request_control.continuous:
                     self.validate_continuous_response(response, operation_name)
+                elif response.status == 502 and can_retry_bad_gateway:
+                    can_retry_bad_gateway = False
+                    self.sleep(1.0)
+                    continue
                 return response
             if rate_limit_retries >= max_retries:
                 wait_seconds = self.retry_policy.rate_limit_wait_seconds(response.headers)
@@ -624,14 +634,17 @@ def parse_album_track_page(payload: object) -> tuple[SpotifyAlbumTrack, ...]:
             continue
         uri = clean_cell(item.get("uri"))
         name = clean_cell(item.get("name"))
-        artists = item.get("artists", [])
-        artist_names = tuple(
-            clean_cell(artist.get("name"))
-            for artist in artists
-            if isinstance(artist, dict) and clean_cell(artist.get("name"))
-        )
         if not uri or not name:
             continue
+        artists = item.get("artists")
+        artist_entries = artists if isinstance(artists, list) else ()
+        raw_artist_names = tuple(
+            artist.get("name") if isinstance(artist, dict) else None for artist in artist_entries
+        )
+        artist_names = tuple(artist_name for raw_name in raw_artist_names if (artist_name := clean_cell(raw_name)))
+        artist_credits_complete = bool(raw_artist_names) and all(
+            isinstance(raw_name, str) and raw_name.strip() for raw_name in raw_artist_names
+        )
         is_playable_value = item.get("is_playable")
         tracks.append(
             SpotifyAlbumTrack(
@@ -645,6 +658,7 @@ def parse_album_track_page(payload: object) -> tuple[SpotifyAlbumTrack, ...]:
                     if isinstance(is_playable_value, bool)
                     else None
                 ),
+                artist_credits_complete=artist_credits_complete,
             )
         )
     return tuple(tracks)

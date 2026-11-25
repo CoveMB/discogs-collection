@@ -148,6 +148,7 @@ class TrackMatchDecision:
     review_candidates: tuple[SpotifyTrackCandidate, ...] = ()
     search_queries: tuple[str, ...] = ()
     match_strategy: str = ""
+    strict_album_recovery: bool = False
 
 
 def build_spotify_track_search_query(track: PlaylistTrack) -> str:
