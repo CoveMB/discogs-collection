@@ -276,18 +276,16 @@ def validate_existing_matches(
         if existing_record is None:
             continue
         existing_status = clean_cell(existing_record.get("match_status"))
-        existing_uri = clean_cell(existing_record.get("spotify_uri"))
-        if existing_status not in {"matched", "manual"} or not existing_uri:
-            continue
-        if existing_uri != override.spotify_uri:
-            raise ValueError(
-                f"{source_key} already has a different {existing_status} Spotify URI; "
-                "use --replace-existing to replace it"
-            )
         if existing_status == "manual" and cached_manual_source_conflicts(override.source_track, existing_record):
             raise ValueError(
                 f"{source_key} already has a manual Spotify match for a different source track; "
                 "use --replace-existing to bind it to this source"
+            )
+        existing_uri = clean_cell(existing_record.get("spotify_uri"))
+        if existing_status in {"matched", "manual"} and existing_uri and existing_uri != override.spotify_uri:
+            raise ValueError(
+                f"{source_key} already has a different {existing_status} Spotify URI; "
+                "use --replace-existing to replace it"
             )
 
 

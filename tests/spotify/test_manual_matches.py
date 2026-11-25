@@ -392,14 +392,19 @@ class SpotifyManualMatchTests(unittest.TestCase):
             })
             write_override_file(overrides_path, source_values=source)
             key = "release-1|1|artist|album|signal"
+            manual_uri = "spotify:track:manual-one"
             unrelated = {"match_status": "unmatched", "track_name": "Other Synthetic Track"}
 
-            for field, wrong_value in (
-                ("release_id", "release-2"), ("track_number", "2"), ("track_name", "Signal 東"),
-                ("artist_name", "Artist 東"), ("album_name", "Album 東"),
+            for field, wrong_value, saved_uri in (
+                ("release_id", "release-2", manual_uri), ("track_number", "2", manual_uri),
+                ("track_name", "Signal 東", manual_uri), ("artist_name", "Artist 東", manual_uri),
+                ("album_name", "Album 東", manual_uri),
+                ("track_name", "Signal 東", ""), ("track_name", "Signal 東", None),
             ):
-                with self.subTest(field=field):
-                    record = {"match_status": "manual", "spotify_uri": "spotify:track:manual-one", field: wrong_value}
+                with self.subTest(field=field, saved_uri=saved_uri):
+                    record = {"match_status": "manual", field: wrong_value}
+                    if saved_uri is not None:
+                        record["spotify_uri"] = saved_uri
                     save_spotify_track_match_cache(cache_path, {key: record, "unrelated": unrelated})
                     before = cache_path.read_bytes()
 
@@ -417,7 +422,7 @@ class SpotifyManualMatchTests(unittest.TestCase):
                     self.assertEqual(result.applied_count, 1)
                     updated = load_spotify_track_match_cache(cache_path)
                     self.assertEqual(updated[key][field], source[field])
-                    self.assertEqual(updated[key]["spotify_uri"], "spotify:track:manual-one")
+                    self.assertEqual(updated[key]["spotify_uri"], manual_uri)
                     self.assertEqual(updated["unrelated"], unrelated)
 
     def test_reimport_binds_key_only_and_compatible_partial_manual_matches(self) -> None:
@@ -429,10 +434,16 @@ class SpotifyManualMatchTests(unittest.TestCase):
             write_playlist_master(master, source_values={"Track Name": "Signal 西 É"})
             write_override_file(overrides_path, source_values={"track_name": "Signal 西 É"})
             key = "release-1|1|source artist|source album|signal e"
+            compatible_fields = {"track_name": " SIGNAL  西 e\u0301 ", "release_id": " release-1 ", "album_name": "  "}
 
-            for source_fields in ({}, {"track_name": " SIGNAL  西 e\u0301 ", "release_id": " release-1 ", "album_name": "  "}):
-                with self.subTest(source_fields=source_fields):
-                    record = {"match_status": "manual", "spotify_uri": "spotify:track:manual-one", **source_fields}
+            for saved_fields in (
+                {"spotify_uri": "spotify:track:manual-one"},
+                {},
+                {**compatible_fields, "spotify_uri": "spotify:track:manual-one"},
+                {**compatible_fields, "spotify_uri": ""},
+            ):
+                with self.subTest(saved_fields=saved_fields):
+                    record = {"match_status": "manual", **saved_fields}
                     save_spotify_track_match_cache(cache_path, {key: record})
                     before = cache_path.read_bytes()
                     preview = import_manual_match_overrides(overrides_path, directory, cache_path)
