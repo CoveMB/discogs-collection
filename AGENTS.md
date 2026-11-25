@@ -40,10 +40,12 @@ versus uncertain write details. Raw
 tokens bypass renewal; reports distinguish publishing-session refresh attempts
 from Web API attempts. Optional Spotify tooling can also dedupe
 repo-managed publisher playlists by exact Spotify track URI. A manual-match
-importer validates override rows against generated playlist masters, previews
-by default without calling Spotify or writing the match cache, writes only in
-explicit apply mode, and stores authoritative manual cache records. The Spotify
-review command can verify one or more eligible candidates against a recording
+importer prepares compact publisher-keyed track maps offline. It writes a new
+private version 2 review file with verified source fields and rechecks those
+fields against all selected masters at preview and apply. Only explicit apply
+updates the match cache. An override reviewed without Spotify labels keeps
+exact-URI append membership. The importer also accepts version 1 files. The
+Spotify review command can verify one or more eligible candidates against a recording
 ISRC corroborated on the exact Discogs pressing and export schema-v1 manual
 override proposals.
 The operator reviews proposals with the manual importer before choosing whether
@@ -159,6 +161,9 @@ The tool should:
 - treat empty configured definitions as authoritative empty playlists
 - publish configured release playlists from their exact current master paths in
   replace mode only, after every non-empty source row resolves to Spotify
+- prepare manual overrides from the explicitly selected publisher section and
+  verify the recorded source at its generated release and track position before
+  an explicit apply
 - remove metadata-owned local folders for deleted configured definitions only
   when their metadata is valid and they contain no unknown content
 - never delete or change a Spotify playlist merely because its configured

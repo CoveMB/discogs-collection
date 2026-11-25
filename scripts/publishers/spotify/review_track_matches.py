@@ -31,7 +31,12 @@ from publishers.spotify.client import (
     parse_search_track_items,
 )
 from publishers.spotify.env import DEFAULT_ENV_PATH, DEFAULT_TOKEN_CACHE_PATH, load_spotify_settings
-from publishers.spotify.manual_matches import ManualMatchOverride, tracks_by_import_key
+from publishers.spotify.manual_matches import (
+    ManualMatchOverride,
+    proposal_destination,
+    tracks_by_import_key,
+    write_proposals,
+)
 from publishers.spotify.match_cache import (
     MATCHER_VERSION,
     cache_record_has_recording_conflict,
@@ -71,18 +76,10 @@ from publishers.spotify.recording_proposals import (
     SpotifyRecordingHit,
     check_spotify_recordings,
     ordered_editions,
-    proposal_destination,
-    write_proposals,
 )
 from publishers.spotify.session import SpotifySession, get_spotify_access_token, load_existing_token
 from shared.discogs_api import DEFAULT_REQUEST_INTERVAL_SECONDS, DiscogsRateLimiter, default_discogs_rate_limit
-from shared.workflow_paths import (
-    DEFAULT_PROCESSING_CACHE_PATH,
-    DEFAULT_SEEN_TERMS_CACHE_PATH,
-    DEFAULT_SPOTIFY_MATCH_CACHE_PATH,
-    DEFAULT_SPOTIFY_PUBLISH_STATE_CACHE_PATH,
-    DEFAULT_TRACKLIST_CACHE_PATH,
-)
+from shared.workflow_paths import DEFAULT_SPOTIFY_MATCH_CACHE_PATH
 
 
 SEARCH_LIMIT = 10
@@ -779,12 +776,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.proposals is not None:
-            args.proposals = proposal_destination(args.proposals, protected=(
-                args.playlist_output_directory, args.match_cache, args.token_cache, args.env_file,
-                DEFAULT_SPOTIFY_MATCH_CACHE_PATH, DEFAULT_TOKEN_CACHE_PATH, DEFAULT_ENV_PATH,
-                DEFAULT_PROCESSING_CACHE_PATH, DEFAULT_SEEN_TERMS_CACHE_PATH,
-                DEFAULT_TRACKLIST_CACHE_PATH, DEFAULT_SPOTIFY_PUBLISH_STATE_CACHE_PATH,
-            ))
+            args.proposals = proposal_destination(
+                args.proposals,
+                playlist_root=args.playlist_output_directory,
+                match_cache=args.match_cache,
+                protected=(args.token_cache, args.env_file),
+            )
         rows = review_release(args)
     except (ValueError, OSError) as error:
         print(f"Spotify track match review: {error}", file=sys.stderr)

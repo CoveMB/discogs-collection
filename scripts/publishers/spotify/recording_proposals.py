@@ -2,22 +2,12 @@
 
 from __future__ import annotations
 
-import json
-import os
 import re
-import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import combinations
-from pathlib import Path
 
 from publishers.spotify.client import parse_search_track_items
-from publishers.spotify.manual_matches import (
-    MANUAL_MATCH_OVERRIDE_RECORD_TYPE,
-    MANUAL_MATCH_OVERRIDE_SCHEMA_VERSION,
-    ManualMatchOverride,
-    import_manual_match_overrides,
-)
 from publishers.spotify.matching import (
     PlaylistTrack,
     SpotifyTrackCandidate,
@@ -177,49 +167,3 @@ def ordered_editions(source: PlaylistTrack, hits: Sequence[SpotifyRecordingHit])
     return tuple(sorted(hits, key=lambda hit: (
         normalize_recording_evidence_text(hit.track.album_name) != album, hit.track.uri,
     )))
-
-
-def proposal_destination(path: Path, *, protected: Sequence[Path]) -> Path:
-    if path.suffix.lower() != ".json":
-        raise ValueError("--proposals must name a new .json file.")
-    if os.path.lexists(path):
-        raise ValueError("--proposals already exists. Choose a new path.")
-    destination = path.resolve()
-    if any(destination == input_path.resolve() for input_path in protected):
-        raise ValueError("--proposals names a protected input or cache path.")
-    if not destination.parent.is_dir():
-        raise ValueError("--proposals needs an existing parent directory.")
-    return destination
-
-
-def write_proposals(
-    destination: Path, overrides: Sequence[ManualMatchOverride], playlist_root: Path, match_cache: Path,
-) -> None:
-    payload = {
-        "schema_version": MANUAL_MATCH_OVERRIDE_SCHEMA_VERSION,
-        "record_type": MANUAL_MATCH_OVERRIDE_RECORD_TYPE,
-        "matches": [{
-            "release_id": item.source_track.release_id,
-            "track_number": item.source_track.track_number,
-            "artist_name": item.source_track.artist_name,
-            "album_name": item.source_track.album_name,
-            "track_name": item.source_track.track_name,
-            "spotify_uri": item.spotify_uri,
-            "spotify_track_name": item.spotify_track_name,
-            "spotify_artist_names": item.spotify_artist_names,
-            "spotify_album_name": item.spotify_album_name,
-            "spotify_album_id": item.spotify_album_id,
-        } for item in overrides],
-    }
-    with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=destination.parent, prefix=".spotify-proposals-", delete=False,
-    ) as output:
-        temporary = Path(output.name)
-        try:
-            json.dump(payload, output, ensure_ascii=False, indent=2)
-            output.write("\n")
-            output.close()
-            import_manual_match_overrides(temporary, playlist_root, match_cache)
-            os.link(temporary, destination, follow_symlinks=False)
-        finally:
-            temporary.unlink()

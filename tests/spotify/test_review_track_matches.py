@@ -868,7 +868,7 @@ class SpotifyArtistReviewTests(unittest.TestCase):
             with self.subTest(constant=constant):
                 self.requests.clear()
                 destination = self.directory / filename
-                with patch(f"publishers.spotify.review_track_matches.{constant}", destination, create=True):
+                with patch.object(manual_matches, constant, destination):
                     report, paths = self.run_recording_review(link, pressing, reverse, output=destination, code=1)
                 self.assertEqual((report, paths, self.requests), ({}, [], []))
                 self.assertFalse(destination.exists())

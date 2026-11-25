@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -14,7 +17,8 @@ SCRIPTS_DIRECTORY = Path(__file__).resolve().parents[2]
 if str(SCRIPTS_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 
-from publishers.manual_override_map import read_override_json  # noqa: E402
+from publishers.manual_override_map import read_override_json, read_publisher_track_map  # noqa: E402
+from publishers.spotify.env import DEFAULT_ENV_PATH, DEFAULT_TOKEN_CACHE_PATH  # noqa: E402
 from publishers.spotify.match_cache import (  # noqa: E402
     MATCHER_VERSION,
     cached_manual_source_conflicts,
@@ -37,12 +41,17 @@ from publishers.spotify.matching import (  # noqa: E402
     spotify_recording_metadata_from_values,
     spotify_track_uri_is_structurally_valid,
 )
-from publishers.spotify.publish_playlist import read_playlist_tracks  # noqa: E402
+from publishers.spotify.publish_playlist import default_publish_state_cache_path, read_playlist_tracks  # noqa: E402
 from shared.config_files import reject_unknown_keys  # noqa: E402
+from shared.publisher_config import DEFAULT_PUBLISHER_CONFIG_PATH, SPOTIFY_PUBLISHER  # noqa: E402
 from shared.text import clean_cell  # noqa: E402
 from shared.workflow_paths import (  # noqa: E402
     DEFAULT_PLAYLIST_OUTPUT_DIRECTORY,
+    DEFAULT_PROCESSING_CACHE_PATH,
+    DEFAULT_SEEN_TERMS_CACHE_PATH,
     DEFAULT_SPOTIFY_MATCH_CACHE_PATH,
+    DEFAULT_SPOTIFY_PUBLISH_STATE_CACHE_PATH,
+    DEFAULT_TRACKLIST_CACHE_PATH,
 )
 
 
@@ -121,11 +130,7 @@ def import_manual_match_overrides(
         }
         if override.uri_only:
             record["match_strategy"] = MANUAL_URI_ONLY_MATCH_STRATEGY
-        record.update({
-            field: value
-            for field in TARGET_DESCRIPTION_FIELDS
-            if (value := getattr(override, field))
-        })
+        record.update(target_description(override))
         match_cache[spotify_track_match_key(track)] = record
         clear_manual_collision_cache_entry(track, match_cache)
     save_spotify_track_match_cache(match_cache_path, match_cache)
@@ -386,11 +391,139 @@ def validate_existing_matches(
             )
 
 
+def target_description(override: ManualMatchOverride, *, include_empty: bool = False) -> dict[str, object]:
+    fields: dict[str, object] = {
+        "spotify_track_name": override.spotify_track_name,
+        "spotify_artist_names": list(override.spotify_artist_names),
+        "spotify_album_name": override.spotify_album_name,
+        "spotify_album_id": override.spotify_album_id,
+    }
+    return fields if include_empty else {name: value for name, value in fields.items() if value}
+
+
+def proposal_destination(
+    path: Path,
+    *,
+    playlist_root: Path,
+    match_cache: Path,
+    protected: Sequence[Path] = (),
+    option: str = "--proposals",
+) -> Path:
+    if path.suffix.lower() != ".json":
+        raise ValueError(f"{option} must name a new .json file.")
+    if os.path.lexists(path):
+        raise ValueError(f"{option} already exists. Choose a new path.")
+    protected_paths = (
+        *protected,
+        match_cache,
+        default_publish_state_cache_path(match_cache),
+        DEFAULT_SPOTIFY_MATCH_CACHE_PATH,
+        DEFAULT_SPOTIFY_PUBLISH_STATE_CACHE_PATH,
+        DEFAULT_PROCESSING_CACHE_PATH,
+        DEFAULT_SEEN_TERMS_CACHE_PATH,
+        DEFAULT_TRACKLIST_CACHE_PATH,
+        DEFAULT_TOKEN_CACHE_PATH,
+        DEFAULT_ENV_PATH,
+        DEFAULT_PUBLISHER_CONFIG_PATH,
+    )
+    try:
+        destination = path.resolve()
+        protected_path = any(destination == item.resolve() for item in protected_paths)
+        managed_folder = any(
+            destination.is_relative_to(root.resolve())
+            for root in (playlist_root, DEFAULT_PLAYLIST_OUTPUT_DIRECTORY)
+        )
+    except RuntimeError as error:
+        raise ValueError(f"{option} could not resolve an output or protected path: {error}") from error
+    if protected_path or managed_folder:
+        raise ValueError(f"{option} names a protected input, cache path, or managed playlist folder.")
+    if not destination.parent.is_dir():
+        raise ValueError(f"{option} needs an existing parent directory.")
+    return destination
+
+
+def write_proposals(
+    destination: Path,
+    overrides: Sequence[ManualMatchOverride],
+    playlist_root: Path,
+    match_cache: Path,
+    *,
+    schema_version: int = MANUAL_MATCH_OVERRIDE_SCHEMA_VERSION,
+    replace_existing: bool = False,
+) -> None:
+    legacy = schema_version == MANUAL_MATCH_OVERRIDE_SCHEMA_VERSION
+    rows: list[dict[str, object]] = []
+    for override in overrides:
+        track = override.source_track
+        row: dict[str, object] = {field: getattr(track, field) for field in SOURCE_IDENTITY_FIELDS}
+        row["spotify_uri"] = override.spotify_uri
+        if legacy or (override.spotify_track_name and override.spotify_artist_names and override.spotify_album_name):
+            row.update(target_description(override, include_empty=legacy))
+        rows.append(row)
+    payload = {
+        "schema_version": schema_version,
+        "record_type": MANUAL_MATCH_OVERRIDE_RECORD_TYPE,
+        "matches": rows,
+    }
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=destination.parent, prefix=".spotify-proposals-", delete=False,
+    ) as output:
+        temporary = Path(output.name)
+        try:
+            json.dump(payload, output, ensure_ascii=False, indent=2)
+            output.write("\n")
+            output.close()
+            import_manual_match_overrides(temporary, playlist_root, match_cache, replace_existing=replace_existing)
+            os.link(temporary, destination, follow_symlinks=False)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def prepare_manual_match_map(
+    draft: Path, output: Path, playlist_root: Path, match_cache_path: Path, *, replace_existing: bool,
+) -> None:
+    destination = proposal_destination(
+        output, playlist_root=playlist_root, match_cache=match_cache_path, protected=(draft,), option="--output",
+    )
+    selections, skipped = read_publisher_track_map(draft, SPOTIFY_PUBLISHER)
+    sources = tracks_by_position(read_playlist_tracks(playlist_root))
+    match_cache = load_spotify_track_match_cache(match_cache_path)
+    overrides: list[ManualMatchOverride] = []
+    for (release_id, track_number), spotify_uri in selections.items():
+        label = f"Spotify selection for release {release_id}, track {track_number}"
+        if not spotify_track_uri_is_structurally_valid(spotify_uri):
+            raise ValueError(f"{label} must use a Spotify track URI (spotify:track:<identifier>)")
+        try:
+            track = resolve_source_position(release_id, track_number, sources)
+        except ValueError as error:
+            raise ValueError(f"{label} {error}") from error
+        overrides.append(with_compatible_target_labels(ManualMatchOverride(track, spotify_uri), match_cache, row_label=label))
+    write_proposals(
+        destination, overrides, playlist_root, match_cache_path,
+        schema_version=PREPARED_MAP_SCHEMA_VERSION, replace_existing=replace_existing,
+    )
+
+    print(f"Prepared {len(overrides)} Spotify matches in {destination}")
+    if skipped:
+        print("Skipped publishers: " + ", ".join(repr(name) for name in skipped))
+    for override in overrides:
+        track = override.source_track
+        print(f"- Discogs release {track.release_id}, track {track.track_number} | "
+              f"{track.artist_name!r} | {track.track_name!r} | {track.album_name!r}")
+        details = (", ".join(override.spotify_artist_names), override.spotify_track_name, override.spotify_album_name)
+        labels = " | ".join(repr(label) if label else "(unknown)" for label in details)
+        album_id = f" | album ID {override.spotify_album_id!r}" if override.spotify_album_id else ""
+        print(f"  Spotify {override.spotify_uri!r} | {labels}{album_id}")
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Validate or import explicit Spotify manual match overrides.",
+        description="Prepare, validate, or import explicit Spotify manual match overrides.",
     )
-    parser.add_argument("--overrides", type=Path, required=True, help="Manual match override JSON path.")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--overrides", type=Path, help="Reviewed manual match override JSON path.")
+    mode.add_argument("--prepare-map", type=Path, help="Compact publisher track map to prepare for review.")
+    parser.add_argument("--output", type=Path, help="New review JSON path for --prepare-map.")
     parser.add_argument(
         "--playlist-output-directory",
         type=Path,
@@ -413,12 +546,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Allow replacing a matched or manual Spotify URI or binding a manual match to a different source.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.prepare_map is not None:
+        if args.output is None:
+            parser.error("--prepare-map requires --output")
+        if args.apply:
+            parser.error("--apply requires a reviewed --overrides file")
+    elif args.output is not None:
+        parser.error("--output requires --prepare-map")
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
+        if args.prepare_map is not None:
+            prepare_manual_match_map(
+                args.prepare_map, args.output, args.playlist_output_directory, args.match_cache,
+                replace_existing=args.replace_existing,
+            )
+            return 0
         summary = import_manual_match_overrides(
             overrides_path=args.overrides,
             playlist_output_directory=args.playlist_output_directory,
@@ -426,7 +573,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             apply=args.apply,
             replace_existing=args.replace_existing,
         )
-    except (FileNotFoundError, NotADirectoryError, ValueError) as error:
+    except (OSError, ValueError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 2
     action = "Applied" if args.apply else "Would apply"
