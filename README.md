@@ -786,6 +786,44 @@ anchor order, unequal or oversized gaps, positional artist mismatches, and
 unusable Spotify tracks. If every query returns no candidates, the report says
 so directly.
 
+## Review Spotify candidates under Discogs artist name variations
+
+Use this command after a publisher preview leaves tracks on one Discogs pressing
+ambiguous or unmatched. Pass the pressing's release ID and the generated playlist
+root. The command reads the master CSV in each immediate playlist folder.
+
+```sh
+python3 scripts/publishers/spotify/review_track_matches.py \
+  --release-id 123456789 \
+  --playlist-output-directory collection/playlists/release-playlists
+```
+
+The reviewer uses the publisher's match cache. Pass `--match-cache` if the
+preview used a different file. It skips current matches, manual bindings and
+recording-conflict holds. For a missing or stale assessment, run the ordinary
+publisher preview on the same masters and cache first.
+
+The command reads the selected Discogs pressing, using `DISCOGS_TOKEN` when
+set. It verifies each eligible track against the master CSV's exported track
+number and reports the printed Discogs position separately. When the Discogs
+credit documents a variation, it searches Spotify using the full title and
+the credited and canonical names of the first contributor with a variation.
+It checks every artist credit on returned tracks. A separately listed
+featuring credit that may apply to the track keeps the row in review.
+Each spelling search reads the first page of up to 10 hits. The normal Spotify OAuth session may
+prompt for authorization or refresh and update the token cache. Use
+`--env-file` or `--token-cache` to select the same settings as your publisher
+preview.
+
+The JSON report on stdout lists each Spotify URI and album, the spellings
+that fit the track's credits, and each search or cached suggestion that
+supplied the observation. It retains conflicting observations and identifies
+skipped rows and incomplete queries. An incomplete request returns exit status
+`1` with the available report. A title and credit can lead to multiple
+recordings. Verify the performance before using a URI in a manual override.
+The command leaves the generated masters, track caches, publisher state,
+and Spotify playlists untouched.
+
 ## Import manual Spotify matches
 
 Use a manual override when the report identifies the correct Spotify track but

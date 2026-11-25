@@ -7,6 +7,7 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 from shared.discogs_api import (
     DEFAULT_REQUEST_INTERVAL_SECONDS,
@@ -65,33 +66,56 @@ def release_tracklist_from_payload(
     )
 
 
-def flatten_tracklist(tracklist: object, default_artist_name: str) -> list[DiscogsTrack]:
+class IncludedTrack(NamedTuple):
+    item: Mapping[str, object]
+    parents: tuple[Mapping[str, object], ...]
+
+
+def included_track_items(
+    tracklist: object, *, strict: bool = False, parents: tuple[Mapping[str, object], ...] = (),
+) -> list[IncludedTrack]:
+    """Follow the exporter’s order and exclude headings and other non-playable rows."""
     if not isinstance(tracklist, list):
+        if strict:
+            raise ValueError("Discogs tracklist is missing or malformed")
         return []
-    tracks: list[DiscogsTrack] = []
+    tracks: list[IncludedTrack] = []
     for item in tracklist:
         if not isinstance(item, Mapping):
+            if strict:
+                raise ValueError("Discogs tracklist contains an invalid item")
             continue
-        sub_tracks = flatten_tracklist(item.get("sub_tracks"), default_artist_name)
+        sub_tracks = (
+            included_track_items(item["sub_tracks"], strict=strict, parents=(*parents, item))
+            if "sub_tracks" in item else []
+        )
         if sub_tracks:
             tracks.extend(sub_tracks)
             continue
 
         track_type = clean_cell(item.get("type_", "track")).casefold() or "track"
         if track_type != "track":
+            if strict and track_type not in {"heading", "index"}:
+                raise ValueError("Discogs tracklist contains an unsupported item type")
             continue
 
-        title = clean_cell(item.get("title", ""))
-        if not title:
-            continue
-        tracks.append(
-            DiscogsTrack(
-                position=clean_cell(item.get("position", "")),
-                title=title,
-                artist_name=parse_artists(item.get("artists")) or default_artist_name,
-            )
-        )
+        title = item.get("title")
+        if strict and (not isinstance(title, str) or not title.strip()):
+            raise ValueError("Discogs tracklist contains a track with an invalid title")
+        if clean_cell(title):
+            tracks.append(IncludedTrack(item, parents))
     return tracks
+
+
+def flatten_tracklist(tracklist: object, default_artist_name: str) -> list[DiscogsTrack]:
+    return [
+        DiscogsTrack(
+            position=clean_cell(item.get("position")),
+            title=clean_cell(item.get("title")),
+            artist_name=parse_artists(item.get("artists")) or default_artist_name,
+        )
+        for item, _ in included_track_items(tracklist)
+    ]
 
 
 def parse_artists(value: object) -> str:
@@ -132,6 +156,17 @@ def fetch_release_tracklist(
     rate_limiter: DiscogsRateLimiter,
 ) -> ReleaseTracklistLookup:
     release_id = clean_cell(row.get(RELEASE_ID_COLUMN, ""))
+    payload = fetch_release_payload(release_id, token, user_agent, timeout_seconds, rate_limiter)
+    return release_tracklist_from_payload(release_id, payload if isinstance(payload, Mapping) else {}, row)
+
+
+def fetch_release_payload(
+    release_id: str,
+    token: str,
+    user_agent: str,
+    timeout_seconds: int,
+    rate_limiter: DiscogsRateLimiter,
+) -> object:
     body = http_get(
         release_api_url(release_id),
         user_agent=user_agent,
@@ -140,10 +175,7 @@ def fetch_release_tracklist(
         accept="application/json",
         rate_limiter=rate_limiter,
     )
-    payload = json.loads(body or "{}")
-    if not isinstance(payload, Mapping):
-        payload = {}
-    return release_tracklist_from_payload(release_id, payload, row)
+    return json.loads(body or "{}")
 
 
 def make_cached_tracklist_lookup(

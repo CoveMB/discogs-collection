@@ -13,6 +13,9 @@ Spotify editions whose full source metadata agrees and whose ISRC is shared.
 Append uses the proven group of Spotify URIs to recognize an existing copy.
 For eligible unmatched tracks, the publisher makes one base-title search and
 shows the new candidates for manual review. Those tracks stay unmatched.
+A standalone review command checks current unresolved generated rows for one
+pressing and reports Spotify candidates found under its documented credited
+and canonical Discogs artist names. It writes the review to stdout.
 The standalone publisher supports optional finite,
 non-negative request spacing, defaults to no added delay, and reports actual
 Web API attempts separately from searches. It retains bounded retries and

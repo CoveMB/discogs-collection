@@ -8,7 +8,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Iterable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Protocol
 
@@ -197,6 +197,13 @@ class SpotifyClient:
         query: str,
         limit: int = 10,
     ) -> tuple[SpotifyTrackCandidate, ...]:
+        response = self.search_tracks_response(access_token, query, limit)
+        if response.status != 200:
+            raise SpotifyApiError(f"Spotify search failed with status {response.status}: {response.body}")
+        return parse_search_track_candidates(response.body)
+
+    def search_tracks_response(self, access_token: str, query: str, limit: int = 10) -> HttpResponse:
+        """Run the shared search request and retain the response for strict page validation."""
         if limit < 1 or limit > 10:
             raise ValueError("Spotify search limit must be between 1 and 10")
         params = urllib.parse.urlencode(
@@ -214,10 +221,7 @@ class SpotifyClient:
                 "Accept": "application/json",
             },
         )
-        response = self.request_with_rate_limit_retries(request, operation_name="spotify_search")
-        if response.status != 200:
-            raise SpotifyApiError(f"Spotify search failed with status {response.status}: {response.body}")
-        return parse_search_track_candidates(response.body)
+        return self.request_with_rate_limit_retries(request, operation_name="spotify_search")
 
     def search_albums(
         self,
@@ -552,6 +556,10 @@ def parse_search_track_candidates(body: str) -> tuple[SpotifyTrackCandidate, ...
     payload = json.loads(body or "{}")
     tracks = payload.get("tracks", {}) if isinstance(payload, dict) else {}
     items = tracks.get("items", []) if isinstance(tracks, dict) else []
+    return parse_search_track_items(items)
+
+
+def parse_search_track_items(items: Iterable[object]) -> tuple[SpotifyTrackCandidate, ...]:
     candidates: list[SpotifyTrackCandidate] = []
     for item in items:
         if not isinstance(item, dict):
