@@ -116,6 +116,8 @@ class SpotifyArtistReviewTests(unittest.TestCase):
         response = self.search_responses[query]
         if isinstance(response, HttpResponse):
             return response
+        if isinstance(response, bytes):
+            return HttpResponse(200, {}, response.decode("utf-8"))
         return HttpResponse(200, {}, json.dumps(response if isinstance(response, Mapping) else {"tracks": {"items": response}}))
 
     def run_review(self, *, code: int = 0) -> tuple[dict, int]:
@@ -251,6 +253,11 @@ class SpotifyArtistReviewTests(unittest.TestCase):
             {"tracklist": [discogs_track("Night Signal", "")]},
             {"tracklist": [{"type_": "index", "title": "Medley", "artists": [artist(9, "Another Artist")],
                             "sub_tracks": [discogs_track("Night Signal", "A1")]}]},
+            *(
+                {"tracklist": [{"type_": "index", "title": "Medley", "extraartists": invalid_credits,
+                                "sub_tracks": [discogs_track("Night Signal", "A1")]}]}
+                for invalid_credits in (None, {}, False)
+            ),
         )
         original = self.payload.copy()
         for scenario in scenarios:
@@ -383,6 +390,40 @@ class SpotifyArtistReviewTests(unittest.TestCase):
                 self.assertEqual(row["status"], "source_unverified")
                 self.assertIn("featuring", row["reason"])
         self.assertFalse(self.requests)
+
+    def test_malformed_extra_artist_credits_hold_the_source(self) -> None:
+        self.write_master("Shelf A", (TRACK,))
+        self.cache_negative(TRACK)
+        malformed_feature = {**artist(89, "Otto Finch"), "role": "Featuring"}
+        original = self.payload.copy()
+        for fields in (
+            {"extraartists": malformed_feature},
+            {"extraartists": [None]},
+            {"tracklist": [discogs_track("Night Signal", "A1", extraartists=malformed_feature)]},
+        ):
+            with self.subTest(fields=fields):
+                self.payload = {**original, **fields}
+                self.search_responses = {PRINTED_QUERY: [], CANONICAL_QUERY: [spotify_hit("solo", "Mara Vale")]}
+                report, _ = self.run_review()
+                row, = report["rows"]
+                self.assertEqual(row["status"], "source_unverified")
+                self.assertIn("malformed separate artist credits", row["reason"])
+        self.assertFalse(self.requests)
+
+    def test_invalid_utf8_keeps_earlier_spotify_observations(self) -> None:
+        self.write_master("Shelf A", (TRACK,))
+        self.cache_negative(TRACK)
+        self.search_responses = {
+            PRINTED_QUERY: [spotify_hit("printed", "M. Vale")],
+            CANONICAL_QUERY: bytes([255]),
+        }
+
+        report, _ = self.run_review(code=1)
+        row, = report["rows"]
+        self.assertEqual(row["status"], "incomplete")
+        self.assertEqual([query["status"] for query in row["queries"]], ["complete", "incomplete"])
+        self.assertIn("decoded", row["queries"][1]["reason"])
+        self.assertEqual([candidate["uri"] for candidate in row["candidates"]], ["spotify:track:printed"])
 
     def test_incomplete_same_uri_hit_preserves_verified_disagreement(self) -> None:
         self.write_master("Shelf A", (TRACK,))

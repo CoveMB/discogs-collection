@@ -209,22 +209,19 @@ def source_bound_cached_candidates(record: Mapping[str, object]) -> tuple[Spotif
     return tuple(candidates)
 
 
-def has_separate_featuring_credit(
-    value: object, *, other_positions: set[str] | None = None,
-) -> bool:
+def separate_credit_issue(value: object, *, other_positions: set[str] | None = None) -> str:
     if not isinstance(value, list):
-        return False
+        return "Discogs returned malformed separate artist credits."
     for credit in value:
-        if not isinstance(credit, Mapping):
-            continue
-        role = strict_text(credit.get("role"))
+        if not isinstance(credit, Mapping) or not (role := strict_text(credit.get("role"))):
+            return "Discogs returned malformed separate artist credits."
         # Scope to a different track only when the release names one known printed position.
         scope = normalize_recording_evidence_text(strict_text(credit.get("tracks")))
         if re.search(r"(?:^|,)\s*featuring\s*(?:\[|,|$)", role, re.IGNORECASE) and (
             other_positions is None or scope not in other_positions
         ):
-            return True
-    return False
+            return "Discogs lists a separate featuring credit that may apply to this track."
+    return ""
 
 
 def bind_discogs_sources(
@@ -251,16 +248,16 @@ def bind_discogs_sources(
         row.source["discogs_position"] = printed_position
         if any(
             strict_text(parent.get("type_")).casefold() not in {"heading", "index"}
-            or parent.get("position") or parent.get("artists") or parent.get("extraartists")
+            or parent.get("position") or parent.get("artists") or parent.get("extraartists", []) != []
             for parent in parents
         ):
             row.status, row.reason = "source_unverified", "A nested track has unsupported parent positioning or credits."
         elif not printed_position or positions[position_key] != 1:
             row.status, row.reason = "source_unverified", "The Discogs printed position is missing or ambiguous."
-        elif has_separate_featuring_credit(item.get("extraartists")) or has_separate_featuring_credit(
-            payload.get("extraartists"), other_positions={key for key in positions if key and key != position_key},
+        elif credit_issue := separate_credit_issue(item.get("extraartists", [])) or separate_credit_issue(
+            payload.get("extraartists", []), other_positions={key for key in positions if key and key != position_key},
         ):
-            row.status, row.reason = "source_unverified", "Discogs lists a separate featuring credit that may apply to this track."
+            row.status, row.reason = "source_unverified", credit_issue
         elif not compare_manual_source(
             track, release_id=release_id, track_number=track.track_number, title=item.get("title"),
             artist=parse_artists(credited_artists), album=album,
@@ -343,6 +340,8 @@ def search_first_page(client: SpotifyClient, access_token: str, query: str) -> S
         return SearchPage(reason="Spotify authentication failed. Reauthorize before restarting.", terminal=True)
     except (SpotifyRateLimitDeferredError, SpotifyRateLimitRetriesExhaustedError) as error:
         return SearchPage(reason=f"Spotify rate limit. Retry after {format_wait_duration(error.retry_after_seconds)}.", terminal=True)
+    except UnicodeDecodeError:
+        return SearchPage(reason="Spotify returned a response that could not be decoded.")
     except (SpotifyApiError, OSError, http.client.HTTPException):
         return SearchPage(reason="The Spotify search request failed.", terminal=True)
     if response.status != 200:
