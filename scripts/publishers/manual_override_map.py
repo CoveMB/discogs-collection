@@ -19,7 +19,8 @@ def read_override_json(path: Path, *, label: str) -> object:
         return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_members)
     except json.JSONDecodeError as error:
         raise ValueError(f"malformed {label} JSON: {path}") from error
-
+    except RecursionError as error:
+        raise ValueError(f"malformed {label} JSON (nesting too deep): {path}") from error
 
 
 def canonical_positive_decimal(value: str) -> bool:

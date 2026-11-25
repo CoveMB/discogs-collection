@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -73,6 +74,11 @@ class ManualMatchOverride:
     spotify_album_name: str = ""
     spotify_album_id: str = ""
     uri_only: bool = False
+    additional_sources: tuple[PlaylistTrack, ...] = ()
+
+    @property
+    def sources(self) -> tuple[PlaylistTrack, ...]:
+        return (self.source_track, *self.additional_sources)
 
 
 @dataclass(frozen=True)
@@ -111,28 +117,28 @@ def import_manual_match_overrides(
 
     matched_at = timestamp or utc_timestamp()
     for override in overrides:
-        track = override.source_track
-        record: dict[str, object] = {
-            "release_id": track.release_id,
-            "track_number": track.track_number,
-            "artist_name": track.artist_name,
-            "album_name": track.album_name,
-            "track_name": track.track_name,
-            "search_query": build_spotify_track_search_query(track),
-            "search_queries": [],
-            "match_status": "manual",
-            "match_reason": MANUAL_MATCH_REASON,
-            "matcher_version": MATCHER_VERSION,
-            "spotify_uri": override.spotify_uri,
-            "spotify_url": spotify_url_from_uri(override.spotify_uri),
-            "matched_at": matched_at,
-            "last_seen_at": matched_at,
-        }
-        if override.uri_only:
-            record["match_strategy"] = MANUAL_URI_ONLY_MATCH_STRATEGY
-        record.update(target_description(override))
-        match_cache[spotify_track_match_key(track)] = record
-        clear_manual_collision_cache_entry(track, match_cache)
+        for track in override.sources:
+            record: dict[str, object] = {
+                "release_id": track.release_id,
+                "track_number": track.track_number,
+                "artist_name": track.artist_name,
+                "album_name": track.album_name,
+                "track_name": track.track_name,
+                "search_query": build_spotify_track_search_query(track),
+                "search_queries": [],
+                "match_status": "manual",
+                "match_reason": MANUAL_MATCH_REASON,
+                "matcher_version": MATCHER_VERSION,
+                "spotify_uri": override.spotify_uri,
+                "spotify_url": spotify_url_from_uri(override.spotify_uri),
+                "matched_at": matched_at,
+                "last_seen_at": matched_at,
+            }
+            if override.uri_only:
+                record["match_strategy"] = MANUAL_URI_ONLY_MATCH_STRATEGY
+            record.update(target_description(override))
+            match_cache[spotify_track_match_key(track)] = record
+            clear_manual_collision_cache_entry(track, match_cache)
     save_spotify_track_match_cache(match_cache_path, match_cache)
     return ManualMatchImportSummary(
         planned_count=len(overrides),
@@ -176,6 +182,17 @@ def resolve_source_position(
     if not all(matches_source_identity(candidate, source) for candidate in candidates):
         raise ValueError(f"has conflicting or incomplete generated playlist rows for {position}")
     return source
+
+
+def additional_sources_at_position(
+    source: PlaylistTrack, sources_by_position: Mapping[tuple[str, str], Sequence[PlaylistTrack]],
+) -> tuple[PlaylistTrack, ...]:
+    primary_key = spotify_track_match_key(source)
+    same_position = sources_by_position[source.release_id, source.track_number]
+    # Unicode identity can agree across different keys used by the publisher.
+    return tuple(
+        copies[0] for key, copies in tracks_by_import_key(same_position).items() if key != primary_key
+    )
 
 
 def load_manual_match_overrides(
@@ -223,6 +240,7 @@ def load_manual_match_overrides(
             spotify_search_query="",
         )
         source = frozen_source
+        additional_sources: tuple[PlaylistTrack, ...] = ()
         if prepared:
             try:
                 source = resolve_source_position(frozen_source.release_id, frozen_source.track_number, sources_by_position)
@@ -230,38 +248,44 @@ def load_manual_match_overrides(
                 raise ValueError(f"{label} {error}") from error
             if not matches_source_identity(source, frozen_source):
                 raise ValueError(f"{label} does not match the current generated playlist row at the reviewed position")
+            additional_sources = additional_sources_at_position(source, sources_by_position)
 
-        source_key = spotify_track_match_key(source)
-        source_candidates = source_tracks_by_key.get(source_key, ())
-        matching_sources = [candidate for candidate in source_candidates if matches_source_identity(candidate, source)]
-        if not matching_sources:
-            raise ValueError(f"{label} does not match a generated playlist row")
-        if len(matching_sources) != len(source_candidates):
-            raise ValueError(f"{label} has conflicting generated playlist rows for its cache key")
-        if source_key in seen_keys:
-            raise ValueError(f"{label} duplicates source track {source_key}")
-        seen_keys.add(source_key)
+        verified_sources: list[PlaylistTrack] = []
+        for variant in (source, *additional_sources):
+            source_key = spotify_track_match_key(variant)
+            source_candidates = source_tracks_by_key.get(source_key, ())
+            matching_sources = [candidate for candidate in source_candidates if matches_source_identity(candidate, variant)]
+            if not matching_sources:
+                raise ValueError(f"{label} does not match a generated playlist row")
+            if len(matching_sources) != len(source_candidates):
+                raise ValueError(f"{label} has conflicting generated playlist rows for its cache key")
+            if source_key in seen_keys:
+                raise ValueError(f"{label} duplicates source track {source_key}")
+            seen_keys.add(source_key)
+            verified_sources.append(matching_sources[0])
+        source, *variants = verified_sources
 
         spotify_uri = required_text(row, "spotify_uri", index, strict=prepared)
-        if not spotify_track_uri_is_structurally_valid(spotify_uri):
+        if (prepared and row.get("spotify_uri") != spotify_uri) or not spotify_track_uri_is_structurally_valid(spotify_uri):
             raise ValueError(
                 f"{label} spotify_uri must be spotify:track:<identifier> "
                 "with one nonempty identifier containing no whitespace or extra separators"
             )
         if prepared and not any(field in row for field in TARGET_DESCRIPTION_FIELDS):
-            overrides.append(ManualMatchOverride(matching_sources[0], spotify_uri, uri_only=True))
+            overrides.append(ManualMatchOverride(source, spotify_uri, uri_only=True, additional_sources=tuple(variants)))
             continue
         album_id = (
             required_text(row, "spotify_album_id", index, strict=True)
             if prepared and "spotify_album_id" in row else clean_cell(row.get("spotify_album_id"))
         )
         overrides.append(ManualMatchOverride(
-            source_track=matching_sources[0],
+            source_track=source,
             spotify_uri=spotify_uri,
             spotify_track_name=required_text(row, "spotify_track_name", index, strict=prepared),
             spotify_artist_names=required_text_sequence(row, "spotify_artist_names", index, strict=prepared),
             spotify_album_name=required_text(row, "spotify_album_name", index, strict=prepared),
             spotify_album_id=album_id,
+            additional_sources=tuple(variants),
         ))
     return tuple(overrides), prepared
 
@@ -326,23 +350,30 @@ def explicit_manual_target(record: Mapping[str, object], uri: str) -> SpotifyTra
     )
 
 
+def cached_target_observations(
+    track: PlaylistTrack, spotify_uri: str, match_cache: Mapping[str, Mapping[str, object]],
+) -> tuple[SpotifyTrackCandidate, ...]:
+    _, record = track_match_cache_entry(track, match_cache)
+    if record is None or compare_cached_manual_source(track, record) is not True:
+        return ()
+    candidates = tuple(candidate for candidate in source_bound_cached_candidates(record) if candidate.uri == spotify_uri)
+    if record.get("match_status") == "manual" and record.get("spotify_uri") == spotify_uri:
+        return (explicit_manual_target(record, spotify_uri), *candidates)
+    return candidates
+
+
 def with_compatible_target_labels(
     override: ManualMatchOverride,
     match_cache: Mapping[str, Mapping[str, object]],
     *,
     row_label: str,
 ) -> ManualMatchOverride:
-    track = override.source_track
-    _, record = track_match_cache_entry(track, match_cache)
-    if record is None or compare_cached_manual_source(track, record) is not True:
-        return override
-
-    candidates = source_bound_cached_candidates(record)
-    if record.get("match_status") == "manual" and record.get("spotify_uri") == override.spotify_uri:
-        candidates = (explicit_manual_target(record, override.spotify_uri), *candidates)
+    candidates = (
+        candidate
+        for track in override.sources
+        for candidate in cached_target_observations(track, override.spotify_uri, match_cache)
+    )
     for candidate in candidates:
-        if candidate.uri != override.spotify_uri:
-            continue
         metadata = spotify_recording_metadata_from_values(
             title=override.spotify_track_name,
             artist_names=override.spotify_artist_names,
@@ -350,6 +381,7 @@ def with_compatible_target_labels(
             album_id=override.spotify_album_id,
         )
         if metadata.conflicts_with(candidate.recording_metadata()):
+            track = override.source_track
             raise ValueError(
                 f"{row_label} has conflicting Spotify target descriptions for {override.spotify_uri} "
                 f"(release {track.release_id}, track {track.track_number})"
@@ -373,22 +405,23 @@ def validate_existing_matches(
     if replace_existing:
         return
     for override in overrides:
-        source_key = spotify_track_match_key(override.source_track)
-        existing_record = match_cache.get(source_key)
-        if existing_record is None:
-            continue
-        existing_status = clean_cell(existing_record.get("match_status"))
-        if existing_status == "manual" and cached_manual_source_conflicts(override.source_track, existing_record):
-            raise ValueError(
-                f"{source_key} already has a manual Spotify match for a different source track; "
-                "use --replace-existing to bind it to this source"
-            )
-        existing_uri = clean_cell(existing_record.get("spotify_uri"))
-        if existing_status in {"matched", "manual"} and existing_uri and existing_uri != override.spotify_uri:
-            raise ValueError(
-                f"{source_key} already has a different {existing_status} Spotify URI; "
-                "use --replace-existing to replace it"
-            )
+        for track in override.sources:
+            source_key = spotify_track_match_key(track)
+            existing_record = match_cache.get(source_key)
+            if existing_record is None:
+                continue
+            existing_status = clean_cell(existing_record.get("match_status"))
+            if existing_status == "manual" and cached_manual_source_conflicts(track, existing_record):
+                raise ValueError(
+                    f"{source_key} already has a manual Spotify match for a different source track; "
+                    "use --replace-existing to bind it to this source"
+                )
+            existing_uri = clean_cell(existing_record.get("spotify_uri"))
+            if existing_status in {"matched", "manual"} and existing_uri and existing_uri != override.spotify_uri:
+                raise ValueError(
+                    f"{source_key} already has a different {existing_status} Spotify URI; "
+                    "use --replace-existing to replace it"
+                )
 
 
 def target_description(override: ManualMatchOverride, *, include_empty: bool = False) -> dict[str, object]:
@@ -399,6 +432,13 @@ def target_description(override: ManualMatchOverride, *, include_empty: bool = F
         "spotify_album_id": override.spotify_album_id,
     }
     return fields if include_empty else {name: value for name, value in fields.items() if value}
+
+
+def output_reservation_key(path: Path) -> Path:
+    # macOS volumes can alias names that pathlib compares by spelling.
+    if sys.platform == "darwin":
+        return Path(unicodedata.normalize("NFC", str(path)).casefold())
+    return path
 
 
 def proposal_destination(
@@ -428,9 +468,10 @@ def proposal_destination(
     )
     try:
         destination = path.resolve()
-        protected_path = any(destination == item.resolve() for item in protected_paths)
+        reservation = output_reservation_key(destination)
+        protected_path = any(reservation == output_reservation_key(item.resolve()) for item in protected_paths)
         managed_folder = any(
-            destination.is_relative_to(root.resolve())
+            reservation.is_relative_to(output_reservation_key(root.resolve()))
             for root in (playlist_root, DEFAULT_PLAYLIST_OUTPUT_DIRECTORY)
         )
     except RuntimeError as error:
@@ -497,7 +538,10 @@ def prepare_manual_match_map(
             track = resolve_source_position(release_id, track_number, sources)
         except ValueError as error:
             raise ValueError(f"{label} {error}") from error
-        overrides.append(with_compatible_target_labels(ManualMatchOverride(track, spotify_uri), match_cache, row_label=label))
+        override = ManualMatchOverride(
+            track, spotify_uri, additional_sources=additional_sources_at_position(track, sources),
+        )
+        overrides.append(with_compatible_target_labels(override, match_cache, row_label=label))
     write_proposals(
         destination, overrides, playlist_root, match_cache_path,
         schema_version=PREPARED_MAP_SCHEMA_VERSION, replace_existing=replace_existing,

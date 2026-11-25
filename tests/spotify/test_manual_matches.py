@@ -210,6 +210,26 @@ class SpotifyManualMatchTests(unittest.TestCase):
             self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["matches"], [])
             self.assertFalse(cache.exists())
 
+    def test_manual_cli_handles_json_beyond_the_parser_depth_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            masters = directory / "masters"
+            masters.mkdir()
+            draft = directory / "nested.json"
+            excessive_depth = sys.getrecursionlimit() + 10
+            draft.write_text("[" * excessive_depth + "0" + "]" * excessive_depth, encoding="utf-8")
+            cache = directory / "matches.json"
+            output = directory / "review.json"
+            for flags in (
+                ("--prepare-map", str(draft), "--output", str(output)),
+                ("--overrides", str(draft), "--apply"),
+            ):
+                with self.subTest(flags=flags):
+                    result, stdout, stderr = run_cli(masters, cache, *flags)
+                    self.assertEqual((result, stdout), (2, ""))
+                    self.assertIn("malformed", stderr)
+                    self.assertFalse(output.exists() or cache.exists())
+
     def test_prepare_map_cli_requires_an_output_and_cannot_import_drafts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
@@ -397,6 +417,81 @@ class SpotifyManualMatchTests(unittest.TestCase):
                         import_manual_match_overrides(review, masters, cache, apply=apply, replace_existing=True)
                 self.assertEqual(cache.read_bytes(), original_cache)
 
+    def test_v2_applies_equivalent_source_spellings_to_every_current_cache_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            masters = directory / "masters"
+            cache = directory / "matches.json"
+            variants = {
+                "First": {**V2_SOURCE, "track_name": "Straße"},
+                "Second": {**V2_SOURCE, "track_name": "STRASSE"},
+            }
+            tracks = [
+                PlaylistTrack(playlist_name=playlist, spotify_search_query="", **source)
+                for playlist, source in variants.items()
+            ]
+            for track in tracks:
+                write_playlist_master(masters / track.playlist_name / f"{track.playlist_name}.csv", source_values={
+                    "Release Id": "321", "Track Name": track.track_name,
+                })
+            keys = [spotify_track_match_key(track) for track in tracks]
+            self.assertNotEqual(*keys)
+            save_spotify_track_match_cache(cache, {keys[1]: {
+                **variants["Second"], "match_status": UNMATCHED,
+                "review_candidates": [{**V2_TARGET_LABELS, "spotify_uri": V2_URI}],
+            }})
+            original_cache = cache.read_bytes()
+            draft = directory / "choices.json"
+            draft.write_text(json.dumps({"publishers": {"spotify": {"321": {"1": V2_URI}}}}), encoding="utf-8")
+            review = directory / "review.json"
+
+            result, _, stderr = run_cli(masters, cache, "--prepare-map", str(draft), "--output", str(review))
+            self.assertEqual((result, stderr), (0, ""))
+            row, = json.loads(review.read_text(encoding="utf-8"))["matches"]
+            self.assertEqual(row, {**variants["First"], **V2_TARGET_LABELS, "spotify_uri": V2_URI})
+            self.assertEqual(cache.read_bytes(), original_cache)
+
+            self.assertEqual(import_manual_match_overrides(review, masters, cache, apply=True).applied_count, 1)
+            records = load_spotify_track_match_cache(cache)
+            for track, key in zip(tracks, keys):
+                cached = cached_track_match(track, records)
+                assert cached is not None
+                self.assertEqual(cached.decision.spotify_uri, V2_URI)
+                self.assertEqual(records[key]["track_name"], track.track_name)
+
+            records[keys[1]]["spotify_uri"] = "spotify:track:other"
+            save_spotify_track_match_cache(cache, records)
+            original_cache = cache.read_bytes()
+            for apply in (False, True):
+                with self.subTest(apply=apply), self.assertRaisesRegex(ValueError, "--replace-existing"):
+                    import_manual_match_overrides(review, masters, cache, apply=apply)
+                self.assertEqual(cache.read_bytes(), original_cache)
+
+            import_manual_match_overrides(review, masters, cache, apply=True, replace_existing=True)
+            self.assertEqual({record["spotify_uri"] for record in load_spotify_track_match_cache(cache).values()}, {V2_URI})
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS can alias reserved paths by case")
+    def test_prepare_map_protects_alternate_spellings_of_reserved_paths_on_macos(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            masters = directory / "masters"
+            write_playlist_master(masters / "Set" / "Set.csv", source_values={"Release Id": "321"})
+            draft = directory / "choices.json"
+            draft.write_text('{"publishers": {"spotify": {}}}', encoding="utf-8")
+            cache = directory / "matches.json"
+            reserved = directory / "spotify-publish-state.cache.json"
+            outputs = (
+                reserved.with_name(reserved.name.upper()),
+                masters.with_name("MASTERS") / "Set" / "review.json",
+            )
+            for output in outputs:
+                with self.subTest(output=output):
+                    result, stdout, stderr = run_cli(masters, cache, "--prepare-map", str(draft), "--output", str(output))
+                    self.assertEqual((result, stdout), (2, ""))
+                    self.assertIn("protected", stderr)
+                    self.assertFalse(output.exists())
+            self.assertFalse(reserved.exists() or cache.exists())
+
     def test_review_rejects_duplicate_members_before_dispatching_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
@@ -429,6 +524,7 @@ class SpotifyManualMatchTests(unittest.TestCase):
             selected = {**V2_SOURCE, "spotify_uri": V2_URI}
             for invalid in (
                 {"release_id": 321}, {"album_name": ""}, {"spotify_uri": "spotify:album:no"},
+                {"spotify_uri": f"{V2_URI} "},
                 {"spotify_album_id": "orphan"}, {"spotify_track_name": "Partial"},
                 {**V2_TARGET_LABELS, "spotify_artist_names": ["First Artist", 99]},
                 {**V2_TARGET_LABELS, "spotify_album_name": None},
