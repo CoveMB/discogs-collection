@@ -8,6 +8,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DIRECTORY = PROJECT_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 
+from publishers.spotify.client import parse_album_track_page
 from publishers.spotify.matching import PlaylistTrack, SpotifyTrackCandidate
 from publishers.spotify.match_cache import (
     MATCHER_VERSION,
@@ -782,6 +783,37 @@ class SpotifyCachedAlbumFallbackTests(unittest.TestCase):
                 self.assertEqual(result.decisions, ())
                 self.assertTrue(result.used_fallback_track_candidates)
                 self.assertTrue(result.diagnostic)
+                self.assertEqual(
+                    [album_id for _, album_id in client.album_track_requests],
+                    ["direct-album", "recovered-album"],
+                )
+
+    def test_cached_album_requires_complete_parsed_artist_credits(self) -> None:
+        for incomplete_credit in ({}, {"name": " "}, {"name": 23}, None):
+            with self.subTest(credit=incomplete_credit):
+                parsed_tracks = parse_album_track_page({
+                    "items": [
+                        {
+                            "uri": track.uri,
+                            "name": track.name,
+                            "artists": [{"name": artist} for artist in track.artists]
+                            + ([incomplete_credit] if track.track_number == 2 else []),
+                            "disc_number": track.disc_number,
+                            "track_number": track.track_number,
+                            "is_playable": True,
+                        }
+                        for track in self.exact_tracks
+                    ]
+                })
+                result, client = self.resolve(
+                    ("direct-album",),
+                    {"direct-album": self.rejected_tracks, "recovered-album": parsed_tracks},
+                    (self.hint("recovered-album"),),
+                )
+
+                self.assertEqual(len(parsed_tracks), 3)
+                self.assertEqual(result.decisions, ())
+                self.assertIn("incomplete artist credits", result.diagnostic)
                 self.assertEqual(
                     [album_id for _, album_id in client.album_track_requests],
                     ["direct-album", "recovered-album"],

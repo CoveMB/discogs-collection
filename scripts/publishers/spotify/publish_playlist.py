@@ -1130,8 +1130,7 @@ def cached_review_candidates_for_release(
     match_cache: dict[str, dict[str, object]],
     recording_observations: SourceRecordingObservations,
 ) -> tuple[SpotifyTrackCandidate, ...]:
-    candidates_by_uri: dict[str, SpotifyTrackCandidate] = {}
-    additional_album_evidence: list[SpotifyTrackCandidate] = []
+    candidates_by_album_observation: dict[tuple[str, str, str], SpotifyTrackCandidate] = {}
     for track in release_tracks:
         record = match_cache.get(spotify_track_match_key(track))
         if record is None:
@@ -1145,19 +1144,9 @@ def cached_review_candidates_for_release(
                 record_cached_recording_conflict(record, conflict)
                 continue
         for candidate in candidates:
-            first_candidate = candidates_by_uri.setdefault(candidate.uri, candidate)
-            if candidate.album_id and candidate.album_name and (
-                candidate.album_id != first_candidate.album_id or candidate.album_name != first_candidate.album_name
-            ):
-                additional_album_evidence.append(candidate)
-    primary_candidates = tuple(candidates_by_uri.values())
-    if not additional_album_evidence:
-        return primary_candidates
-    # Retain conflicting title observations for eligible IDs while preserving the primary hints.
-    eligible_album_ids = set(album_recovery_candidate_ids(release_tracks, primary_candidates))
-    return primary_candidates + tuple(
-        candidate for candidate in additional_album_evidence if candidate.album_id in eligible_album_ids
-    )
+            observation = (candidate.uri, candidate.album_id, candidate.album_name)
+            candidates_by_album_observation.setdefault(observation, candidate)
+    return tuple(candidates_by_album_observation.values())
 
 
 def album_recovery_candidate_ids(

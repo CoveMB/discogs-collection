@@ -12,6 +12,7 @@ from publishers.spotify.matching import (
     PlaylistTrack,
     SpotifyTrackCandidate,
     TrackMatchDecision,
+    deduplicate_spotify_track_candidates,
     music_values_match_only_after_alphanumeric_spacing,
     normalize_alphanumeric_spacing,
     normalize_music_text,
@@ -62,6 +63,7 @@ class SpotifyAlbumTrack:
     disc_number: int
     track_number: int
     is_playable: bool | None = None
+    artist_credits_complete: bool = True
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,7 @@ class SpotifyAlbumValidationDiagnostic:
     oversized_gap_count: int
     positional_artist_mismatch_count: int
     unusable_spotify_track_count: int
+    incomplete_artist_credit_track_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -167,15 +170,19 @@ def resolve_release_with_album(
     if not exact_album_candidates:
         exact_album_candidates = album_candidates_from_track_candidates(
             source_tracks=source_tracks,
-            track_candidates=fallback_track_candidates,
+            track_candidates=deduplicate_spotify_track_candidates(tuple(fallback_track_candidates)),
         )
-        candidates_came_from_track_search = bool(exact_album_candidates)
         if not exact_album_candidates:
+            # Alternate hints can trigger the direct search and need a receipt for this completed check.
             return SpotifyReleaseAlbumMatchResult(
                 decisions=(),
                 search_count=1,
                 diagnostic="Spotify returned no album candidate with a matching title",
+                used_fallback_track_candidates=bool(
+                    album_candidates_from_track_candidates(source_tracks, fallback_track_candidates)
+                ),
             )
+        candidates_came_from_track_search = True
     if len(exact_album_candidates) > MAXIMUM_EXACT_ALBUM_CANDIDATES_TO_FETCH:
         return SpotifyReleaseAlbumMatchResult(
             decisions=(),
@@ -279,6 +286,7 @@ def _has_complete_ordered_recording_evidence(
         len(spotify_tracks) != len(source_tracks)
         or assessment.diagnostic.exact_anchor_count != len(source_tracks)
         or not assessment.diagnostic.anchor_order_is_valid
+        or assessment.diagnostic.incomplete_artist_credit_track_count
         or len({track.uri for track in spotify_tracks}) != len(spotify_tracks)
     ):
         return False
@@ -430,6 +438,7 @@ def analyze_album_sequence(
         unusable_spotify_track_count=sum(
             1 for track in spotify_tracks if not spotify_album_track_is_usable(track)
         ),
+        incomplete_artist_credit_track_count=sum(not track.artist_credits_complete for track in spotify_tracks),
     )
 
 
@@ -443,6 +452,11 @@ def format_album_validation_diagnostic(
     diagnostic: SpotifyAlbumValidationDiagnostic,
 ) -> str:
     anchor_order = "valid" if diagnostic.anchor_order_is_valid else "conflicting"
+    incomplete_artist_credits = (
+        f". Spotify tracks with incomplete artist credits {diagnostic.incomplete_artist_credit_track_count}"
+        if diagnostic.incomplete_artist_credit_track_count
+        else ""
+    )
     return (
         f"{diagnostic.album_id} ({diagnostic.album_name}): "
         f"source/Spotify tracks {diagnostic.source_track_count}/{diagnostic.spotify_track_count}; "
@@ -452,7 +466,7 @@ def format_album_validation_diagnostic(
         f"anchor order {anchor_order}; unequal gaps {diagnostic.unequal_gap_count}; "
         f"oversized gaps {diagnostic.oversized_gap_count}; "
         f"positional artist mismatches {diagnostic.positional_artist_mismatch_count}; "
-        f"unusable Spotify tracks {diagnostic.unusable_spotify_track_count}"
+        f"unusable Spotify tracks {diagnostic.unusable_spotify_track_count}{incomplete_artist_credits}"
     )
 
 

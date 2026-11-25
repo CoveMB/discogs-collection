@@ -634,14 +634,17 @@ def parse_album_track_page(payload: object) -> tuple[SpotifyAlbumTrack, ...]:
             continue
         uri = clean_cell(item.get("uri"))
         name = clean_cell(item.get("name"))
-        artists = item.get("artists", [])
-        artist_names = tuple(
-            clean_cell(artist.get("name"))
-            for artist in artists
-            if isinstance(artist, dict) and clean_cell(artist.get("name"))
-        )
         if not uri or not name:
             continue
+        artists = item.get("artists")
+        artist_entries = artists if isinstance(artists, list) else ()
+        raw_artist_names = tuple(
+            artist.get("name") if isinstance(artist, dict) else None for artist in artist_entries
+        )
+        artist_names = tuple(artist_name for raw_name in raw_artist_names if (artist_name := clean_cell(raw_name)))
+        artist_credits_complete = bool(raw_artist_names) and all(
+            isinstance(raw_name, str) and raw_name.strip() for raw_name in raw_artist_names
+        )
         is_playable_value = item.get("is_playable")
         tracks.append(
             SpotifyAlbumTrack(
@@ -655,6 +658,7 @@ def parse_album_track_page(payload: object) -> tuple[SpotifyAlbumTrack, ...]:
                     if isinstance(is_playable_value, bool)
                     else None
                 ),
+                artist_credits_complete=artist_credits_complete,
             )
         )
     return tuple(tracks)
