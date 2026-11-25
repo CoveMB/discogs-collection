@@ -317,6 +317,32 @@ class SpotifyArtistReviewTests(unittest.TestCase):
         self.assertEqual(row["status"], "no_suggestions")
         self.assertFalse(row["candidates"])
 
+    def test_source_bound_cached_hits_can_contradict_fresh_hits_and_vice_versa(self) -> None:
+        self.write_master("Shelf A", (TRACK,))
+        self.cache_negative(
+            TRACK,
+            SpotifyTrackCandidate("spotify:track:freshlead", "Night Signal (Live)", ("Mara Vale",), "Other", "other"),
+            SpotifyTrackCandidate("spotify:track:cachelead", "Night Signal", ("Mara Vale",), "Other", "other"),
+            SpotifyTrackCandidate("spotify:track:irrelevant", "Another Track", ("Mara Vale",), "Other", "other"),
+        )
+        self.search_responses = {
+            PRINTED_QUERY: [],
+            CANONICAL_QUERY: [
+                spotify_hit("freshlead", "Mara Vale"),
+                spotify_hit("cachelead", "Mara Vale", title="Night Signal (Live)"),
+            ],
+        }
+
+        report, _ = self.run_review()
+        row, = report["rows"]
+        by_uri = {candidate["uri"]: candidate for candidate in row["candidates"]}
+        self.assertEqual(set(by_uri), {"spotify:track:freshlead", "spotify:track:cachelead"})
+        for uri, lead in (("spotify:track:freshlead", "canonical_search"), ("spotify:track:cachelead", "cached_review")):
+            candidate = by_uri[uri]
+            self.assertTrue(candidate["conflicting_observations"])
+            self.assertEqual([item["origins"] for item in candidate["observations"]], [["cached_review"], ["canonical_search"]])
+            self.assertEqual([item["origins"] for item in candidate["observations"] if item["credit_evidence"]], [[lead]])
+
     def test_same_title_requires_accurate_punctuation_unicode_and_complete_credits(self) -> None:
         track = replace(TRACK, track_name="À la Mer?", artist_name="J. Mérin")
         self.write_master("Shelf A", (track,))

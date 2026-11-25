@@ -415,7 +415,6 @@ def collect_candidates(
         credit = next(credit for credit in row.discogs_credits if credit.printed != credit.canonical)
         observations: dict[tuple[SpotifyTrackCandidate, SpotifyRecordingMetadata], list[str]] = {
             (hit, hit.recording_metadata()): ["cached_review"] for hit in cached_candidates[track]
-            if matching_credits(track.track_name, row.discogs_credits, hit) is not None
         }
         for origin, artist_name in (("printed_search", credit.printed), ("canonical_search", credit.canonical)):
             query = build_spotify_track_search_query(replace(track, artist_name=artist_name, album_name=""))
