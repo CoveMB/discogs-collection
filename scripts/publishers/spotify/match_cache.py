@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TypeVar
 
 from publishers.spotify.matching import (
     ALPHANUMERIC_SPACING_MATCH_STRATEGY,
@@ -23,11 +25,13 @@ from publishers.spotify.matching import (
     build_spotify_track_search_query,
     music_values_match_only_after_alphanumeric_spacing,
     normalize_music_text,
+    normalize_recording_evidence_text,
     normalize_spotify_isrc,
     recording_proof_source_matches,
     resolve_spotify_edition_tie,
     spotify_recording_metadata_from_values,
     spotify_recording_metadata_is_complete,
+    spotify_track_uri_is_structurally_valid,
     with_version_title_review_candidates,
 )
 from publishers.spotify.release_matching import (
@@ -55,12 +59,15 @@ RECORDING_CONFLICT_REASON_FIELD = "recording_conflict_reason"
 STRICT_ALBUM_RECOVERY_FIELD = "strict_album_recovery"
 STRICT_ALBUM_MATCH_STORAGE_STATUS = "strict_album_matched"
 
+MatchCacheRecord = TypeVar("MatchCacheRecord", bound=Mapping[str, object])
+
 
 @dataclass(frozen=True)
 class CachedSpotifyTrackMatch:
     cache_key: str
     decision: TrackMatchDecision
     has_recording_conflict: bool = False
+    is_manual: bool = False
 
 
 def load_spotify_track_match_cache(path: Path) -> dict[str, dict[str, object]]:
@@ -113,27 +120,144 @@ def _match_record_for_storage(record: Mapping[str, object]) -> dict[str, object]
     return result
 
 
+def compare_manual_source(
+    track: PlaylistTrack,
+    *,
+    release_id: object,
+    track_number: object,
+    title: object,
+    artist: object,
+    album: object,
+) -> bool | None:
+    """Compare the source identity, or return None for incomplete source fields."""
+    if not (
+        isinstance(release_id, str) and (saved_release_id := release_id.strip())
+        and isinstance(track_number, str) and (saved_track_number := track_number.strip())
+        and isinstance(title, str) and title.strip()
+        and isinstance(artist, str) and artist.strip()
+        and isinstance(album, str) and album.strip()
+    ):
+        return None
+    return (
+        saved_release_id == track.release_id.strip()
+        and saved_track_number == track.track_number.strip()
+        and recording_proof_source_matches(track, title=title, artist=artist, album=album)
+    )
+
+
+def compare_cached_manual_source(track: PlaylistTrack, record: Mapping[str, object]) -> bool | None:
+    return compare_manual_source(
+        track,
+        release_id=record.get("release_id"),
+        track_number=record.get("track_number"),
+        title=record.get("track_name"),
+        artist=record.get("artist_name"),
+        album=record.get("album_name"),
+    )
+
+
+def _source_identity_fields(track: PlaylistTrack) -> tuple[tuple[str, str, Callable[[str], str]], ...]:
+    return (
+        ("release_id", track.release_id, str.strip),
+        ("track_number", track.track_number, str.strip),
+        ("artist_name", track.artist_name, normalize_recording_evidence_text),
+        ("album_name", track.album_name, normalize_recording_evidence_text),
+        ("track_name", track.track_name, normalize_recording_evidence_text),
+    )
+
+
+def cached_manual_source_conflicts(track: PlaylistTrack, record: Mapping[str, object]) -> bool:
+    """Check each recorded source string, including when other source fields are missing."""
+    return any(
+        isinstance(saved := record.get(field), str)
+        and (saved_value := normalize(saved))
+        and saved_value != normalize(source_value)
+        for field, source_value, normalize in _source_identity_fields(track)
+    )
+
+
+def _manual_collision_cache_key(track: PlaylistTrack) -> str:
+    identity = tuple(normalize(value) for _, value, normalize in _source_identity_fields(track))
+    encoded = json.dumps(identity, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    # Ordinary keys contain pipes, so older readers cannot select this entry.
+    return f"manual-collision:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _automatic_collision_source_matches(track: PlaylistTrack, record: Mapping[str, object]) -> bool:
+    # A blank source field must be saved as a string for an automatic decision to be replayable.
+    return all(
+        isinstance(saved_value := record.get(field), str) and normalize(saved_value) == normalize(source_value)
+        for field, source_value, normalize in _source_identity_fields(track)
+    )
+
+
+def track_match_cache_entry(
+    track: PlaylistTrack,
+    matches: Mapping[str, MatchCacheRecord],
+    *,
+    refresh_match_cache: bool = False,
+) -> tuple[str, MatchCacheRecord | None]:
+    """Select the entry for a source, including its automatic match beside a manual binding."""
+    cache_key = spotify_track_match_key(track)
+    record = matches.get(cache_key)
+    if (
+        not refresh_match_cache
+        and record is not None
+        and clean_cell(record.get("match_status")) == "manual"
+        and compare_cached_manual_source(track, record) is False
+    ):
+        collision_key = _manual_collision_cache_key(track)
+        collision_record = matches.get(collision_key)
+        if collision_record is not None and (
+            clean_cell(collision_record.get("match_status")) not in CACHEABLE_MATCH_STATUSES
+            or not _automatic_collision_source_matches(track, collision_record)
+        ):
+            collision_record = None
+        return collision_key, collision_record
+    return cache_key, record
+
+
+def clear_manual_collision_cache_entry(track: PlaylistTrack, matches: dict[str, dict[str, object]]) -> None:
+    matches.pop(_manual_collision_cache_key(track), None)
+
+
 def cached_track_match(
     track: PlaylistTrack,
     matches: Mapping[str, Mapping[str, object]],
     seen_at: str | None = None,
 ) -> CachedSpotifyTrackMatch | None:
-    cache_key = spotify_track_match_key(track)
-    record = matches.get(cache_key)
+    cache_key, record = track_match_cache_entry(track, matches)
     if not record:
         return None
     if cache_record_has_recording_conflict(record):
         return cached_review_decision(track, cache_key, record, AMBIGUOUS, seen_at=seen_at)
     match_status = clean_cell(record.get("match_status"))
-    if match_status in {"matched", "manual"}:
+    if match_status == "manual":
+        source_match = compare_cached_manual_source(track, record)
+        if source_match is False:
+            return None
+        if source_match is None:
+            hold_reason = "cached manual Spotify match has incomplete source fields"
+        elif not spotify_track_uri_is_structurally_valid(clean_cell(record.get("spotify_uri"))):
+            hold_reason = "cached manual Spotify match has an invalid Spotify track URI"
+        else:
+            return cached_matched_track(track, cache_key, record, seen_at=seen_at)
+        return CachedSpotifyTrackMatch(
+            cache_key=cache_key,
+            decision=TrackMatchDecision(
+                track=track,
+                status=AMBIGUOUS,
+                spotify_uri="",
+                reason=f"{hold_reason}. Re-import the verified source with manual_matches.py",
+            ),
+            is_manual=True,
+        )
+    if match_status == MATCHED:
         if (
-            match_status == MATCHED
-            and (
-                not _strict_album_recovery_applies_to(track, record)
-                or (
-                    cache_record_is_version_sensitive(record)
-                    and cache_record_matcher_version(record) != MATCHER_VERSION
-                )
+            not _strict_album_recovery_applies_to(track, record)
+            or (
+                cache_record_is_version_sensitive(record)
+                and cache_record_matcher_version(record) != MATCHER_VERSION
             )
         ):
             return None
@@ -237,6 +361,7 @@ def cached_matched_track(
             match_strategy=match_strategy,
             strict_album_recovery=match_status == MATCHED and record.get(STRICT_ALBUM_RECOVERY_FIELD) is True,
         ),
+        is_manual=match_status == "manual",
     )
 
 
@@ -479,16 +604,16 @@ def cache_track_match(
         return False
     timestamp = matched_at or utc_timestamp()
     track = decision.track
-    cache_key = spotify_track_match_key(track)
-    existing_record = matches.get(cache_key)
-    if (
-        not refresh_match_cache
-        and existing_record is not None
-        and existing_record.get(STRICT_ALBUM_RECOVERY_FIELD) is True
-        and cache_record_matcher_version(existing_record) == MATCHER_VERSION
-        and not cached_recording_proof_is_current(track, existing_record)
-    ):
-        return False
+    cache_key, existing_record = track_match_cache_entry(track, matches, refresh_match_cache=refresh_match_cache)
+    if existing_record is not None and not refresh_match_cache:
+        if clean_cell(existing_record.get("match_status")) == "manual":
+            return False
+        if (
+            existing_record.get(STRICT_ALBUM_RECOVERY_FIELD) is True
+            and cache_record_matcher_version(existing_record) == MATCHER_VERSION
+            and not cached_recording_proof_is_current(track, existing_record)
+        ):
+            return False
     candidate = decision.candidate
     record: dict[str, object] = {
         "release_id": track.release_id,
@@ -562,12 +687,14 @@ def cache_track_match(
             }
         )
         _store_version_title_review_candidates(record, decision.review_candidates)
+    if refresh_match_cache:
+        clear_manual_collision_cache_entry(track, matches)
     matches[cache_key] = record
     return True
 
 
 def record_cached_version_title_review(record: dict[str, object], decision: TrackMatchDecision) -> bool:
-    if not _strict_album_recovery_applies_to(decision.track, record):
+    if clean_cell(record.get("match_status")) == "manual" or not _strict_album_recovery_applies_to(decision.track, record):
         return False
     record["search_queries"] = list(decision.search_queries)
     _store_version_title_review_candidates(record, decision.review_candidates)

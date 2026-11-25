@@ -1169,6 +1169,13 @@ def normalize_recording_evidence_text(value: str) -> str:
     return " ".join(unicodedata.normalize("NFC", text).split())
 
 
+def artist_spelling(value: str) -> str:
+    """Compare documented artist spellings while preserving letters, accents and words."""
+    text = normalize_recording_evidence_text(value)
+    text = re.sub(r"\s*\.\s*", ".", text)
+    return re.sub(r"(?<=[^\W_])\s*[-\u2010\u2011]\s*(?=[^\W_])", " ", text)
+
+
 def recording_proof_source_matches(track: PlaylistTrack, *, title: str, artist: str, album: str) -> bool:
     return all(
         bool(source_text := normalize_recording_evidence_text(source))

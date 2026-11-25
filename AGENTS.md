@@ -13,6 +13,9 @@ Spotify editions whose full source metadata agrees and whose ISRC is shared.
 Append uses the proven group of Spotify URIs to recognize an existing copy.
 For eligible unmatched tracks, the publisher makes one base-title search and
 shows the new candidates for manual review. Those tracks stay unmatched.
+A standalone review command checks current unresolved generated rows for one
+pressing and reports Spotify candidates found under its documented credited
+and canonical Discogs artist names. It writes the review to stdout.
 The standalone publisher supports optional finite,
 non-negative request spacing, defaults to no added delay, and reports actual
 Web API attempts separately from searches. It retains bounded retries and
@@ -39,7 +42,11 @@ from Web API attempts. Optional Spotify tooling can also dedupe
 repo-managed publisher playlists by exact Spotify track URI. A manual-match
 importer validates override rows against generated playlist masters, previews
 by default without calling Spotify or writing the match cache, writes only in
-explicit apply mode, and stores authoritative manual cache records. A separate
+explicit apply mode, and stores authoritative manual cache records. The Spotify
+review command can verify unresolved ties against a recording ISRC corroborated
+on the exact Discogs pressing and export schema-v1 manual override proposals.
+The operator reviews proposals with the manual importer before choosing whether
+to apply them. A separate
 release-ID playlist script can create an isolated on-the-fly playlist from
 explicit Discogs `release_id` values without adding those releases to the
 collection master. The same script can rebuild durable configured release
