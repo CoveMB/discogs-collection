@@ -16,8 +16,8 @@ if str(SCRIPTS_DIRECTORY) not in sys.path:
 
 from publishers.spotify.match_cache import (  # noqa: E402
     MATCHER_VERSION,
+    cached_manual_source_conflicts,
     clear_manual_collision_cache_entry,
-    compare_cached_manual_source,
     compare_manual_source,
     load_spotify_track_match_cache,
     save_spotify_track_match_cache,
@@ -284,7 +284,7 @@ def validate_existing_matches(
                 f"{source_key} already has a different {existing_status} Spotify URI; "
                 "use --replace-existing to replace it"
             )
-        if existing_status == "manual" and compare_cached_manual_source(override.source_track, existing_record) is False:
+        if existing_status == "manual" and cached_manual_source_conflicts(override.source_track, existing_record):
             raise ValueError(
                 f"{source_key} already has a manual Spotify match for a different source track; "
                 "use --replace-existing to bind it to this source"

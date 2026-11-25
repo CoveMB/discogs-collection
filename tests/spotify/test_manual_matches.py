@@ -377,6 +377,74 @@ class SpotifyManualMatchTests(unittest.TestCase):
             import_manual_match_overrides(overrides_path, directory, cache_path, apply=True, replace_existing=True)
             self.assertIsNone(cached_track_match(colliding_track, load_spotify_track_match_cache(cache_path)))
 
+    def test_rebinding_partial_manual_match_requires_flag_for_each_conflicting_field(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            master = directory / "Mix" / "Mix.csv"
+            overrides_path = directory / "manual.json"
+            cache_path = directory / "matches.json"
+            source = {
+                "release_id": "release-1", "track_number": "1", "track_name": "Signal 西",
+                "artist_name": "Artist 西", "album_name": "Album 西",
+            }
+            write_playlist_master(master, source_values={
+                "Track Name": source["track_name"], "Artist Name": source["artist_name"], "Album Name": source["album_name"],
+            })
+            write_override_file(overrides_path, source_values=source)
+            key = "release-1|1|artist|album|signal"
+            unrelated = {"match_status": "unmatched", "track_name": "Other Synthetic Track"}
+
+            for field, wrong_value in (
+                ("release_id", "release-2"), ("track_number", "2"), ("track_name", "Signal 東"),
+                ("artist_name", "Artist 東"), ("album_name", "Album 東"),
+            ):
+                with self.subTest(field=field):
+                    record = {"match_status": "manual", "spotify_uri": "spotify:track:manual-one", field: wrong_value}
+                    save_spotify_track_match_cache(cache_path, {key: record, "unrelated": unrelated})
+                    before = cache_path.read_bytes()
+
+                    for apply in (False, True):
+                        with self.subTest(apply=apply), self.assertRaisesRegex(ValueError, "use --replace-existing"):
+                            import_manual_match_overrides(overrides_path, directory, cache_path, apply=apply)
+                    self.assertEqual(cache_path.read_bytes(), before)
+
+                    preview = import_manual_match_overrides(overrides_path, directory, cache_path, replace_existing=True)
+                    self.assertEqual((preview.planned_count, preview.applied_count), (1, 0))
+                    self.assertEqual(cache_path.read_bytes(), before)
+                    result = import_manual_match_overrides(
+                        overrides_path, directory, cache_path, apply=True, replace_existing=True,
+                    )
+                    self.assertEqual(result.applied_count, 1)
+                    updated = load_spotify_track_match_cache(cache_path)
+                    self.assertEqual(updated[key][field], source[field])
+                    self.assertEqual(updated[key]["spotify_uri"], "spotify:track:manual-one")
+                    self.assertEqual(updated["unrelated"], unrelated)
+
+    def test_reimport_binds_key_only_and_compatible_partial_manual_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            master = directory / "Mix" / "Mix.csv"
+            overrides_path = directory / "manual.json"
+            cache_path = directory / "matches.json"
+            write_playlist_master(master, source_values={"Track Name": "Signal 西 É"})
+            write_override_file(overrides_path, source_values={"track_name": "Signal 西 É"})
+            key = "release-1|1|source artist|source album|signal e"
+
+            for source_fields in ({}, {"track_name": " SIGNAL  西 e\u0301 ", "release_id": " release-1 ", "album_name": "  "}):
+                with self.subTest(source_fields=source_fields):
+                    record = {"match_status": "manual", "spotify_uri": "spotify:track:manual-one", **source_fields}
+                    save_spotify_track_match_cache(cache_path, {key: record})
+                    before = cache_path.read_bytes()
+                    preview = import_manual_match_overrides(overrides_path, directory, cache_path)
+                    self.assertEqual((preview.planned_count, preview.applied_count), (1, 0))
+                    self.assertEqual(cache_path.read_bytes(), before)
+
+                    result = import_manual_match_overrides(overrides_path, directory, cache_path, apply=True)
+                    self.assertEqual(result.applied_count, 1)
+                    updated = load_spotify_track_match_cache(cache_path)[key]
+                    self.assertEqual(updated["track_name"], "Signal 西 É")
+                    self.assertEqual(updated["album_name"], "Source Album")
+
     def test_replacing_different_matched_record_requires_explicit_flag(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)

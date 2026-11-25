@@ -2124,6 +2124,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
 
             for source_fields in (
                 {"release_id": "111", "track_number": "2"},
+                {"release_id": "111", "track_number": "2", "track_name": "Middle東"},
                 {"release_id": "111", "track_number": "2", "track_name": "Middle", "artist_name": artist, "album_name": ""},
                 {},
             ):

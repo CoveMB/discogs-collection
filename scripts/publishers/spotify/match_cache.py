@@ -156,7 +156,7 @@ def compare_cached_manual_source(track: PlaylistTrack, record: Mapping[str, obje
     )
 
 
-def _collision_source_fields(track: PlaylistTrack) -> tuple[tuple[str, str, Callable[[str], str]], ...]:
+def _source_identity_fields(track: PlaylistTrack) -> tuple[tuple[str, str, Callable[[str], str]], ...]:
     return (
         ("release_id", track.release_id, str.strip),
         ("track_number", track.track_number, str.strip),
@@ -166,8 +166,18 @@ def _collision_source_fields(track: PlaylistTrack) -> tuple[tuple[str, str, Call
     )
 
 
+def cached_manual_source_conflicts(track: PlaylistTrack, record: Mapping[str, object]) -> bool:
+    """Check each recorded source string, including when other source fields are missing."""
+    return any(
+        isinstance(saved := record.get(field), str)
+        and (saved_value := normalize(saved))
+        and saved_value != normalize(source_value)
+        for field, source_value, normalize in _source_identity_fields(track)
+    )
+
+
 def _manual_collision_cache_key(track: PlaylistTrack) -> str:
-    identity = tuple(normalize(value) for _, value, normalize in _collision_source_fields(track))
+    identity = tuple(normalize(value) for _, value, normalize in _source_identity_fields(track))
     encoded = json.dumps(identity, ensure_ascii=True, separators=(",", ":")).encode("ascii")
     # Ordinary keys contain pipes, so older readers cannot select this entry.
     return f"manual-collision:{hashlib.sha256(encoded).hexdigest()}"
@@ -177,7 +187,7 @@ def _automatic_collision_source_matches(track: PlaylistTrack, record: Mapping[st
     # A blank source field must be saved as a string for an automatic decision to be replayable.
     return all(
         isinstance(saved_value := record.get(field), str) and normalize(saved_value) == normalize(source_value)
-        for field, source_value, normalize in _collision_source_fields(track)
+        for field, source_value, normalize in _source_identity_fields(track)
     )
 
 
