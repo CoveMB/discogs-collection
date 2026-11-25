@@ -31,7 +31,7 @@ from publishers.spotify.client import (
     parse_search_track_items,
 )
 from publishers.spotify.env import DEFAULT_ENV_PATH, DEFAULT_TOKEN_CACHE_PATH, load_spotify_settings
-from publishers.spotify.manual_matches import ManualMatchOverride
+from publishers.spotify.manual_matches import ManualMatchOverride, tracks_by_import_key
 from publishers.spotify.match_cache import (
     MATCHER_VERSION,
     cache_record_has_recording_conflict,
@@ -40,7 +40,7 @@ from publishers.spotify.match_cache import (
     compare_cached_manual_source,
     compare_manual_source,
     load_spotify_track_match_cache,
-    spotify_candidate_from_cache_record,
+    source_bound_cached_candidates,
     spotify_track_match_key,
     track_match_cache_entry,
 )
@@ -232,27 +232,6 @@ def assess_row(
         row.status = "unassessed"
         row.reason = "Run the ordinary publisher preview to obtain a current assessment for this exact source."
     return None
-
-
-def source_bound_cached_candidates(record: Mapping[str, object]) -> tuple[SpotifyTrackCandidate, ...]:
-    raw_candidates = record.get("review_candidates")
-    if not isinstance(raw_candidates, list):
-        return ()
-    candidates: list[SpotifyTrackCandidate] = []
-    for raw in raw_candidates:
-        if not isinstance(raw, Mapping):
-            continue
-        # Ordinary suggestions inherit their source only from the containing decision.
-        if any(field in raw for field in ("release_id", "track_number", "track_name", "artist_name", "album_name")):
-            continue
-        candidate = spotify_candidate_from_cache_record(raw, require_recording_metadata=True)
-        if (
-            candidate and not candidate.version_title_review_only
-            and spotify_track_uri_is_structurally_valid(candidate.uri)
-            and "spotify_observed_recording_metadata" not in raw
-        ):
-            candidates.append(candidate)
-    return tuple(candidates)
 
 
 def separate_credit_issue(value: object, *, other_positions: set[str] | None = None) -> str:
@@ -707,13 +686,6 @@ def source_is_importable(track: PlaylistTrack, same_key: Sequence[PlaylistTrack]
             artist=track.artist_name, album=track.album_name,
         ) is True for source in same_key
     )
-
-
-def tracks_by_import_key(tracks: Sequence[PlaylistTrack]) -> dict[str, list[PlaylistTrack]]:
-    by_key: dict[str, list[PlaylistTrack]] = {}
-    for track in tracks:
-        by_key.setdefault(spotify_track_match_key(track), []).append(track)
-    return by_key
 
 
 def spotify_recording_report(hit: SpotifyRecordingHit) -> dict[str, str | int]:

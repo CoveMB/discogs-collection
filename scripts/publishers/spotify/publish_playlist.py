@@ -56,6 +56,7 @@ from publishers.spotify.matching import (  # noqa: E402
     ERROR,
     FEATURED_ARTIST_MATCH_REASON_PREFIX,
     LEADING_IN_TITLE_MATCH_REASON_PREFIX,
+    MANUAL_URI_ONLY_MATCH_STRATEGY,
     MATCHED,
     ORIGINAL_MIX_MATCH_REASON_PREFIX,
     SAME_RECORDING_EDITION_MATCH_STRATEGY,
@@ -180,13 +181,16 @@ class SourceMatchEvidence:
 class PlaylistSourceMatches:
     def __init__(self, starting_uris: set[str]) -> None:
         self.starting_uris = starting_uris
+        self.planned_uri_only_by_uri: dict[str, bool] = {}
         self.by_identity: dict[str, SourceMatchEvidence] = {}
-        # Each identity records whether edition proof covers this observed or planned URI.
+        # Label identities record whether edition proof covers this observed or planned URI.
         self.identities_by_uri: dict[str, dict[str, bool]] = {}
 
     def has_conflicting_uri(
         self, decision: TrackMatchDecision, identity_key: str, *, check_cohort: bool,
     ) -> bool:
+        if decision.match_strategy == MANUAL_URI_ONLY_MATCH_STRATEGY:
+            return False
         cohort_uris = edition_cohort_uris(decision)
         checked_uris = cohort_uris if check_cohort and cohort_uris else {decision.spotify_uri}
         return any(
@@ -206,13 +210,19 @@ class PlaylistSourceMatches:
         if status not in {WOULD_ADD, WOULD_INCLUDE, ALREADY_PRESENT, DUPLICATE_IN_SOURCE}:
             return
 
+        playlist_uri = publish_decision.spotify_uri
+        if status == WOULD_ADD:
+            self.planned_uri_only_by_uri[playlist_uri] = publish_decision.manual_uri_only
+        if publish_decision.manual_uri_only:
+            return
+
         cohort_uris = edition_cohort_uris(decision)
         earlier = self.by_identity.get(identity_key)
-        playlist_uri = publish_decision.spotify_uri
         if status == DUPLICATE_IN_SOURCE:
-            if earlier is None or earlier.playlist_uri not in cohort_uris:
+            if earlier is not None and earlier.playlist_uri in cohort_uris:
+                playlist_uri = earlier.playlist_uri
+            elif earlier is not None or not self.planned_uri_only_by_uri.get(playlist_uri):
                 return
-            playlist_uri = earlier.playlist_uri
         elif status == ALREADY_PRESENT and not cohort_uris and existing_identity_items:
             # Ordinary reports can show the selected URI even when inventory matched another URI.
             if not any(item.uri == playlist_uri for item in existing_identity_items):
@@ -777,7 +787,7 @@ def publish_spotify_playlists(
                                 publish_decision = replace(
                                     publish_decision,
                                     reason=publish_reason_with_match_details(
-                                        append_publish_reason(known_to_publisher),
+                                        append_publish_reason(known_to_publisher, publish_decision.manual_uri_only),
                                         decision,
                                     ),
                                 )
@@ -1394,7 +1404,6 @@ def build_append_playlist_plan(
             planned_items.insert(
                 insert_index,
                 AppendPlanItem(
-                    identity_key=candidate.identity_key,
                     source_position=candidate.source_position,
                     final_item=final_item,
                     pending_candidate=candidate,
@@ -1403,7 +1412,6 @@ def build_append_playlist_plan(
         else:
             planned_items.append(
                 AppendPlanItem(
-                    identity_key=candidate.identity_key,
                     source_position=None,
                     final_item=final_item,
                     pending_candidate=candidate,
@@ -1431,7 +1439,6 @@ def build_append_playlist_plan(
 
 @dataclass(frozen=True)
 class AppendPlanItem:
-    identity_key: str
     source_position: int | None
     final_item: FinalPlaylistItem
     pending_candidate: PendingAppendTrack | None = None
@@ -1443,12 +1450,15 @@ def append_plan_item_from_existing(
     source_positions_by_identity: Mapping[str, int],
     previous_final_items_by_identity: Mapping[str, FinalPlaylistItem],
 ) -> AppendPlanItem:
-    identity_key = spotify_playlist_item_identity_key(target_playlist_name, item)
-    previous_final_item = previous_final_items_by_identity.get(identity_key)
+    identity_keys = spotify_playlist_item_membership_keys(target_playlist_name, item)
+    previous_final_item = next((
+        previous
+        for key in identity_keys
+        if (previous := previous_final_items_by_identity.get(key)) is not None and previous.spotify_uri == item.uri
+    ), None)
     final_item = (
         previous_final_item
-        if previous_final_item and previous_final_item.spotify_uri == item.uri
-        else FinalPlaylistItem(
+        or FinalPlaylistItem(
             playlist_name=target_playlist_name,
             position=0,
             status="existing",
@@ -1460,8 +1470,10 @@ def append_plan_item_from_existing(
         )
     )
     return AppendPlanItem(
-        identity_key=identity_key,
-        source_position=source_positions_by_identity.get(identity_key),
+        source_position=min(
+            (source_positions_by_identity[key] for key in identity_keys if key in source_positions_by_identity),
+            default=None,
+        ),
         final_item=final_item,
     )
 
@@ -1549,6 +1561,8 @@ def mark_final_item_applied(final_items: list[FinalPlaylistItem], operation: App
 
 
 def final_playlist_item_identity_key(item: FinalPlaylistItem) -> str:
+    if item.manual_uri_only:
+        return spotify_uri_membership_key(item.playlist_name, item.spotify_uri)
     return spotify_track_identity_key(
         target_playlist_name=item.playlist_name,
         artist_names=item.artist_names,
@@ -1568,26 +1582,27 @@ def observe_existing_publish_state_tracks(
     if not timestamp:
         return
     for item in existing_items:
-        identity_key = spotify_playlist_item_identity_key(target_playlist_name, item)
-        source_position = source_positions_by_identity.get(identity_key)
-        if source_position is None:
-            continue
-        record_spotify_publish_state_track(
-            state=publish_state,
-            playlist_name=target_playlist_name,
-            identity_key=identity_key,
-            spotify_uri=item.uri,
-            source_position=source_position,
-            track=source_tracks_by_identity.get(identity_key),
-            timestamp=timestamp,
-            event="observed",
-        )
+        for identity_key in spotify_playlist_item_membership_keys(target_playlist_name, item):
+            source_position = source_positions_by_identity.get(identity_key)
+            if source_position is None:
+                continue
+            record_spotify_publish_state_track(
+                state=publish_state,
+                playlist_name=target_playlist_name,
+                identity_key=identity_key,
+                spotify_uri=item.uri,
+                source_position=source_position,
+                track=source_tracks_by_identity.get(identity_key),
+                timestamp=timestamp,
+                event="observed",
+            )
 
 
-def append_publish_reason(known_to_publisher: bool) -> str:
+def append_publish_reason(known_to_publisher: bool, manual_uri_only: bool) -> str:
+    subject = "Selected Spotify URI" if manual_uri_only else "Spotify artist, album, and track"
     if known_to_publisher:
-        return "Spotify artist, album, and track will be restored at its source-order position"
-    return "Spotify artist, album, and track is newly seen and will be appended to playlist"
+        return f"{subject} will be restored at its source-order position"
+    return f"{subject} is newly seen and will be appended to playlist"
 
 
 def build_publish_decision(
@@ -1617,6 +1632,7 @@ def build_publish_decision(
         )
     spotify_uri = decision.spotify_uri
     candidate = decision.candidate
+    manual_uri_only = decision.match_strategy == MANUAL_URI_ONLY_MATCH_STRATEGY
     identity_key = track_match_decision_identity_key(target_playlist_name, decision)
     if recording_conflict or source_matches.has_conflicting_uri(
         decision, identity_key, check_cohort=publisher_sync_mode == APPEND_SYNC_MODE,
@@ -1628,7 +1644,15 @@ def build_publish_decision(
         )
     elif publisher_sync_mode != APPEND_SYNC_MODE:
         status = WOULD_INCLUDE
-        reason = "Spotify artist, album, and track will be included in replacement playlist"
+        subject = "Selected Spotify URI" if manual_uri_only else "Spotify artist, album, and track"
+        reason = f"{subject} will be included in replacement playlist"
+    elif manual_uri_only:
+        if spotify_uri in source_matches.starting_uris:
+            status, reason = ALREADY_PRESENT, "Selected Spotify URI already exists in playlist"
+        elif spotify_uri in source_matches.planned_uri_only_by_uri:
+            status, reason = DUPLICATE_IN_SOURCE, "Selected Spotify URI already planned from an earlier local row"
+        else:
+            status, reason = WOULD_ADD, "Selected Spotify URI will be appended to playlist"
     else:
         earlier_match = source_matches.by_identity.get(identity_key)
         status, spotify_uri, reason = append_track_disposition(
@@ -1640,6 +1664,8 @@ def build_publish_decision(
             existing_complete_items_by_uri,
             earlier_match.match if earlier_match else None,
         )
+        if status == WOULD_ADD and source_matches.planned_uri_only_by_uri.get(spotify_uri):
+            status, reason = DUPLICATE_IN_SOURCE, "Selected Spotify URI already planned from an earlier local row"
     if status == AMBIGUOUS:
         candidate = None
     elif spotify_uri != decision.spotify_uri:
@@ -1656,6 +1682,7 @@ def build_publish_decision(
         candidate=candidate,
         review_candidates=decision.review_candidates,
         search_queries=decision.search_queries,
+        manual_uri_only=manual_uri_only,
     )
 
 
@@ -2031,6 +2058,17 @@ def spotify_playlist_item_identity_key(target_playlist_name: str, item: SpotifyP
     )
 
 
+def spotify_uri_membership_key(target_playlist_name: str, uri: str) -> str:
+    return f"uri:{target_playlist_name}|{uri}"
+
+
+def spotify_playlist_item_membership_keys(target_playlist_name: str, item: SpotifyPlaylistItem) -> tuple[str, ...]:
+    label_key = spotify_playlist_item_identity_key(target_playlist_name, item)
+    if item.uri:
+        return (spotify_uri_membership_key(target_playlist_name, item.uri), label_key)
+    return (label_key,)
+
+
 def source_identity_positions_by_identity(
     target_playlist_name: str,
     tracks: Sequence[PlaylistTrack],
@@ -2091,6 +2129,8 @@ def spotify_playlist_item_has_identity_metadata(item: SpotifyPlaylistItem) -> bo
 
 
 def track_match_decision_identity_key(target_playlist_name: str, decision: TrackMatchDecision) -> str:
+    if decision.match_strategy == MANUAL_URI_ONLY_MATCH_STRATEGY:
+        return spotify_uri_membership_key(target_playlist_name, decision.spotify_uri)
     candidate = decision.candidate
     if candidate:
         return spotify_candidate_identity_key(target_playlist_name, candidate)
@@ -2103,6 +2143,8 @@ def track_match_decision_identity_key(target_playlist_name: str, decision: Track
 
 
 def publish_decision_identity_key(decision: PlaylistPublishDecision) -> str:
+    if decision.manual_uri_only:
+        return spotify_uri_membership_key(decision.target_playlist_name, decision.spotify_uri) if decision.spotify_uri else ""
     candidate = decision.candidate
     if candidate:
         return spotify_candidate_identity_key(decision.target_playlist_name, candidate)
@@ -2125,6 +2167,7 @@ def final_playlist_item_from_decision(position: int, decision: PlaylistPublishDe
         artist_names=candidate.artists if candidate else (decision.track.artist_name,),
         album_name=candidate.album_name if candidate else decision.track.album_name,
         source_track=decision.track,
+        manual_uri_only=decision.manual_uri_only,
     )
 
 
@@ -2134,18 +2177,7 @@ def reindex_final_items(final_items: Sequence[FinalPlaylistItem]) -> tuple[Final
     for item in final_items:
         next_position = positions_by_playlist.get(item.playlist_name, 0) + 1
         positions_by_playlist[item.playlist_name] = next_position
-        reindexed_items.append(
-            FinalPlaylistItem(
-                playlist_name=item.playlist_name,
-                position=next_position,
-                status=item.status,
-                spotify_uri=item.spotify_uri,
-                track_name=item.track_name,
-                artist_names=item.artist_names,
-                album_name=item.album_name,
-                source_track=item.source_track,
-            )
-        )
+        reindexed_items.append(replace(item, position=next_position))
     return tuple(reindexed_items)
 
 
