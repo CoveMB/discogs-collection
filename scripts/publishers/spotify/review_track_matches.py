@@ -255,6 +255,19 @@ def source_bound_cached_candidates(record: Mapping[str, object]) -> tuple[Spotif
     return tuple(candidates)
 
 
+def held_cache_observations(
+    track: PlaylistTrack, matches: Mapping[str, Mapping[str, object]],
+) -> tuple[SpotifyTrackCandidate, ...]:
+    _, record = track_match_cache_entry(track, matches)
+    if (
+        record is not None
+        and cache_record_matcher_version(record) == MATCHER_VERSION
+        and compare_cached_manual_source(track, record) is True
+    ):
+        return source_bound_cached_candidates(record)
+    return ()
+
+
 def separate_credit_issue(value: object, *, other_positions: set[str] | None = None) -> str:
     if not isinstance(value, list):
         return "Discogs returned malformed separate artist credits."
@@ -565,7 +578,8 @@ def complete_isrc_items(search: SpotifySearch, code: str) -> list[object]:
 
 def resolve_recording_proposals(
     args: argparse.Namespace, payload: object, rows: Sequence[tuple[PlaylistTrack, ReviewRow]],
-    candidates: Mapping[PlaylistTrack, CandidateEvidence], search: SpotifySearch,
+    candidates: Mapping[PlaylistTrack, CandidateEvidence],
+    initial_matches: Mapping[str, Mapping[str, object]], search: SpotifySearch,
 ) -> list[ManualMatchOverride]:
     rows_to_verify: list[tuple[PlaylistTrack, ReviewRow, set[str]]] = []
     for track, row in rows:
@@ -647,20 +661,20 @@ def resolve_recording_proposals(
     latest_assessments: dict[PlaylistTrack, tuple[ReviewRow, CandidateEvidence | None]] = {}
     cached_observations = [hit for evidence in candidates.values() for hit in evidence.cached_hits]
     for track, row in rows:
+        if row.status == "source_collision":
+            continue
+        initial = candidates.get(track)
+        # Held rows can still contribute source-bound evidence against other proposals.
+        if initial is None and row.status != "unassessed":
+            cached_observations.extend(held_cache_observations(track, initial_matches))
         latest_row = replace(row)
         assessment = assess_row(track, latest_row, matches, proposals=True)
         if assessment is not None:
-            assessment.discovery_hits = candidates[track].discovery_hits
+            if initial is not None:
+                assessment.discovery_hits = initial.discovery_hits
             cached_observations.extend(assessment.cached_hits)
         elif latest_row.status != "unassessed":
-            # A held row can still contribute source-bound evidence against other proposals.
-            _, record = track_match_cache_entry(track, matches)
-            if (
-                record is not None
-                and cache_record_matcher_version(record) == MATCHER_VERSION
-                and compare_cached_manual_source(track, record) is True
-            ):
-                cached_observations.extend(source_bound_cached_candidates(record))
+            cached_observations.extend(held_cache_observations(track, matches))
         latest_assessments[track] = latest_row, assessment
 
     # An observation from another row's search can contradict a URI even if that row yields no proposal.
@@ -781,7 +795,7 @@ def review_release(args: argparse.Namespace) -> list[ReviewRow]:
                 row.status, row.reason = "incomplete", "The Discogs pressing request failed."
         collect_candidates(search, [(track, row) for track, row in pending if row.status == "pending"], candidates)
     if proposals:
-        overrides = resolve_recording_proposals(args, payload, pending, candidates, search)
+        overrides = resolve_recording_proposals(args, payload, rows, candidates, matches, search)
         write_proposals(args.proposals, overrides, args.playlist_output_directory, args.match_cache)
     return [row for _, row in rows]
 

@@ -573,6 +573,50 @@ class SpotifyArtistReviewTests(unittest.TestCase):
         ))
         return track, second_track, link, pressing, first_code, second_code
 
+    def test_recording_proposal_checks_source_bound_observations_from_startup_holds(self) -> None:
+        _, held, link, pressing, reverse, _ = self.two_track_recording_fixture()
+        self.set_isrc_hits(reverse["isrc"], self.recording_hit("studio", reverse["isrc"]))
+        held_record = self.cache_negative(held, SpotifyTrackCandidate(
+            "spotify:track:studio", held.track_name, (held.artist_name,), "Field Notes", "FieldNotes",
+            isrc="ZZABC2600099",
+        ))
+        record_cached_recording_conflict(held_record, "Synthetic recording conflict")
+        held_key = spotify_track_match_key(held)
+        for case, blocked in (
+            ("current", True), ("removed_before_export", True), ("added_before_export", True),
+            ("stale", False), ("different_source", False),
+        ):
+            with self.subTest(case=case):
+                self.requests.clear()
+                initial = deepcopy(self.matches)
+                if case == "stale":
+                    initial[held_key]["matcher_version"] = MATCHER_VERSION - 1
+                elif case == "different_source":
+                    initial[held_key]["track_name"] = "Another source"
+                latest = deepcopy(initial)
+                if case == "removed_before_export":
+                    latest[held_key]["review_candidates"] = []
+                elif case == "added_before_export":
+                    initial[held_key]["review_candidates"] = []
+                with patch.object(
+                    review_track_matches, "load_spotify_track_match_cache", side_effect=(initial, latest),
+                ):
+                    report, paths = self.run_recording_review(
+                        link, pressing, reverse, output=self.directory / f"startup-{case}.json",
+                    )
+                self.assertEqual((len(paths), len(self.requests)), (3, 1))
+                candidate, held_row = report["rows"]
+                self.assertEqual(held_row["status"], "recording_conflict")
+                self.assertNotIn("recording_proof", held_row)
+                overrides = json.loads(self.proposals.read_text())["matches"]
+                if blocked:
+                    self.assertEqual(candidate["status"], "recording_unverified")
+                    self.assertIn("A cached observation", candidate["reason"])
+                    self.assertEqual(overrides, [])
+                else:
+                    self.assertEqual(candidate["status"], "proposal")
+                    self.assertEqual([override["spotify_uri"] for override in overrides], ["spotify:track:studio"])
+
     def test_recording_proposal_rechecks_new_cached_contradictions_without_holding_independent_rows(self) -> None:
         track, second, link, pressing, first, other = self.two_track_recording_fixture()
         self.set_isrc_hits(first["isrc"], self.recording_hit("studio", first["isrc"]))
