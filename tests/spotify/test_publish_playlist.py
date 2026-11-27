@@ -1213,6 +1213,55 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             self.assertEqual(client.add_calls[-1], ("created-1", (candidates[1].uri,), 1))
             self.assertEqual([item.uri for item in inventory], [candidate.uri for candidate in candidates])
 
+    def test_capped_append_uses_uri_only_anchors_before_processing_later_rows(self):
+        first = playlist_row("201", "Shared Album", "Shared Track", "Shared Artist")
+        middle = playlist_row("202", "Middle Album", "Middle Track", "Middle Artist")
+        last = playlist_row("203", "Shared Album", "Shared Track", "Shared Artist")
+        middle_candidate = matching_candidate(middle)
+        for shared_uri in (False, True):
+            with self.subTest(shared_uri=shared_uri), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                masters = directory / "masters"
+                write_playlist_master(masters / "Sharing" / "Sharing.csv", [first, middle, last])
+                cache = directory / "matches.json"
+                state = directory / "state.json"
+                seed_known_publish_state(state, "Sharing", middle, 2)
+                if shared_uri:
+                    cohort = recording_edition_candidates(first)
+                    save_spotify_track_match_cache(cache, {
+                        "201|1|shared artist|shared album|shared track": saved_edition_match_record(first, cohort),
+                    })
+                    first_candidate = cohort[0]
+                    last_candidate = first_candidate
+                    selections = [(last, last_candidate.uri)]
+                else:
+                    first_candidate = matching_candidate(first)
+                    last_candidate = matching_candidate(last)
+                    selections = [(first, first_candidate.uri), (last, last_candidate.uri)]
+                import_uri_only_review(directory, masters, cache, *selections)
+                existing_candidates = (first_candidate,) if shared_uri else (first_candidate, last_candidate)
+                client = StrictPositionPublishingSpotifyClient(
+                    {'track:"Middle Track" artist:"Middle Artist" album:"Middle Album"': (middle_candidate,)},
+                    playlists=(SpotifyPlaylist("sharing", "Sharing", "", "current-user", public=False),),
+                    playlist_items_by_id={"sharing": tuple(
+                        SpotifyPlaylistItem(candidate.uri, candidate.name, candidate.artists, candidate.album_name)
+                        for candidate in existing_candidates
+                    )},
+                )
+
+                summary = publish_spotify_playlists(
+                    masters, directory / "report.txt", client, "synthetic-token", match_cache_path=cache,
+                    publish_state_cache_path=state, max_new_searches_per_run=1,
+                )
+
+                self.assertEqual(summary.stop_reason, "search_budget")
+                self.assertEqual([decision.track.release_id for decision in summary.decisions], ["201", "202"])
+                self.assertEqual(client.add_calls, [("sharing", (middle_candidate.uri,), 1)])
+                expected = [first_candidate.uri, middle_candidate.uri]
+                if not shared_uri:
+                    expected.append(last_candidate.uri)
+                self.assertEqual([item.uri for item in client.playlist_items_by_id["sharing"]], expected)
+
     def test_uri_only_restore_keeps_the_earliest_actual_source_of_a_shared_uri(self):
         proved = playlist_row("211", "Proved Album", "Proved Track", "Proved Artist")
         middle = playlist_row("212", "Middle Album", "Middle Track", "Middle Artist")
