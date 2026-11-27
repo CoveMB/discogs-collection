@@ -125,19 +125,18 @@ class SpotifyRequestControl:
             raise ValueError("Spotify quota reset time was not provided")
         started = self.monotonic()
         self.notice(self.pause_description(info))
-        next_notice = started + 60.0
+        elapsed = 0.0
         try:
             while True:
                 now = self.monotonic()
                 remaining = delay - (now - info.received_at_monotonic)
                 if remaining <= 0:
-                    return
-                if now >= next_notice:
-                    self.notice(self.pause_description(info))
-                    next_notice = now + 60.0
+                    break
                 self.sleep(min(remaining, 60.0))
         finally:
-            self.wait_seconds += max(0.0, self.monotonic() - started)
+            elapsed = max(0.0, self.monotonic() - started)
+            self.wait_seconds += elapsed
+        self.notice(f"Spotify {info.kind} during {info.operation_name}; paused for {elapsed:g} seconds; resuming")
 
     def reset_fallback_after_progress(self) -> None:
         self._fallback_count = 0

@@ -131,6 +131,7 @@ class SpotifyContinuousControlTests(unittest.TestCase):
         self.assertEqual(clock.now, 4.0)
         self.assertEqual(control.wait_seconds, 2.0)
         self.assertIn("2023-11-14T22:13:24", notices[0])
+        self.assertIn("resuming", notices[1])
         info = control.on_response(429, {"Retry-After": "7200"}, "{}", "spotify_search")
         assert info is not None
         control.wait_for_pause(info)
@@ -138,7 +139,8 @@ class SpotifyContinuousControlTests(unittest.TestCase):
         self.assertEqual(control.wait_seconds, 7202.0)
         self.assertLessEqual(max(clock.sleeps), 60)
         self.assertEqual(control.minimum_interval_seconds, 4.0)
-        self.assertEqual(len(notices), 121)
+        self.assertEqual(len(notices), 4)
+        self.assertIn("resuming", notices[3])
 
     def test_quota_exact_shape_and_unusable_headers(self):
         for body in ('[]', 'null', '0', '"QUOTA_EXCEEDED"', '{', '{"reason":"QUOTA_EXCEEDED"}',
