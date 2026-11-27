@@ -52,6 +52,7 @@ class PlaylistPublishDecision:
     candidate: SpotifyTrackCandidate | None = None
     review_candidates: tuple[SpotifyTrackCandidate, ...] = ()
     search_queries: tuple[str, ...] = ()
+    manual_uri_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,7 @@ class FinalPlaylistItem:
     artist_names: tuple[str, ...]
     album_name: str
     source_track: PlaylistTrack | None = None
+    manual_uri_only: bool = False
 
 
 @dataclass(frozen=True)

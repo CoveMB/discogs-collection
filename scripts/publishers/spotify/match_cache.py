@@ -14,6 +14,7 @@ from publishers.spotify.matching import (
     ALPHANUMERIC_SPACING_MATCH_STRATEGY,
     AMBIGUOUS,
     CONSTRAINED_TYPO_MATCH_REASON_PREFIX,
+    MANUAL_URI_ONLY_MATCH_STRATEGY,
     MATCHED,
     SAME_RECORDING_EDITION_MATCH_STRATEGY,
     UNMATCHED,
@@ -415,14 +416,20 @@ def spotify_candidate_from_cache_record(
     *,
     require_recording_metadata: bool = False,
 ) -> SpotifyTrackCandidate | None:
-    if require_recording_metadata and not spotify_recording_metadata_is_complete(
-        uri=record.get("spotify_uri"),
-        title=record.get("spotify_track_name"),
-        artist_names=record.get("spotify_artist_names"),
-        album_name=record.get("spotify_album_name"),
-        album_id=record.get("spotify_album_id"),
-    ):
+    uri_only = record.get("match_status") == "manual" and record.get("match_strategy") == MANUAL_URI_ONLY_MATCH_STRATEGY
+    has_complete_recording_metadata = True
+    if require_recording_metadata or uri_only:
+        has_complete_recording_metadata = spotify_recording_metadata_is_complete(
+            uri=record.get("spotify_uri"),
+            title=record.get("spotify_track_name"),
+            artist_names=record.get("spotify_artist_names"),
+            album_name=record.get("spotify_album_name"),
+            album_id=record.get("spotify_album_id"),
+        )
+    if require_recording_metadata and not has_complete_recording_metadata:
         return None
+    if uri_only:
+        default_track = None
     spotify_uri = clean_cell(record.get("spotify_uri"))
     if not spotify_uri.startswith("spotify:track:"):
         return None
@@ -452,6 +459,7 @@ def spotify_candidate_from_cache_record(
         album_id=clean_cell(raw_album_id),
         isrc=normalize_spotify_isrc(record.get("spotify_isrc")),
         is_playable=is_playable if isinstance(is_playable, bool) else None,
+        has_complete_recording_metadata=has_complete_recording_metadata,
         observed_recording_metadata=observed_metadata,
         version_title_review_only=record.get("version_title_review_only") is True,
     )
@@ -469,6 +477,27 @@ def review_candidates_from_cache_record(
             continue
         candidate = spotify_candidate_from_cache_record(candidate_record)
         if candidate:
+            candidates.append(candidate)
+    return tuple(candidates)
+
+
+def source_bound_cached_candidates(record: Mapping[str, object]) -> tuple[SpotifyTrackCandidate, ...]:
+    raw_candidates = record.get("review_candidates")
+    if not isinstance(raw_candidates, list):
+        return ()
+    candidates: list[SpotifyTrackCandidate] = []
+    for raw in raw_candidates:
+        if not isinstance(raw, Mapping):
+            continue
+        # Ordinary suggestions inherit their source only from the containing decision.
+        if any(field in raw for field in ("release_id", "track_number", "track_name", "artist_name", "album_name")):
+            continue
+        candidate = spotify_candidate_from_cache_record(raw, require_recording_metadata=True)
+        if (
+            candidate and not candidate.version_title_review_only
+            and spotify_track_uri_is_structurally_valid(candidate.uri)
+            and "spotify_observed_recording_metadata" not in raw
+        ):
             candidates.append(candidate)
     return tuple(candidates)
 
