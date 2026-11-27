@@ -732,7 +732,9 @@ differences when a complete release is unavailable.
 
 After ordinary searches miss, the publisher can check up to three pages of a
 plain song-title search. It can choose a playable copy with the exact title and
-all exported artist credits, including a copy on another album. Incomplete
+all exported artist credits, including a copy on another album. Search totals
+can change between pages. The publisher checks each page's offset and requires
+the last page to have no next link before accepting the result. Incomplete
 coverage and competing recordings keep a candidate in review.
 
 Rows that still have no match after the search ladder get one tightly

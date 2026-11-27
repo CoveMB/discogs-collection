@@ -267,30 +267,36 @@ class SpotifyClient:
         response = self.search_tracks_response(access_token, query, limit, offset=offset)
         if response.status != 200:
             raise SpotifyApiError(f"Spotify search failed with status {response.status}: {response.body}")
-        try:
-            payload = json.loads(response.body)
-        except ValueError as error:
-            raise SpotifyApiError("Spotify search returned invalid JSON") from error
-        tracks = payload.get("tracks") if isinstance(payload, dict) else None
-        if not isinstance(tracks, dict) or not isinstance(items := tracks.get("items"), list):
-            raise SpotifyApiError("Spotify returned a malformed track search page")
+        tracks = search_track_page_object(response.body)
+        items = tracks["items"]
+        assert isinstance(items, list)
         total = tracks.get("total")
         next_url = tracks.get("next")
         if (
-            type(total) is not int or total < offset or type(tracks.get("offset")) is not int
+            type(total) is not int or total < 0 or type(tracks.get("offset")) is not int
             or tracks["offset"] != offset or type(tracks.get("limit")) is not int or tracks["limit"] != limit
-            or len(items) != min(limit, total - offset) or "next" not in tracks
-            or (next_url is not None and (not isinstance(next_url, str) or not next_url.strip()))
-            or (next_url is not None) != (offset + len(items) < total)
+            or len(items) > limit or "next" not in tracks or (not items and (offset or next_url is not None))
         ):
             raise SpotifyApiError("Spotify returned inconsistent track search pagination")
+        next_offset = None
+        if next_url is not None:
+            if not isinstance(next_url, str):
+                raise SpotifyApiError("Spotify returned an invalid next track search offset")
+            # Use only the offset from the link. Requests keep the original query and endpoint.
+            next_offset = offset + len(items)
+            try:
+                parameters = urllib.parse.parse_qs(urllib.parse.urlsplit(next_url).query, keep_blank_values=True)
+            except ValueError as error:
+                raise SpotifyApiError("Spotify returned an invalid next track search offset") from error
+            if parameters.get("offset") != [str(next_offset)] or next_offset > 1000:
+                raise SpotifyApiError("Spotify returned an invalid next track search offset")
         candidates = parse_search_track_items(items)
         if len(candidates) != len(items) or any(
             not candidate.has_complete_recording_metadata or not spotify_track_uri_is_structurally_valid(candidate.uri)
             for candidate in candidates
         ):
             raise SpotifyApiError("Spotify returned incomplete track search metadata")
-        return SpotifyTrackSearchPage(candidates, total, offset + len(items) if next_url is not None else None)
+        return SpotifyTrackSearchPage(candidates, total, next_offset)
 
     def get_track_observation(self, access_token: str, track_id: str) -> SpotifyTrackCandidate:
         if not track_id.isascii() or not track_id.isalnum():

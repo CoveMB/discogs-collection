@@ -996,7 +996,7 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             )
             self.assertEqual((result.decisions[1].status, result.decisions[1].spotify_uri), ("ambiguous", ""))
 
-    def test_exact_title_only_search_checks_all_pages_at_the_spotify_endpoint(self):
+    def test_exact_title_only_search_checks_all_pages_when_totals_change(self):
         track = playlist_track("Picks", "101", "Missing EP", "Night Ferry", "North, Sol")
         requests = []
         def hit(uri, artists):
@@ -1015,15 +1015,59 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
                 0: [hit("spotify:track:cover", ["Cover Artist"]), hit("spotify:track:partial", ["North"])],
                 2: [hit("spotify:track:exact", ["Sol", "North"])],
             }
-            next_url = "https://example.invalid/untrusted" if offset == 0 else None
+            next_url = "https://example.invalid/untrusted?offset=2" if offset == 0 else None
             return HttpResponse(200, {}, json.dumps({
-                "tracks": {"items": rows[offset], "offset": offset, "limit": 2, "total": 3, "next": next_url}
+                "tracks": {"items": rows[offset], "offset": offset, "limit": 2,
+                           "total": 40 if offset == 0 else 2, "next": next_url}
             }))
 
         result = search_spotify_track(track, SpotifyClient(transport=transport), "token", 2)
         self.assertEqual((result.decision.status, result.decision.spotify_uri), ("matched", "spotify:track:exact"))
         self.assertEqual(requests, [0, 2])
         self.assertEqual(result.search_count, len(build_spotify_track_search_queries(track)) + 2)
+
+    def test_exact_title_only_search_rejects_invalid_page_progression(self):
+        track = playlist_track("Picks", "101", "Missing EP", "Night Ferry", "North")
+        hit = {"uri": "spotify:track:night", "name": "Night Ferry", "artists": [{"name": "North"}],
+               "album": {"name": "Another Album", "id": "edition"}, "is_playable": True}
+        first = {"items": [hit], "offset": 0, "limit": 1, "total": 2,
+                 "next": "https://api.spotify.com/v1/search?offset=1"}
+        for name, change in (
+            ("wrong page", {"offset": 1}),
+            ("repeated offset", {"next": "https://api.spotify.com/v1/search?offset=0"}),
+            ("skipped offset", {"next": "https://api.spotify.com/v1/search?offset=2"}),
+            ("missing offset", {"next": "https://api.spotify.com/v1/search"}),
+            ("missing items", {"items": []}),
+            ("too many items", {"items": [hit, hit]}),
+        ):
+            with self.subTest(name=name):
+                def transport(request):
+                    query = parse_qs(urlsplit(request.url).query)
+                    if query["q"] != ["Night Ferry"]:
+                        return complete_track_page([], 1)
+                    self.assertNotIn("offset", query)
+                    return HttpResponse(200, {}, json.dumps({"tracks": {**first, **change}}))
+
+                result = search_spotify_track(track, SpotifyClient(transport=transport), "token", 1)
+                self.assertEqual((result.decision.status, result.decision.spotify_uri), ("error", ""))
+
+    def test_exact_title_only_search_keeps_repeated_uris_in_review(self):
+        track = playlist_track("Picks", "101", "Missing EP", "Night Ferry", "North")
+        hit = {"uri": "spotify:track:night", "name": "Night Ferry", "artists": [{"name": "North"}],
+               "album": {"name": "Another Album", "id": "edition"}, "is_playable": True}
+
+        def transport(request):
+            query = parse_qs(urlsplit(request.url).query)
+            if query["q"] != ["Night Ferry"]:
+                return complete_track_page([], 1)
+            offset = int(query.get("offset", ["0"])[0])
+            return HttpResponse(200, {}, json.dumps({
+                "tracks": {"items": [hit], "offset": offset, "limit": 1, "total": 2,
+                           "next": "https://api.spotify.com/v1/search?offset=1" if offset == 0 else None}
+            }))
+
+        result = search_spotify_track(track, SpotifyClient(transport=transport), "token", 1)
+        self.assertEqual((result.decision.status, result.decision.spotify_uri), ("ambiguous", ""))
 
     def test_exact_title_only_page_cap_leaves_visible_candidates_in_review(self):
         track = playlist_track("Picks", "101", "Missing EP", "Night Ferry", "North")
@@ -1037,7 +1081,8 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
                    "album": {"name": "Another Album", "id": f"edition-{offset}"},
                    "external_ids": {"isrc": "USABC2400001"}, "is_playable": True}
             return HttpResponse(200, {}, json.dumps({
-                "tracks": {"items": [hit], "offset": offset, "limit": 1, "total": 4, "next": "https://example.invalid/"}
+                "tracks": {"items": [hit], "offset": offset, "limit": 1, "total": 4,
+                           "next": f"https://api.spotify.com/v1/search?offset={offset + 1}"}
             }))
 
         result = search_spotify_track(track, SpotifyClient(transport=transport), "token", 1)

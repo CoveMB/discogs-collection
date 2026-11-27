@@ -497,7 +497,6 @@ def search_spotify_title_only(
     searched = (*queries, query)
     hits: list[SpotifyTrackCandidate] = []
     offset = 0
-    total: int | None = None
     complete = False
     for page_number in range(1, MAXIMUM_TITLE_SEARCH_PAGES + 1):
         search_count += 1
@@ -505,15 +504,12 @@ def search_spotify_title_only(
             on_search()
         try:
             page = spotify_client.search_track_page(access_token, query, search_limit, offset)
-            if total is not None and total != page.total:
-                raise SpotifyApiError("Spotify title-only search total changed during pagination")
         except (SpotifyAuthenticationError, SpotifyRateLimitPauseError, SpotifyRateLimitDeferredError, SpotifyRateLimitRetriesExhaustedError):
             raise
         except SpotifyApiError as error:
             if fail_on_api_error and not is_query_specific_spotify_search_error(error):
                 raise
             return SpotifyTrackSearchResult(track_match_error(track, str(error), searched), search_count)
-        total = page.total
         hits.extend(replace(candidate, title_only_search=True) for candidate in page.candidates)
         if page.next_offset is None:
             complete = len({candidate.uri for candidate in hits}) == len(hits)
