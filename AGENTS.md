@@ -63,8 +63,9 @@ explicit Discogs `release_id` values without adding those releases to the
 collection master. The same script can rebuild durable configured release
 playlists from ordered release IDs, by default under
 `collection/playlists/release-playlists`, without reading or changing enriched
-collection rows or playlist associations. Configured Spotify publishing uses
-exact-mirror replace semantics.
+collection rows or playlist associations. Configured Spotify publishing replaces
+with an exact mirror by default and supports an explicit `--allow-partial` mode
+that reports unresolved rows and publishes the matched subset.
 
 The tool should stay focused on this workflow: read Discogs export rows, use
 `release_id` to find explicit Discogs metadata, write an enriched CSV with audit
@@ -168,7 +169,10 @@ The tool should:
   `collection/playlists/release-playlists`
 - treat empty configured definitions as authoritative empty playlists
 - publish configured release playlists from their exact current master paths in
-  replace mode only, after every non-empty source row resolves to Spotify
+  replace mode only. Require every row to resolve by default. With
+  `--allow-partial`, require all rows to be evaluated without operational errors,
+  report unmatched and ambiguous rows, and skip non-empty definitions with zero
+  matches
 - prepare manual overrides from the explicitly selected publisher section and
   verify the recorded source at its generated release and track position before
   an explicit apply

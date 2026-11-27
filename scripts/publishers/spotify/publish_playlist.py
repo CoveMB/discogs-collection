@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -560,9 +561,13 @@ def publish_spotify_playlists(
     invocation: SpotifyPublishInvocation | None = None,
     completed_album_attempts: set[SpotifyAlbumAttemptKey] | None = None,
     discogs_tracklists: Mapping[str, ReleaseTracklistLookup] | None = None,
+    *,
+    allow_partial: bool = False,
 ) -> SpotifyPublishSummary:
     if publisher_sync_mode not in PUBLISHER_SYNC_MODES:
         raise ValueError(f"publisher_sync_mode must be one of: {', '.join(PUBLISHER_SYNC_MODES)}")
+    if allow_partial and publisher_sync_mode != REPLACE_SYNC_MODE:
+        raise ValueError("partial publishing requires replace mode")
     if max_new_searches_per_run < 0:
         raise ValueError("max_new_searches_per_run must be non-negative")
     if playlist_selectors is not None and playlist_master_paths is not None:
@@ -603,6 +608,9 @@ def publish_spotify_playlists(
             match_cache = load_spotify_track_match_cache(match_cache_path)
             publish_state = load_spotify_publish_state(resolved_publish_state_cache_path)
             planned_write_uris_by_playlist: dict[str, tuple[str, ...]] = {}
+            partial_inventory: dict[str, tuple[SpotifyPlaylistItem, ...]] = {}
+            replacement_rows_by_proof_uri: dict[str, set[int]] = {}
+            conflicting_recording_uris: set[str] = set()
             tracks_by_master_path = {
                 playlist_master_path: read_playlist_tracks_from_master_paths(
                     (playlist_master_path,),
@@ -651,8 +659,13 @@ def publish_spotify_playlists(
                     playlist_name=playlist_name,
                     target_playlist_name=target_playlist_name,
                     apply=apply,
-                    info_log=info_log,
+                    info_log=None if allow_partial else info_log,
                 )
+                if allow_partial:
+                    partial_inventory[target_playlist_name] = existing_items
+                    context = replace(
+                        context, info_message=f"Playlist {target_playlist_name} has {len(existing_items)} existing tracks.",
+                    )
                 context_index = len(playlist_contexts)
                 playlist_contexts.append(context)
                 planned_write_uris: list[str] = []
@@ -1002,7 +1015,7 @@ def publish_spotify_playlists(
                                         final_item=final_playlist_item_from_decision(source_position, publish_decision),
                                     )
                                 )
-                            else:
+                            elif not allow_partial:
                                 planned_write_uris.append(publish_decision.spotify_uri)
                                 final_items.append(final_playlist_item_from_decision(len(final_items) + 1, publish_decision))
                         if review_query is None and match_source in {MATCH_SOURCE_ALBUM, MATCH_SOURCE_SEARCH}:
@@ -1013,10 +1026,33 @@ def publish_spotify_playlists(
                                 track, match_cache, aligned_album_positions=aligned_album_positions,
                             ) is not None:
                                 resume_progress_made = True
-                        if recording_conflict:
+                        current_conflict = recording_conflict
+                        if allow_partial and publish_decision.status == AMBIGUOUS and decision.status == MATCHED:
+                            current_conflict = publish_decision.reason
+                        if current_conflict:
                             _, record = track_match_cache_entry(track, match_cache)
                             if record is not None:
-                                record_cached_recording_conflict(record, recording_conflict)
+                                record_cached_recording_conflict(record, current_conflict)
+                        if allow_partial and publish_decision.status == WOULD_INCLUDE:
+                            proof_uris = {publish_decision.spotify_uri, *(candidate.uri for candidate in observed_candidates)}
+                            if conflicting_recording_uris.isdisjoint(proof_uris):
+                                for uri in proof_uris:
+                                    replacement_rows_by_proof_uri.setdefault(uri, set()).add(decision_index)
+                            else:
+                                decisions[decision_index] = hold_conflicting_replacement(publish_decision, match_cache)
+                        elif allow_partial and publish_decision.status == AMBIGUOUS:
+                            conflicted_uris: set[str] = set()
+                            if current_conflict:
+                                conflicted_uris = {decision.spotify_uri, *(candidate.uri for candidate in observed_candidates)}
+                            elif cached_match is not None and cached_match.has_recording_conflict:
+                                conflicted_uris = {candidate.uri for candidate in decision.review_candidates}
+                            conflicting_recording_uris.update(conflicted_uris)
+                            # A later conflict can invalidate a match already planned in another target.
+                            for uri in conflicted_uris:
+                                for earlier_index in replacement_rows_by_proof_uri.pop(uri, ()):
+                                    earlier = decisions[earlier_index]
+                                    if earlier.status == WOULD_INCLUDE:
+                                        decisions[earlier_index] = hold_conflicting_replacement(earlier, match_cache)
                         if len(decisions) % 25 == 0:
                             save_spotify_track_match_cache(match_cache_path, match_cache)
                         if publisher_sync_mode == APPEND_SYNC_MODE and apply and len(append_candidates) >= 100:
@@ -1155,16 +1191,26 @@ def publish_spotify_playlists(
                         searched_row_count=searched_row_count,
                         timestamp=timestamp,
                     )
-                else:
+                elif not allow_partial:
                     planned_write_uris_by_playlist[target_playlist_name] = tuple(planned_write_uris)
+
             save_spotify_track_match_cache(match_cache_path, match_cache)
             if apply and publisher_sync_mode == APPEND_SYNC_MODE:
                 save_spotify_publish_state(resolved_publish_state_cache_path, publish_state)
-            if apply and publisher_sync_mode == REPLACE_SYNC_MODE:
+            if publisher_sync_mode == REPLACE_SYNC_MODE and (apply or allow_partial):
                 try:
-                    validate_replace_apply_decisions(tuple(decisions))
+                    validate_replace_apply_decisions(decisions, allow_partial=allow_partial)
                 except ValueError as error:
                     replace_validation_error = error
+            run_status = "complete"
+            if replace_validation_error:
+                run_status = str(replace_validation_error)
+            elif allow_partial:
+                planned_write_uris_by_playlist, final_items = plan_partial_replacements(
+                    playlist_contexts, decisions, partial_inventory, info_log,
+                )
+                if any(decision.status in {AMBIGUOUS, UNMATCHED} for decision in decisions):
+                    run_status = "partial - unmatched or ambiguous source rows omitted"
             summary = write_publish_summary(
                 request_count=request_control.request_count if request_control is not None else None,
                 token_refresh_count=spotify_session.refresh_count if spotify_session is not None else None,
@@ -1178,7 +1224,7 @@ def publish_spotify_playlists(
                 cache_hit_count=cache_hit_count,
                 search_count=search_count,
                 searched_row_count=searched_row_count,
-                run_status=str(replace_validation_error) if replace_validation_error else "complete",
+                run_status=run_status,
                 run_state="complete" if invocation is None and not (apply and publisher_sync_mode == REPLACE_SYNC_MODE) else "processing",
                 resume_progress_made=resume_progress_made,
             )
@@ -1204,6 +1250,7 @@ def publish_spotify_playlists(
                     cache_hit_count=cache_hit_count,
                     search_count=search_count,
                     searched_row_count=searched_row_count,
+                    run_status=run_status,
                 )
                 summary = write_publish_summary(
                     request_count=request_control.request_count if request_control is not None else None,
@@ -1218,6 +1265,7 @@ def publish_spotify_playlists(
                     cache_hit_count=cache_hit_count,
                     search_count=search_count,
                     searched_row_count=searched_row_count,
+                    run_status=run_status,
                     run_state="complete",
                 )
             return summary
@@ -1653,25 +1701,12 @@ def append_plan_item_from_existing(
         for key in identity_keys
         if (previous := previous_final_items_by_identity.get(key)) is not None and previous.spotify_uri == item.uri
     ), None)
-    final_item = (
-        previous_final_item
-        or FinalPlaylistItem(
-            playlist_name=target_playlist_name,
-            position=0,
-            status="existing",
-            spotify_uri=item.uri,
-            track_name=item.name,
-            artist_names=item.artists,
-            album_name=item.album_name,
-            source_track=None,
-        )
-    )
     return AppendPlanItem(
         source_position=next(
             (source_positions_by_identity[key] for key in identity_keys if key in source_positions_by_identity),
             None,
         ),
-        final_item=final_item,
+        final_item=previous_final_item or final_playlist_item_from_existing(target_playlist_name, item),
     )
 
 
@@ -2025,23 +2060,91 @@ def publish_reason_with_original_mix_match_details(
 
 def validate_replace_apply_decisions(
     decisions: Sequence[PlaylistPublishDecision],
+    *,
+    allow_partial: bool = False,
 ) -> None:
-    blocking_decisions = [
-        decision
-        for decision in decisions
-        if decision.status in {AMBIGUOUS, UNMATCHED, ERROR}
-    ]
-    if not blocking_decisions:
+    permitted_statuses = {WOULD_INCLUDE, AMBIGUOUS, UNMATCHED} if allow_partial else {WOULD_INCLUDE}
+    blocking_counts = Counter(decision.status for decision in decisions if decision.status not in permitted_statuses)
+    if not blocking_counts:
         return
-    blocking_counts = ", ".join(
-        f"{status}={sum(1 for decision in blocking_decisions if decision.status == status)}"
-        for status in (ERROR, AMBIGUOUS, UNMATCHED)
-        if any(decision.status == status for decision in blocking_decisions)
-    )
+    counts = ", ".join(f"{status}={count}" for status, count in blocking_counts.items())
     raise ValueError(
         "replace mode aborted before writing because not every source row resolved "
-        f"to a publishable Spotify URI ({blocking_counts})"
+        f"to a publishable Spotify URI ({counts})"
     )
+
+
+def hold_conflicting_replacement(
+    decision: PlaylistPublishDecision,
+    match_cache: dict[str, dict[str, object]],
+) -> PlaylistPublishDecision:
+    reason = "pending review because another source row reported conflicting evidence for this recording"
+    _, record = track_match_cache_entry(decision.track, match_cache)
+    if record is not None:
+        record_cached_recording_conflict(record, reason)
+    review_candidates = decision.review_candidates or ((decision.candidate,) if decision.candidate else ())
+    return replace(decision, status=AMBIGUOUS, spotify_uri="", candidate=None, review_candidates=review_candidates, reason=reason)
+
+
+def plan_partial_replacements(
+    contexts: list[PlaylistPublishContext],
+    decisions: Sequence[PlaylistPublishDecision],
+    inventory: Mapping[str, tuple[SpotifyPlaylistItem, ...]],
+    info_log: InfoLog | None,
+) -> tuple[dict[str, tuple[str, ...]], list[FinalPlaylistItem]]:
+    by_target: dict[str, list[PlaylistPublishDecision]] = {}
+    for decision in decisions:
+        by_target.setdefault(decision.target_playlist_name, []).append(decision)
+    replacement_uris: dict[str, tuple[str, ...]] = {}
+    final_items: list[FinalPlaylistItem] = []
+    for index, context in enumerate(contexts):
+        target = context.target_playlist_name
+        source_rows = by_target.get(target, [])
+        matched_rows = [decision for decision in source_rows if decision.status == WOULD_INCLUDE]
+        existing_items = inventory[target]
+        if source_rows and not matched_rows:
+            planned_uris = None
+            final_items.extend(final_playlist_item_from_existing(target, item) for item in existing_items)
+        else:
+            planned_uris = tuple(decision.spotify_uri for decision in matched_rows)
+            replacement_uris[target] = planned_uris
+            final_items.extend(final_playlist_item_from_decision(0, decision) for decision in matched_rows)
+        context = partial_replacement_context(context, existing_items, source_rows, planned_uris)
+        contexts[index] = context
+        emit_info(info_log, context.info_message)
+    return replacement_uris, final_items
+
+
+def partial_replacement_context(
+    context: PlaylistPublishContext,
+    existing_items: Sequence[SpotifyPlaylistItem],
+    decisions: Sequence[PlaylistPublishDecision],
+    planned_uris: tuple[str, ...] | None,
+) -> PlaylistPublishContext:
+    counts = Counter(decision.status for decision in decisions)
+    message = (
+        f"Playlist {context.target_playlist_name} has {counts[WOULD_INCLUDE]} matched, "
+        f"{counts[UNMATCHED]} unmatched, {counts[AMBIGUOUS]} ambiguous and {counts[ERROR]} errored source rows."
+    )
+    if planned_uris is None:
+        return replace(context, info_message=(
+            f"{message} Skipping this target and keeping its {len(existing_items)} existing tracks."
+        ))
+    if not context.existed and not planned_uris:
+        return replace(context, info_message=f"{message} Skipping creation for the empty definition.")
+
+    remaining = Counter(planned_uris)
+    removed_items: list[SpotifyPlaylistItem] = []
+    for item in existing_items:
+        if remaining[item.uri]:
+            remaining[item.uri] -= 1
+        else:
+            removed_items.append(item)
+    action = "replace" if context.existed else "create"
+    message += f" Plan to {action} with {len(planned_uris)} tracks."
+    if context.existed:
+        message += f" The plan would remove {len(removed_items)} of {len(existing_items)} existing track occurrences."
+    return replace(context, info_message=message, removed_items=tuple(removed_items))
 
 
 def resolve_playlist_context(
@@ -2132,14 +2235,7 @@ def apply_playlist_writes(
             error.args = (message,)
             raise
         raise ValueError(message) from error
-    return PlaylistPublishContext(
-        playlist_name=context.playlist_name,
-        target_playlist_name=context.target_playlist_name,
-        playlist_id=playlist_id,
-        existed=context.existed,
-        current_item_count=context.current_item_count,
-        info_message=context.info_message,
-    )
+    return replace(context, playlist_id=playlist_id)
 
 
 def find_owned_private_spotify_playlist_by_name(
@@ -2394,6 +2490,18 @@ def publish_decision_identity_key(decision: PlaylistPublishDecision) -> str:
     )
 
 
+def final_playlist_item_from_existing(target_playlist_name: str, item: SpotifyPlaylistItem) -> FinalPlaylistItem:
+    return FinalPlaylistItem(
+        playlist_name=target_playlist_name,
+        position=0,
+        status="existing",
+        spotify_uri=item.uri,
+        track_name=item.name,
+        artist_names=item.artists,
+        album_name=item.album_name,
+    )
+
+
 def final_playlist_item_from_decision(position: int, decision: PlaylistPublishDecision) -> FinalPlaylistItem:
     candidate = decision.candidate
     return FinalPlaylistItem(
@@ -2490,6 +2598,7 @@ def apply_planned_playlist_writes(
     spotify_session: SpotifySession | None = None,
     invocation: SpotifyPublishInvocation | None = None,
     progress: ProgressReporter | None = None,
+    run_status: str = "complete",
 ) -> tuple[
     tuple[PlaylistPublishDecision, ...],
     tuple[FinalPlaylistItem, ...],
@@ -2501,7 +2610,9 @@ def apply_planned_playlist_writes(
     current_contexts = playlist_contexts
     current_playlists = tuple(spotify_playlists)
     for index, context in enumerate(current_contexts):
-        planned_write_uris = planned_write_uris_by_playlist.get(context.target_playlist_name, ())
+        planned_write_uris = planned_write_uris_by_playlist.get(context.target_playlist_name)
+        if planned_write_uris is None:
+            continue
         if progress and (context.playlist_id or planned_write_uris):
             progress.label = "Updating Spotify playlists"
             progress.update(len(current_decisions))
@@ -2536,6 +2647,7 @@ def apply_planned_playlist_writes(
             cache_hit_count=cache_hit_count,
             search_count=search_count,
             searched_row_count=searched_row_count,
+            run_status=run_status,
         )
     if progress:
         progress.label = "Reconciling Spotify playlists"
@@ -2785,6 +2897,8 @@ def run_spotify_publish_from_args(
     publisher_config: PublisherConfig | None = None,
     debug_log: DebugLog | None = None,
     spotify_client: SpotifyPlaylistPlanningClient | None = None,
+    *,
+    allow_partial: bool = False,
 ) -> SpotifyPublishSummary:
     continuous = getattr(args, "continuous", False)
     request_interval_seconds = validate_continuous_publisher_args(args)
@@ -2877,6 +2991,7 @@ def run_spotify_publish_from_args(
                 info_log=None if continuous else print,
                 refresh_match_cache=args.refresh_match_cache,
                 max_new_searches_per_run=args.max_new_searches_per_run,
+                allow_partial=allow_partial,
             )
         except SpotifyRateLimitPauseError as pause:
             if invocation is None or request_control is None:

@@ -362,6 +362,9 @@ def run_configured_release_playlist(
                 max_rows_per_split=args.max_rows,
             )
         publisher_config = load_or_create_publisher_config(args.publisher_config)
+        publisher = args.publisher or publisher_config.default_publisher
+        if args.allow_partial and publisher != SPOTIFY_PUBLISHER:
+            raise ValueError("--allow-partial requires Spotify publishing")
         validate_configured_publisher_targets(config, publisher_config)
     except Exception as error:
         try:
@@ -375,7 +378,6 @@ def run_configured_release_playlist(
             pass
         raise
 
-    publisher = args.publisher or publisher_config.default_publisher
     has_release_ids = any(
         definition.release_ids for definition in config.release_playlists
     )
@@ -420,6 +422,7 @@ def run_configured_release_playlist(
         playlist_names_by_master_path=local_summary.playlist_names_by_master_path,
         publisher_config=configured_release_publisher_config(publisher_config),
         debug_log=debug_log,
+        allow_partial=args.allow_partial,
     )
     return replace(summary, publisher_summary=publisher_summary)
 
@@ -632,6 +635,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--publisher-sync-mode", choices=spotify_publisher.PUBLISHER_SYNC_MODES, help="Publisher sync mode. Ad-hoc mode defaults to append; configured mode requires replace.")
     parser.add_argument("--refresh-match-cache", action="store_true", help="Recheck every generated playlist row with Spotify and update the local track match cache.")
     parser.add_argument("--publishing-dry-run", action="store_true", help="Preview Spotify playlist changes without creating or updating playlists.")
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="With --from-config and Spotify, allow replacement with matched rows and report unresolved rows.",
+    )
     parser.add_argument("--debug-log", type=Path, help="Write sanitized release playlist debug logs to this path.")
     parser.add_argument("--no-progress", action="store_false", dest="progress", help="Disable terminal progress output.")
     args = parser.parse_args(argv)
@@ -656,6 +664,8 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--max-new-searches-per-run must be non-negative")
     if args.max_rows is not None and args.max_rows < 1:
         parser.error("--max-rows must be at least 1")
+    if args.allow_partial and not args.from_config:
+        parser.error("--allow-partial requires --from-config")
     if args.from_config:
         if args.name or args.release_ids or args.release_ids_file is not None:
             parser.error("--from-config cannot be combined with ad-hoc playlist inputs")

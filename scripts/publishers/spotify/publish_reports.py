@@ -137,6 +137,15 @@ def write_publish_report(path: Path, summary: SpotifyPublishSummary) -> None:
             [f"- {context.info_message}" for context in summary.playlist_contexts] or ["- None"],
         )
     )
+    removed_items = [
+        "- " + " | ".join(display_report_value(value) for value in (
+            context.target_playlist_name, item.name, ", ".join(item.artists), item.uri,
+        ))
+        for context in summary.playlist_contexts
+        for item in context.removed_items
+    ]
+    if removed_items:
+        lines.extend(format_report_section("Existing tracks omitted by the replacement plan", removed_items))
     lines.extend(format_report_section("Already-present tracks", format_publish_decisions(summary.decisions, {ALREADY_PRESENT})))
     lines.extend(format_report_section("Tracks that would be added", format_publish_decisions(summary.decisions, {WOULD_ADD})))
     lines.extend(format_report_section("Tracks added", format_publish_decisions(summary.decisions, {ADDED})))

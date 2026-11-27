@@ -2542,6 +2542,69 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
                             self.assertEqual(len(client.searches), 2 if source == "search" else 0)
                             self.assertIn("| South Bridge | ambiguous | no Spotify URI", report.read_text(encoding="utf-8"))
 
+    def test_allow_partial_holds_earlier_selections_with_conflicting_recording_evidence(self):
+        north = playlist_row("111", "Tidal Signals", "North Bridge", "Harbour Lines")
+        south = playlist_row("222", "Tidal Signals", "South Bridge", "Harbour Lines")
+        safe = playlist_row("333", "Blue Album", "Open Sea", "Blue Artist")
+        north_copies, south_copies = overlapping_edition_candidates(north, south)
+        safe_candidate = matching_candidate(safe)
+        later_search = 'track:"South Bridge" artist:"Harbour Lines" album:"Tidal Signals"'
+        for earlier_candidates in (north_copies, (replace(north_copies[1], album_id="", isrc=""),)):
+            with self.subTest(earlier_candidates=earlier_candidates), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                masters = tuple(directory / name / f"{name}.csv" for name in ("First", "Later"))
+                write_playlist_master(masters[0], [north, safe])
+                write_playlist_master(masters[1], [south])
+                cache = directory / "matches.json"
+                client = PublishingSpotifyClient({
+                    'track:"North Bridge" artist:"Harbour Lines" album:"Tidal Signals"': earlier_candidates,
+                    'track:"Open Sea" artist:"Blue Artist" album:"Blue Album"': (safe_candidate,),
+                    later_search: south_copies,
+                })
+                for apply in (False, True):
+                    result = publish_spotify_playlists(
+                        directory, directory / "report.txt", client, "synthetic-token",
+                        match_cache_path=cache, playlist_master_paths=masters,
+                        publisher_sync_mode="replace", allow_partial=True, apply=apply,
+                    )
+                    self.assertEqual([row.status for row in result.decisions],
+                                     ["ambiguous", "included" if apply else "would_include", "ambiguous"])
+                    self.assertEqual([item.spotify_uri for item in result.final_items], [safe_candidate.uri])
+                    self.assertEqual(len(client.searches), 3 if not apply else 0)
+                    self.assertEqual(client.replace_calls,
+                                     [("created-1", (safe_candidate.uri,))] if apply else [])
+                    client.searches.clear()
+
+                client.replace_calls.clear()
+                earlier_only = publish_spotify_playlists(
+                    directory, directory / "report.txt", client, "synthetic-token",
+                    match_cache_path=cache, playlist_master_paths=masters[:1],
+                    publisher_sync_mode="replace", allow_partial=True,
+                )
+                self.assertEqual([row.status for row in earlier_only.decisions], ["ambiguous", "included"])
+                self.assertEqual(client.searches, [])
+                self.assertEqual(client.replace_calls, [("created-1", (safe_candidate.uri,))])
+
+                final_master = directory / "Not Assessed" / "Not Assessed.csv"
+                write_playlist_master(final_master, [playlist_row("444", "Grey Album", "Last Row", "Grey Artist")])
+                cache = directory / "capped-matches.json"
+                client.searches.clear()
+                client.replace_calls.clear()
+                capped = publish_spotify_playlists(
+                    directory, directory / "report.txt", client, "synthetic-token",
+                    match_cache_path=cache, playlist_master_paths=(*masters, final_master),
+                    publisher_sync_mode="replace", allow_partial=True, max_new_searches_per_run=3,
+                )
+                self.assertEqual((capped.track_count, capped.stop_reason), (3, "search_budget"))
+                self.assertEqual(client.replace_calls, [])
+                earlier_only = publish_spotify_playlists(
+                    directory, directory / "report.txt", client, "synthetic-token",
+                    match_cache_path=cache, playlist_master_paths=masters[:1],
+                    publisher_sync_mode="replace", allow_partial=True,
+                )
+                self.assertEqual([row.status for row in earlier_only.decisions], ["ambiguous", "included"])
+                self.assertEqual(client.replace_calls, [("created-1", (safe_candidate.uri,))])
+
     def test_publish_edition_tie_keeps_alternate_evidence_out_of_other_playlist_inventory(self):
         row = playlist_row("111", "Tidal Signals", "North Bridge", "Harbour Lines")
         first, alternate = recording_edition_candidates(row)
@@ -8298,33 +8361,57 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
                 },
             )
 
-            with self.assertRaisesRegex(ValueError, "replace mode aborted before writing"):
-                publish_spotify_playlists(
-                    playlist_output_directory=playlist_directory,
-                    report_path=report_path,
-                    spotify_client=client,
-                    access_token="access-token",
-                    match_cache_path=match_cache_path,
-                    publisher_config=PublisherConfig(
-                        default_publisher="spotify",
-                        playlist_prefix="Discogs - ",
-                        playlist_suffix="",
-                    ),
-                    publisher_sync_mode="replace",
-                    max_new_searches_per_run=0,
+            for allow_partial, apply in ((False, True), (True, True), (True, False)):
+                with (self.subTest(allow_partial=allow_partial, apply=apply),
+                      self.assertRaisesRegex(ValueError, "replace mode aborted before writing")):
+                    publish_spotify_playlists(
+                        playlist_output_directory=playlist_directory,
+                        report_path=report_path,
+                        spotify_client=client,
+                        access_token="access-token",
+                        match_cache_path=match_cache_path,
+                        publisher_config=PublisherConfig(
+                            default_publisher="spotify",
+                            playlist_prefix="Discogs - ",
+                            playlist_suffix="",
+                        ),
+                        publisher_sync_mode="replace",
+                        max_new_searches_per_run=0,
+                        allow_partial=allow_partial,
+                        apply=apply,
+                    )
+                report_text = report_path.read_text(encoding="utf-8")
+                self.assertIn(
+                    "Run status: replace mode aborted before writing because not every source row resolved "
+                    "to a publishable Spotify URI (error=1)",
+                    report_text,
                 )
-            report_text = report_path.read_text(encoding="utf-8")
+                self.assertNotIn("Run status: complete", report_text)
+                self.assertIn("Search errors: 1", report_text)
+                self.assertIn("Discogs - House | 222 | 1 | Beta Artist | Beta One | error | no Spotify URI", report_text)
 
         self.assertEqual(client.replace_calls, [])
         self.assertEqual(client.add_calls, [])
-        self.assertIn(
-            "Run status: replace mode aborted before writing because not every source row resolved "
-            "to a publishable Spotify URI (error=1)",
-            report_text,
-        )
-        self.assertNotIn("Run status: complete", report_text)
-        self.assertIn("Search errors: 1", report_text)
-        self.assertIn("Discogs - House | 222 | 1 | Beta Artist | Beta One | error | no Spotify URI", report_text)
+        self.assertEqual(client.created_playlists, [])
+
+    def test_allow_partial_search_budget_stops_before_writing_any_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            masters = tuple(directory / name / f"{name}.csv" for name in ("Ready", "Later"))
+            first = playlist_row("111", "Alpha Album", "Alpha One", "Alpha Artist")
+            write_playlist_master(masters[0], [first])
+            write_playlist_master(masters[1], [playlist_row("222", "Beta Album", "Beta One", "Beta Artist")])
+            client = PublishingSpotifyClient({
+                'track:"Alpha One" artist:"Alpha Artist" album:"Alpha Album"': (matching_candidate(first),),
+            })
+            summary = publish_spotify_playlists(
+                directory, directory / "report.txt", client, "access-token",
+                match_cache_path=directory / "matches.json", playlist_master_paths=masters,
+                publisher_sync_mode="replace", allow_partial=True, max_new_searches_per_run=1,
+            )
+            self.assertEqual((summary.track_count, summary.would_include_count, summary.stop_reason),
+                             (1, 1, "search_budget"))
+            self.assertEqual((client.created_playlists, client.replace_calls, client.add_calls), ([], [], []))
 
     def test_publish_replace_apply_reports_partial_write_if_remainder_append_fails(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

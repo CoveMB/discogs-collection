@@ -1188,12 +1188,25 @@ Removing a definition never selects, changes, clears, or deletes its Spotify
 playlist.
 
 When Spotify is selected, configured playlists always publish in `replace`
-mode. The Spotify playlist becomes an exact mirror of the current generated
-master and track order, so releases removed from the definition and tracks added
-manually in Spotify are removed on a successful run. Before any configured
-replace write, every non-empty source row must resolve to a publishable Spotify
-URI; an ambiguous, unmatched, or errored row aborts all configured replace
-writes.
+mode. By default, every source row must resolve before the publisher can make
+any Spotify changes. The replacement follows the generated master's track order
+and removes existing tracks absent from the replacement.
+
+For a one-time partial publish, pass `--allow-partial` to the configured release
+playlist command. After evaluating every source row, the publisher replaces each
+eligible Spotify playlist with its matched tracks in source order and reports
+the unmatched and ambiguous rows. Conflicting recording evidence can also hold
+a previously matched row for review. Each local master still contains every
+source row. A non-empty definition with zero matches is skipped. Search errors,
+authentication failures, and reaching the search limit before all rows are
+evaluated block all replacement writes.
+
+Preview the counts and any existing Spotify tracks that would be removed before
+applying a partial replacement.
+
+```bash
+python3 scripts/discogs_release_playlist.py --from-config --publisher spotify --allow-partial --publishing-dry-run
+```
 
 An empty release-ID array is authoritative. It writes a header-only local
 master, creates no split CSV, and clears an existing Spotify playlist when
@@ -2191,6 +2204,10 @@ release_ids
 
 --publishing-dry-run
     Preview Spotify playlist changes without creating or updating playlists.
+
+--allow-partial
+    With --from-config and Spotify publishing, replace eligible playlists with
+    matched tracks and report unmatched and ambiguous rows after a complete pass.
 
 --publisher-sync-mode append|replace
     Spotify sync mode. Ad-hoc mode defaults to append. Configured mode requires

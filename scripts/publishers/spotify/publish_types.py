@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from discogs_tracklists import ReleaseTracklistLookup
+    from publishers.spotify.client import SpotifyPlaylistItem
     from publishers.spotify.request_control import SpotifyRequestControl
     from publishers.spotify.session import SpotifySession
 
@@ -78,6 +79,7 @@ class PlaylistPublishContext:
     existed: bool
     current_item_count: int
     info_message: str
+    removed_items: tuple[SpotifyPlaylistItem, ...] = ()
 
 
 @dataclass(frozen=True)
