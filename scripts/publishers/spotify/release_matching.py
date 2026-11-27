@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import re
+
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Protocol, runtime_checkable
 
+from discogs_tracklists import ReleaseTracklistLookup
+
 from publishers.spotify.matching import (
+    CATALOGUE_SPELLING_STRATEGY,
+    catalogue_spelling_strategy,
+    complete_credit_keys,
+    has_legacy_loss,
+    normalized_nonempty_music_values_match,
     MATCHED,
     PlaylistTrack,
     SpotifyTrackCandidate,
@@ -22,7 +31,10 @@ from publishers.spotify.matching import (
     quote_search_filter_value,
     split_source_artist_names,
     spotify_track_uri_is_structurally_valid,
+    source_credit_names,
+    trailing_performer_credit,
 )
+from publishers.spotify.spelling import conjunction_difference, spelling_difference
 
 
 MINIMUM_RELEASE_TRACKS_FOR_ALBUM_LOOKUP = 3
@@ -98,6 +110,7 @@ class SpotifyReleaseAlbumMatchResult:
     diagnostic: str = ""
     validation_diagnostics: tuple[SpotifyAlbumValidationDiagnostic, ...] = ()
     used_fallback_track_candidates: bool = False
+    spelling_positions: tuple[tuple[PlaylistTrack, SpotifyTrackCandidate], ...] = ()
 
 
 @runtime_checkable
@@ -142,6 +155,7 @@ def resolve_release_with_album(
     access_token: str,
     search_limit: int = 10,
     fallback_track_candidates: Sequence[SpotifyTrackCandidate] = (),
+    source_tracklist: ReleaseTracklistLookup | None = None,
 ) -> SpotifyReleaseAlbumMatchResult:
     source_tracks = tuple(source_tracks)
     if not release_is_eligible_for_album_lookup(source_tracks):
@@ -266,13 +280,84 @@ def resolve_release_with_album(
         decisions = mark_track_candidate_album_decisions(
             decisions, strict_album_recovery=checking_cached_after_direct_rejection,
         )
+    spelling_positions = ()
+    if source_tracklist is not None and complete_source_tracklist_matches(source_tracks, source_tracklist):
+        spelling_positions = tuple(
+            position
+            for assessment in assessments
+            for position in independently_aligned_spelling_positions(source_tracks, assessment)
+        )
     return SpotifyReleaseAlbumMatchResult(
         decisions=decisions,
         search_count=1,
         diagnostic=diagnostic,
         validation_diagnostics=validation_diagnostics,
         used_fallback_track_candidates=candidates_came_from_track_search,
+        spelling_positions=spelling_positions,
     )
+
+
+def complete_source_tracklist_matches(
+    tracks: Sequence[PlaylistTrack], tracklist: ReleaseTracklistLookup,
+) -> bool:
+    positions = tuple(track.position for track in tracklist.tracks)
+    return (
+        not tracklist.notes and len(tracks) == len(positions) and all(positions)
+        and len(set(positions)) == len(positions)
+        and all(
+            row.release_id == tracklist.release_id and row.track_number == str(index)
+            and all(
+                normalize_recording_evidence_text(left) == normalize_recording_evidence_text(right)
+                for left, right in ((row.track_name, source.title), (row.artist_name, source.artist_name),
+                                    (row.album_name, tracklist.album_name))
+            )
+            for index, (row, source) in enumerate(zip(tracks, tracklist.tracks), start=1)
+        )
+    )
+
+
+def independently_aligned_spelling_positions(
+    source_tracks: Sequence[PlaylistTrack], assessment: _AlbumAssessment,
+) -> tuple[tuple[PlaylistTrack, SpotifyTrackCandidate], ...]:
+    album, spotify_tracks = assessment.album, assessment.spotify_tracks
+    positions = tuple((track.disc_number, track.track_number) for track in spotify_tracks)
+    if (
+        len(source_tracks) != len(spotify_tracks) or len(spotify_tracks) != album.total_tracks
+        or any(disc < 1 or number < 1 for disc, number in positions)
+        or positions != tuple(sorted(set(positions)))
+        or not normalized_nonempty_music_values_match(source_tracks[0].album_name, album.name)
+    ):
+        return ()
+
+    source_titles = tuple(normalize_recording_evidence_text(track.track_name) for track in source_tracks)
+    spotify_titles = tuple(normalize_recording_evidence_text(track.name) for track in spotify_tracks)
+    source_counts, spotify_counts = Counter(source_titles), Counter(spotify_titles)
+    source_credits = tuple(complete_credit_keys(source_credit_names(track.artist_name)) for track in source_tracks)
+    spotify_credits = tuple(complete_credit_keys(track.artists) for track in spotify_tracks)
+    anchor_indices = [
+        index for index, title in enumerate(source_titles)
+        if title == spotify_titles[index] and source_counts[title] == spotify_counts[title] == 1
+        and not re.fullmatch(r"(?:intro|outro|interlude|untitled|track)(?:[\s.#_-]*\d+)?", title)
+        and any(character.isalpha() for character in title)
+        and spotify_tracks[index].artist_credits_complete and spotify_album_track_is_usable(spotify_tracks[index])
+    ]
+    aligned: list[tuple[PlaylistTrack, SpotifyTrackCandidate]] = []
+    for index, (row, track) in enumerate(zip(source_tracks, spotify_tracks)):
+        if not track.artist_credits_complete or not spotify_album_track_is_usable(track):
+            continue
+        candidate = SpotifyTrackCandidate(track.uri, track.name, track.artists, album.name, album.album_id)
+        if catalogue_spelling_strategy(row.track_name, source_credit_names(row.artist_name), candidate) != CATALOGUE_SPELLING_STRATEGY:
+            continue
+        source, spotify = source_credits[index], spotify_credits[index]
+        if sum(
+            offset != index and bool(source_credits[offset]) and (
+                source_credits[offset] == spotify_credits[offset] if source == spotify
+                else (source_credits[offset], spotify_credits[offset]) == (source, spotify)
+            )
+            for offset in anchor_indices
+        ) >= 2:
+            aligned.append((row, candidate))
+    return tuple(aligned)
 
 
 def _has_complete_ordered_recording_evidence(
@@ -626,6 +711,17 @@ def positional_pair_is_safe(
     return (
         spotify_album_track_is_usable(spotify_track)
         and full_artist_sets_are_equal(source_track.artist_name, spotify_track.artists)
+        and (
+            normalized_titles_are_equal(source_track.track_name, spotify_track.name)
+            or (
+                not any(has_legacy_loss(title) for title in (source_track.track_name, spotify_track.name))
+                and not conjunction_difference(source_track.track_name, spotify_track.name)
+                and not spelling_difference(source_track.track_name, spotify_track.name)
+                and not any(":" in title or trailing_performer_credit(title) for title in (
+                    source_track.track_name, spotify_track.name,
+                ))
+            )
+        )
     )
 
 

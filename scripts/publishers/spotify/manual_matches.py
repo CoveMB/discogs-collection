@@ -21,8 +21,10 @@ from publishers.spotify.match_cache import (  # noqa: E402
     compare_manual_source,
     load_spotify_track_match_cache,
     save_spotify_track_match_cache,
+    source_track_binding,
     spotify_track_match_key,
     spotify_url_from_uri,
+    track_match_cache_entry,
     utc_timestamp,
 )
 from publishers.spotify.matching import (  # noqa: E402
@@ -126,8 +128,10 @@ def import_manual_match_overrides(
         }
         if override.spotify_album_id:
             record["spotify_album_id"] = override.spotify_album_id
-        match_cache[spotify_track_match_key(track)] = record
-        clear_manual_collision_cache_entry(track, match_cache)
+        cache_key, _ = track_match_cache_entry(track, match_cache)
+        match_cache[cache_key] = record
+        if cache_key == spotify_track_match_key(track):
+            clear_manual_collision_cache_entry(track, match_cache)
     save_spotify_track_match_cache(match_cache_path, match_cache)
     return ManualMatchImportSummary(
         planned_count=len(overrides),
@@ -161,7 +165,7 @@ def load_manual_match_overrides(
         raise ValueError("Spotify manual match overrides matches must be a list")
 
     overrides: list[ManualMatchOverride] = []
-    seen_keys: set[str] = set()
+    seen_bindings: set[tuple[str, ...]] = set()
     for index, raw_match in enumerate(raw_matches, start=1):
         if not isinstance(raw_match, Mapping):
             raise ValueError(f"Spotify manual match override {index} must be a JSON object")
@@ -201,11 +205,12 @@ def load_manual_match_overrides(
             raise ValueError(
                 f"Spotify manual match override {index} has conflicting generated playlist rows for its cache key"
             )
-        if source_key in seen_keys:
+        binding = source_track_binding(source_track)
+        if binding in seen_bindings:
             raise ValueError(
                 f"Spotify manual match override {index} duplicates source track {source_key}"
             )
-        seen_keys.add(source_key)
+        seen_bindings.add(binding)
 
         spotify_uri = required_text(raw_match, "spotify_uri", index)
         if not spotify_track_uri_is_structurally_valid(spotify_uri):
@@ -272,15 +277,20 @@ def validate_existing_matches(
         return
     for override in overrides:
         source_key = spotify_track_match_key(override.source_track)
-        existing_record = match_cache.get(source_key)
-        if existing_record is None:
-            continue
-        existing_status = clean_cell(existing_record.get("match_status"))
-        if existing_status == "manual" and cached_manual_source_conflicts(override.source_track, existing_record):
+        primary = match_cache.get(source_key)
+        _, existing_record = track_match_cache_entry(override.source_track, match_cache)
+        if (
+            primary is not None and primary.get("match_status") == "manual"
+            and cached_manual_source_conflicts(override.source_track, primary)
+            and (existing_record is None or existing_record is primary or existing_record.get("match_status") != "manual")
+        ):
             raise ValueError(
                 f"{source_key} already has a manual Spotify match for a different source track; "
                 "use --replace-existing to bind it to this source"
             )
+        if existing_record is None:
+            continue
+        existing_status = clean_cell(existing_record.get("match_status"))
         existing_uri = clean_cell(existing_record.get("spotify_uri"))
         if existing_status in {"matched", "manual"} and existing_uri and existing_uri != override.spotify_uri:
             raise ValueError(

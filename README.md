@@ -650,9 +650,8 @@ the same structured query without the album, individual artist names from safe
 comma-separated artist lists, plain `artist title` text, and the existing
 `Spotify Search Query` value. The matcher treats Unicode punctuation and symbols
 as token separators before comparing track, artist, and album text, so curly
-apostrophes and long dashes behave like their ASCII forms. This normalization
-still requires all words to match. Only the explicit title fallbacks below may
-remove or add text.
+apostrophes and long dashes behave like their ASCII forms. It preserves letters
+and marks across writing systems and recognizes equivalent Unicode encodings.
 
 When track search ties at the track, artist, and album tier, the publisher
 checks every observation of the tied URIs. Each must match the full Discogs
@@ -663,7 +662,10 @@ ones Spotify marks playable, and breaks any remaining tie by URI. Missing
 playability leaves market availability unknown. Incomplete or conflicting
 recording evidence leaves the tie in review. Before applying a newly resolved
 edition tie, independently verify that the Spotify recording matches the track
-on the Discogs release.
+on the Discogs release. When strict title and full artist credits tie across
+different albums, the publisher checks all observed competitors before
+choosing a playable copy with a shared ISRC. It prefers the source album
+when available and uses the Spotify URI to break a remaining tie.
 
 A separate letter-number spacing rule can match titles such
 as `Chroma001 Helium` and `CHROMA 001 HELIUM`. The albums must also match under
@@ -699,11 +701,42 @@ the observed `Orginal Mix` spelling. This rule requires an exact base title,
 the same complete artist set, the same nonempty album name, and one unique
 candidate. Other version labels are not removed by this rule.
 
+Spotify can repeat a performer's name in a title. For example, if Discogs
+credits North and Sol on `Night Ferry`, Spotify's `Night Ferry (with Sol)`
+or `Night Ferry featuring Sol` can match when Spotify lists both artists
+separately. The publisher compares
+the full title and exported credits, preserving accents, punctuation and
+version labels. `Night Ferry (Live) (with Sol)` therefore requires
+`Night Ferry (Live)` on Discogs. The Discogs export flattens credits into
+one field, so a comma inside a band name can look like an artist separator.
+
+After the ordinary searches complete, one playable copy with complete
+metadata can match on any album. With multiple copies, Spotify must mark
+each one playable, supply the same recording code (ISRC) on distinct albums,
+and identify exactly one copy on the source album. That album can also end
+in the same repeated credit. Otherwise the competing copies stay in review.
+The report shows the selected Spotify title. Append uses its usual duplicate
+checks with the selected URI.
+
+The publisher can recognize a composer prefix such as `A. Reed: ` on the
+source album when the remaining title, the composer label and the source
+performers agree. For a title with `and` or `&`, it checks the surrounding text
+and full credits. A short spelling difference in an artist or title, such as
+an omitted accent, needs stronger evidence. The publisher checks the track's
+position on a complete release, using two other matching titles and
+corresponding credits. The recording review command can verify spelling
+differences when a complete release is unavailable.
+
+After ordinary searches miss, the publisher can check up to three pages of a
+plain song-title search. It can choose a playable copy with the exact title and
+all exported artist credits, including a copy on another album. Incomplete
+coverage and competing recordings keep a candidate in review.
+
 Rows that still have no match after the search ladder get one tightly
 constrained typo check. The source and Spotify album must match, and their
 album names must be nonempty. Their normalized artist sets must also be nonempty
 and contain the same names. The titles must have the same number of words with
-exactly one differing word of at least five characters. A one-edit spelling difference is
+exactly one differing ASCII word of at least five characters. A one-edit spelling difference is
 allowed. Titles of at least 20 characters may differ by up to three edits when
 those edits affect no more than 10 percent of the normalized title. Version
 words such as `mix`, `remix`, `edit`, `live`, and `dub` cannot be the differing
@@ -741,8 +774,10 @@ Later runs reuse those decisions and completed review queries. Searches that
 fail temporarily can be retried. Typo-derived matches, position-derived album
 matches, letter-number spacing matches, Spotify Original annotation matches, albums
 recovered from cached track candidates, version substitutes, and resolved
-edition ties are version-sensitive.
-A matcher update can recheck them without invalidating ordinary exact matches.
+edition ties, spelling recovery and credit rules are version-sensitive. The first
+run after this update can spend its search budget rechecking older misses,
+ambiguities and matches that depended on older text comparison. Valid cached
+matches remain reusable, and colliding source rows can retain separate decisions.
 Album cache records keep the Spotify album ID and the match strategy for audit.
 For a resolved edition tie, the cache keeps the chosen URI and every proven
 copy. The publisher checks the current matcher version and the source title,
@@ -836,9 +871,10 @@ python3 scripts/publishers/spotify/review_track_matches.py \
   --proposals ./spotify-recording-proposals.json
 ```
 
-This works for saved ambiguous rows with competing candidates, including tracks
-with one artist spelling, and for previously unmatched rows where the spelling
-search finds a tie. A single new suggestion stays in the stdout report.
+This works for saved ties and individual candidates, including those with
+unchanged artist credits or a supported spelling variation. When MusicBrainz
+has no link to the pressing, the review can report missing Spotify metadata
+from up to ten known competitors on different albums.
 
 The command looks up the exact Discogs pressing in MusicBrainz. It checks the
 links in both directions, the barcode and label/catalogue pair, and the ordered

@@ -51,6 +51,136 @@ def source_track(
 
 
 class SpotifyMatchingTests(unittest.TestCase):
+    def test_other_aligned_edition_cannot_disappear_when_the_uri_has_conflicting_metadata(self):
+        track = source_track(track_name="Rivière", artist_name="North", album_name="Evening")
+        first = SpotifyTrackCandidate(
+            "spotify:track:first", "Riviere", ("North",), "Evening", "edition-a", "USABC2400001", True,
+        )
+        second = replace(first, uri="spotify:track:second", album_id="edition-b")
+        contradicted = replace(second, name="Another Song", isrc="USABC2400002")
+        result = choose_best_track_match(track, (first, contradicted), spelling_positions=(first, second))
+        self.assertEqual((result.status, result.spotify_uri), (AMBIGUOUS, ""))
+
+    def test_composer_prefix_requires_full_label_credits_album_and_unique_playable_candidate(self):
+        track = source_track(track_name="Op. 12 / II. Allegro", artist_name="City Players", album_name="Works (Volume I)")
+        candidate = SpotifyTrackCandidate(
+            "spotify:track:work", "A. Reed: Op. 12/II. Allegro", ("Ada Reed", "City Players"),
+            "Works / Volume I", "edition", "USABC2400001", True,
+        )
+        self.assertEqual(choose_best_track_match(track, (candidate,)).spotify_uri, candidate.uri)
+        reversed_label = replace(candidate, name="Reed, A: Op. 12/II. Allegro")
+        self.assertEqual(choose_best_track_match(track, (reversed_label,)).spotify_uri, candidate.uri)
+        for other in (
+            replace(candidate, name="T. Reed: Op. 12/II. Allegro"),
+            replace(candidate, name="Reed, T: Op. 12/II. Allegro"),
+            replace(candidate, name="Reed: Op. 12/III. Allegro"),
+            replace(candidate, name="Reed: Op. 12/II. Allegro (Arranged)"),
+            replace(candidate, artists=("Ada Reed",)),
+            replace(candidate, album_name="Compilation"),
+            replace(candidate, is_playable=None),
+        ):
+            with self.subTest(other=other):
+                self.assertNotEqual(choose_best_track_match(track, (other,)).status, MATCHED)
+        rival = replace(candidate, uri="spotify:track:rival", name="Unknown: Op. 12/II. Allegro")
+        self.assertEqual(choose_best_track_match(track, (candidate, rival)).status, AMBIGUOUS)
+
+    def test_featuring_requires_all_separately_credited_performers(self):
+        track = source_track(track_name="Evening", artist_name="North, Sol", album_name="Source")
+        copy = SpotifyTrackCandidate(
+            "spotify:track:copy", "Evening featuring Sol", ("Sol", "North"), "Other", "edition", is_playable=True,
+        )
+        self.assertEqual(choose_best_track_match(track, (copy,)).spotify_uri, copy.uri)
+        for other in (replace(copy, artists=("North",)), replace(copy, name="Evening featuring Sol featuring Sol")):
+            self.assertNotEqual(choose_best_track_match(track, (other,)).status, MATCHED)
+
+    def test_full_title_conjunction_with_exact_credits_and_playability(self):
+        track = source_track(track_name="Night and Day", artist_name="North", album_name="Source")
+        copy = SpotifyTrackCandidate(
+            "spotify:track:copy", "Night & Day", ("North",), "Other", "edition", is_playable=True,
+        )
+        self.assertEqual(choose_best_track_match(track, (copy,)).spotify_uri, copy.uri)
+        for other in (replace(copy, artists=("North", "South")), replace(copy, name="Night&Day"),
+                      replace(copy, name="Night & Day (Live)"), replace(copy, is_playable=False)):
+            self.assertNotEqual(choose_best_track_match(track, (other,)).status, MATCHED)
+
+    def test_spelling_candidates_must_be_explainable_before_requiring_source_proof(self):
+        for left, right, candidate in (
+            ("Mavi Işık", "Mavi İşik", True), ("Crème", "Creme", True), ("Άνοιξη", "Ανοιξη", True),
+            ("Алёна", "Алена", True), ("عَلَم", "علم", True), ("שָׁלוֹם", "שׁלום", True),
+            ("año 東京", "ano 東京", True), ("عَلَم", "عِلْم", False), ("أمل", "امل", False),
+            ("שׁם", "שׂם", False), ("año 東京", "ano 京都", False), ("が", "か", False),
+            ("Côte", "Côté", True), ("Côte", "Cóte", False), ("Mira Α", "Mira А", False),
+        ):
+            with self.subTest(left=left, right=right):
+                track = source_track(track_name=left, artist_name="North", album_name="Evening")
+                hit = SpotifyTrackCandidate(
+                    "spotify:track:copy", right, ("North",), "Evening", "edition", is_playable=True,
+                )
+                result = choose_best_track_match(track, (hit,))
+                self.assertEqual(result.status, AMBIGUOUS if candidate else UNMATCHED)
+
+    def test_exact_matching_preserves_letters_and_marks_in_all_scripts(self):
+        artist = "Example Artist"
+        for source, spotify, matches in (
+            ("東京", "京都", False),
+            ("Signal 東", "Signal 西", False),
+            ("Север", "север", True),
+            ("Κύμα", "Κυ\u0301μα", True),
+            ("か", "が", False),
+            ("Café", "Cafe", False),
+            ("Maße", "Masse", False),
+            ("♫", "★", False),
+        ):
+            with self.subTest(source=source, spotify=spotify):
+                track = source_track(track_name=source, artist_name=artist, album_name="Evening")
+                candidate = SpotifyTrackCandidate("spotify:track:copy", spotify, (artist,), "Evening")
+                self.assertEqual(choose_best_track_match(track, (candidate,)).status == MATCHED, matches)
+
+    def test_repeated_performer_credit_requires_consistent_playable_copies(self):
+        track = source_track(track_name="Rivière (Live)", artist_name="North, Sol", album_name="Evening")
+        preferred = SpotifyTrackCandidate(
+            "spotify:track:one", "Rivière (Live) (with Sol)", ("Sol", "North"),
+            "Evening (with Sol)", "album-one", "USABC2400001", True,
+        )
+        other = replace(preferred, uri="spotify:track:two", album_name="Sampler", album_id="album-two")
+        for candidates, winner in (
+            ((replace(other, isrc=""),), other.uri),
+            ((preferred, other), preferred.uri), ((other, preferred, other), preferred.uri),
+        ):
+            with self.subTest(candidates=candidates):
+                decision = choose_best_track_match(track, candidates)
+                self.assertEqual((decision.status, decision.spotify_uri), (MATCHED, winner))
+                self.assertEqual(decision.match_strategy, "repeated_performer_credit")
+                self.assertIn("(with Sol)", decision.reason)
+        for rival in (
+            replace(other, isrc="USABC2400002"), replace(other, isrc=""), replace(other, is_playable=None),
+            replace(other, album_id=preferred.album_id), replace(other, album_name="Evening"),
+            replace(other, album_id=""), replace(preferred, name=""), replace(preferred, is_playable=False),
+            replace(preferred, has_complete_recording_metadata=False), replace(preferred, name="Other"),
+        ):
+            with self.subTest(rival=rival):
+                self.assertEqual(choose_best_track_match(track, (preferred, rival)).status, AMBIGUOUS)
+        self.assertEqual(choose_best_track_match(replace(track, album_name="Third"), (preferred, other)).status, AMBIGUOUS)
+
+    def test_repeated_performer_credit_preserves_work_version_and_artist_identity(self):
+        track = source_track(track_name="Café", artist_name="North, Sol", album_name="Source")
+        candidate = SpotifyTrackCandidate("spotify:track:one", "Cafe\u0301 ( WITH  SOL )", ("Sol", "North"), "Other", "id", "", True)
+        self.assertEqual(choose_best_track_match(track, (candidate,)).status, MATCHED)
+        self.assertEqual(choose_best_track_match(track, (replace(candidate, name="Café(with Sol)"),)).status, MATCHED)
+        self.assertEqual(choose_best_track_match(track, (replace(candidate, version_title_review_only=True),)).status, UNMATCHED)
+        for title in ("Cafe (with Sol)", "Café Live (with Sol)", "Café (Mixed) (with Sol)", "Café with Sol",
+                      "Café (with (Sol))", "Café (with Sol", "Café (with S)", "Café (with Sol) (with Sol)"):
+            with self.subTest(title=title):
+                self.assertEqual(choose_best_track_match(track, (replace(candidate, name=title),)).status, UNMATCHED)
+        for exported, artists in (
+            ("North, Sol", ("North, Sol",)), ("North, Sol", ("North",)),
+            ("North, Sol", ("North", "Sol", "Guest")), ("North, Sol, Sol", ("North", "Sol", "Sol")),
+            ("North, Wind & Fire, Sol", ("North", "Wind & Fire", "Sol")), ("North,,Sol", ("North", "Sol")),
+        ):
+            with self.subTest(exported=exported, artists=artists):
+                decision = choose_best_track_match(replace(track, artist_name=exported), (replace(candidate, artists=artists),))
+                self.assertEqual(decision.status, UNMATCHED)
+
     def test_normalizes_equivalent_unicode_punctuation_as_separators(self):
         equivalent_values = (
             ("Marcel’s Walk", "Marcel's Walk"),
@@ -1750,8 +1880,8 @@ class SpotifyMatchingTests(unittest.TestCase):
             ("shared album ID", (first, replace(second, album_id="edition-a"))),
             ("partial artist credit", (first, replace(second, artists=("Harbour Lines",)))),
             ("changed version punctuation", (first, replace(second, name="After Light [Live] 夜"))),
-            ("changed Unicode title", (first, replace(second, name="After Light (Live) 日"))),
-            ("changed Unicode album", (first, replace(second, album_name="Tidal Signals 山"))),
+            ("changed Unicode title for the same URI", (first, second, replace(second, name="After Light (Live) 日"))),
+            ("changed Unicode album for the same URI", (first, second, replace(second, album_name="Tidal Signals 山"))),
             ("all unavailable", (replace(first, is_playable=False), replace(second, is_playable=False))),
             ("changed observed ID", (first, second, replace(first, isrc="USAAA2600002"))),
             ("changed observed album", (first, second, replace(first, album_id="edition-c"))),

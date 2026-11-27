@@ -13,8 +13,11 @@ from typing import TypeVar
 from publishers.spotify.matching import (
     ALPHANUMERIC_SPACING_MATCH_STRATEGY,
     AMBIGUOUS,
+    CATALOGUE_RECORDING_STRATEGIES,
     CONSTRAINED_TYPO_MATCH_REASON_PREFIX,
     MATCHED,
+    EXACT_TITLE_RECORDING_STRATEGY,
+    REPEATED_PERFORMER_CREDIT_STRATEGY,
     SAME_RECORDING_EDITION_MATCH_STRATEGY,
     UNMATCHED,
     PlaylistTrack,
@@ -23,8 +26,13 @@ from publishers.spotify.matching import (
     TrackMatchDecision,
     VERSION_SUBSTITUTE_MATCH_STRATEGY,
     build_spotify_track_search_query,
+    choose_best_track_match,
+    has_legacy_loss,
+    legacy_music_text,
+    match_catalogue_variants,
+    match_exact_title_recording,
+    match_repeated_performer_credit,
     music_values_match_only_after_alphanumeric_spacing,
-    normalize_music_text,
     normalize_recording_evidence_text,
     normalize_spotify_isrc,
     recording_proof_source_matches,
@@ -48,7 +56,10 @@ from shared.text import clean_cell
 
 MATCH_CACHE_SCHEMA_VERSION = 1
 MATCH_CACHE_RECORD_TYPE = "spotify_track_match_cache"
-MATCHER_VERSION = 13
+MATCHER_VERSION = 15
+RECORDING_COHORT_STRATEGIES = CATALOGUE_RECORDING_STRATEGIES | {
+    SAME_RECORDING_EDITION_MATCH_STRATEGY, REPEATED_PERFORMER_CREDIT_STRATEGY,
+}
 CACHEABLE_MATCH_STATUSES = {MATCHED, AMBIGUOUS, UNMATCHED}
 CONSTRAINED_TYPO_MATCH_STRATEGY = "constrained_title_typo"
 ALBUM_RECOVERY_ATTEMPT_MATCHER_VERSION_FIELD = "album_recovery_attempt_matcher_version"
@@ -177,13 +188,12 @@ def cached_manual_source_conflicts(track: PlaylistTrack, record: Mapping[str, ob
 
 
 def _manual_collision_cache_key(track: PlaylistTrack) -> str:
-    identity = tuple(normalize(value) for _, value, normalize in _source_identity_fields(track))
-    encoded = json.dumps(identity, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    encoded = json.dumps(source_track_binding(track), ensure_ascii=True, separators=(",", ":")).encode("ascii")
     # Ordinary keys contain pipes, so older readers cannot select this entry.
     return f"manual-collision:{hashlib.sha256(encoded).hexdigest()}"
 
 
-def _automatic_collision_source_matches(track: PlaylistTrack, record: Mapping[str, object]) -> bool:
+def automatic_source_matches(track: PlaylistTrack, record: Mapping[str, object]) -> bool:
     # A blank source field must be saved as a string for an automatic decision to be replayable.
     return all(
         isinstance(saved_value := record.get(field), str) and normalize(saved_value) == normalize(source_value)
@@ -194,27 +204,35 @@ def _automatic_collision_source_matches(track: PlaylistTrack, record: Mapping[st
 def track_match_cache_entry(
     track: PlaylistTrack,
     matches: Mapping[str, MatchCacheRecord],
-    *,
-    refresh_match_cache: bool = False,
 ) -> tuple[str, MatchCacheRecord | None]:
-    """Select the entry for a source, including its automatic match beside a manual binding."""
+    """Select the legacy slot or the exact source's entry beside a conflicting binding."""
     cache_key = spotify_track_match_key(track)
     record = matches.get(cache_key)
-    if (
-        not refresh_match_cache
-        and record is not None
-        and clean_cell(record.get("match_status")) == "manual"
-        and compare_cached_manual_source(track, record) is False
+    if record is not None and (
+        compare_cached_manual_source(track, record) is False if record.get("match_status") == "manual"
+        else _automatic_source_conflicts(track, record)
     ):
         collision_key = _manual_collision_cache_key(track)
         collision_record = matches.get(collision_key)
         if collision_record is not None and (
-            clean_cell(collision_record.get("match_status")) not in CACHEABLE_MATCH_STATUSES
-            or not _automatic_collision_source_matches(track, collision_record)
+            clean_cell(collision_record.get("match_status")) not in CACHEABLE_MATCH_STATUSES | {"manual"}
+            or not automatic_source_matches(track, collision_record)
         ):
             collision_record = None
         return collision_key, collision_record
     return cache_key, record
+
+
+def _automatic_source_conflicts(track: PlaylistTrack, record: Mapping[str, object]) -> bool:
+    return any(
+        isinstance(saved := record.get(field), str)
+        and normalize(saved) != normalize(value)
+        for field, value, normalize in _source_identity_fields(track)
+    )
+
+
+def source_track_binding(track: PlaylistTrack) -> tuple[str, ...]:
+    return tuple(normalize(value) for _, value, normalize in _source_identity_fields(track))
 
 
 def clear_manual_collision_cache_entry(track: PlaylistTrack, matches: dict[str, dict[str, object]]) -> None:
@@ -225,6 +243,8 @@ def cached_track_match(
     track: PlaylistTrack,
     matches: Mapping[str, Mapping[str, object]],
     seen_at: str | None = None,
+    *,
+    spelling_positions: Sequence[SpotifyTrackCandidate] = (),
 ) -> CachedSpotifyTrackMatch | None:
     cache_key, record = track_match_cache_entry(track, matches)
     if not record:
@@ -255,18 +275,36 @@ def cached_track_match(
     if match_status == MATCHED:
         if (
             not _strict_album_recovery_applies_to(track, record)
+            or not legacy_positive_is_safe(track, record)
             or (
                 cache_record_is_version_sensitive(record)
                 and cache_record_matcher_version(record) != MATCHER_VERSION
             )
         ):
             return None
-        return cached_matched_track(track, cache_key, record, seen_at=seen_at)
+        return cached_matched_track(track, cache_key, record, seen_at=seen_at, spelling_positions=spelling_positions)
     if match_status in {AMBIGUOUS, UNMATCHED}:
         if cache_record_matcher_version(record) != MATCHER_VERSION:
             return None
         return cached_review_decision(track, cache_key, record, match_status, seen_at=seen_at)
     return None
+
+
+def legacy_positive_is_safe(track: PlaylistTrack, record: Mapping[str, object]) -> bool:
+    if cache_record_matcher_version(record) >= MATCHER_VERSION:
+        return True
+    fields = (track.track_name, track.artist_name, track.album_name, clean_cell(record.get("spotify_track_name")),
+              clean_cell(record.get("spotify_album_name")), *clean_string_sequence(record.get("spotify_artist_names")))
+    if not any(has_legacy_loss(value) for value in fields):
+        return True
+    if not automatic_source_matches(track, record):
+        return False
+    candidate = spotify_candidate_from_cache_record(record, require_recording_metadata=True)
+    return candidate is not None and choose_best_track_match(
+        track, (candidate,), allow_leading_in_title_variant=False, allow_alphanumeric_spacing_fallback=False,
+        allow_constrained_typo_fallback=False, allow_version_substitute=False, repeated_credit_observations=(),
+        allow_catalogue_recovery=False,
+    ).status == MATCHED
 
 
 def cache_record_has_recording_conflict(record: Mapping[str, object] | None) -> bool:
@@ -332,6 +370,8 @@ def cached_matched_track(
     cache_key: str,
     record: Mapping[str, object],
     seen_at: str | None = None,
+    *,
+    spelling_positions: Sequence[SpotifyTrackCandidate] = (),
 ) -> CachedSpotifyTrackMatch | None:
     candidate = spotify_candidate_from_cache_record(record, default_track=track)
     if not candidate:
@@ -339,8 +379,8 @@ def cached_matched_track(
     match_strategy = clean_cell(record.get("match_strategy"))
     match_status = clean_cell(record.get("match_status"))
     review_candidates = (candidate,)
-    if match_strategy == SAME_RECORDING_EDITION_MATCH_STRATEGY and match_status == MATCHED:
-        review_candidates = cached_recording_edition_cohort(track, record)
+    if match_strategy in RECORDING_COHORT_STRATEGIES and match_status == MATCHED:
+        review_candidates = cached_recording_edition_cohort(track, record, spelling_positions=spelling_positions)
         if not review_candidates:
             return None
     if seen_at is not None and isinstance(record, dict):
@@ -360,6 +400,7 @@ def cached_matched_track(
             search_queries=search_queries_from_cache_record(record),
             match_strategy=match_strategy,
             strict_album_recovery=match_status == MATCHED and record.get(STRICT_ALBUM_RECOVERY_FIELD) is True,
+            title_search_complete=record.get("title_search_complete") is True,
         ),
         is_manual=match_status == "manual",
     )
@@ -415,13 +456,14 @@ def spotify_candidate_from_cache_record(
     *,
     require_recording_metadata: bool = False,
 ) -> SpotifyTrackCandidate | None:
-    if require_recording_metadata and not spotify_recording_metadata_is_complete(
+    metadata_complete = record.get("spotify_metadata_incomplete") is not True and spotify_recording_metadata_is_complete(
         uri=record.get("spotify_uri"),
         title=record.get("spotify_track_name"),
         artist_names=record.get("spotify_artist_names"),
         album_name=record.get("spotify_album_name"),
         album_id=record.get("spotify_album_id"),
-    ):
+    )
+    if require_recording_metadata and not metadata_complete:
         return None
     spotify_uri = clean_cell(record.get("spotify_uri"))
     if not spotify_uri.startswith("spotify:track:"):
@@ -452,8 +494,10 @@ def spotify_candidate_from_cache_record(
         album_id=clean_cell(raw_album_id),
         isrc=normalize_spotify_isrc(record.get("spotify_isrc")),
         is_playable=is_playable if isinstance(is_playable, bool) else None,
+        has_complete_recording_metadata=metadata_complete,
         observed_recording_metadata=observed_metadata,
         version_title_review_only=record.get("version_title_review_only") is True,
+        title_only_search=record.get("title_only_search") is True,
     )
 
 
@@ -476,22 +520,62 @@ def review_candidates_from_cache_record(
 def cached_recording_edition_cohort(
     track: PlaylistTrack,
     record: Mapping[str, object],
+    *,
+    spelling_positions: Sequence[SpotifyTrackCandidate] = (),
 ) -> tuple[SpotifyTrackCandidate, ...]:
-    if not cached_recording_proof_is_current(track, record):
+    strategy = clean_cell(record.get("match_strategy"))
+    repeated_credit = strategy == REPEATED_PERFORMER_CREDIT_STRATEGY
+    catalogue_recovery = strategy in CATALOGUE_RECORDING_STRATEGIES
+    if repeated_credit or catalogue_recovery:
+        if cache_record_matcher_version(record) != MATCHER_VERSION or not automatic_source_matches(track, record):
+            return ()
+    elif not cached_recording_proof_is_current(track, record):
         return ()
     chosen = spotify_candidate_from_cache_record(record, require_recording_metadata=True)
     candidate_records = record.get("review_candidates")
     if chosen is None or not isinstance(candidate_records, list):
         return ()
+    if repeated_credit or catalogue_recovery:
+        count = record.get("repeated_credit_candidate_count" if repeated_credit else "recording_candidate_count")
+        if (
+            type(count) is not int or count != len(candidate_records)
+            or "spotify_observed_recording_metadata" in record or chosen.version_title_review_only
+        ):
+            return ()
     candidates: list[SpotifyTrackCandidate] = []
     for candidate_record in candidate_records:
         if not isinstance(candidate_record, Mapping):
             return ()
         candidate = spotify_candidate_from_cache_record(candidate_record, require_recording_metadata=True)
-        if candidate is None:
+        if candidate is None or ((repeated_credit or catalogue_recovery) and (
+            not candidate.has_complete_recording_metadata or candidate.version_title_review_only
+            or "spotify_observed_recording_metadata" in candidate_record
+        )):
             return ()
         candidates.append(candidate)
     cohort = tuple(candidates)
+    if repeated_credit:
+        credit_match = match_repeated_performer_credit(track, cohort)
+        if (
+            credit_match is None or credit_match.status != MATCHED or credit_match.candidate != chosen
+            or len(credit_match.review_candidates) != len(cohort)
+        ):
+            return ()
+        return credit_match.review_candidates
+    if catalogue_recovery:
+        proof = (
+            match_exact_title_recording(
+                track, cohort, (), title_search_complete=record.get("title_search_complete") is True,
+            )
+            if strategy == EXACT_TITLE_RECORDING_STRATEGY
+            else match_catalogue_variants(track, cohort, (), spelling_positions)
+        )
+        if (
+            proof is None or proof.status != MATCHED or proof.match_strategy != strategy or proof.candidate != chosen
+            or len(proof.review_candidates) != len(cohort)
+        ):
+            return ()
+        return proof.review_candidates
     proof = resolve_spotify_edition_tie(
         TrackMatchDecision(track=track, status=AMBIGUOUS, spotify_uri="", reason="", review_candidates=cohort),
         cohort,
@@ -503,18 +587,24 @@ def album_lookup_candidates_from_cache_record(
     track: PlaylistTrack,
     record: Mapping[str, object],
 ) -> tuple[SpotifyTrackCandidate, ...]:
-    if cache_record_has_recording_conflict(record) or not _strict_album_recovery_applies_to(track, record):
+    if (
+        _automatic_source_conflicts(track, record) or cache_record_has_recording_conflict(record)
+        or not _strict_album_recovery_applies_to(track, record)
+    ):
         return ()
     match_status = clean_cell(record.get("match_status"))
     if match_status == MATCHED:
-        if clean_cell(record.get("match_strategy")) == SAME_RECORDING_EDITION_MATCH_STRATEGY:
-            return cached_recording_edition_cohort(track, record)
+        if not legacy_positive_is_safe(track, record):
+            return ()
+        if clean_cell(record.get("match_strategy")) in RECORDING_COHORT_STRATEGIES:
+            return tuple(candidate for candidate in cached_recording_edition_cohort(track, record)
+                         if not candidate.title_only_search)
         candidate = spotify_candidate_from_cache_record(record)
         return (candidate,) if candidate else ()
     if match_status in {AMBIGUOUS, UNMATCHED}:
         return tuple(
             candidate for candidate in review_candidates_from_cache_record(record)
-            if not candidate.version_title_review_only
+            if not candidate.version_title_review_only and not candidate.title_only_search
         )
     return ()
 
@@ -582,7 +672,7 @@ def cache_record_can_store_album_recovery_attempt(
     if cache_record_has_recording_conflict(record) or not _strict_album_recovery_applies_to(track, record):
         return False
     match_status = clean_cell(record.get("match_status"))
-    if match_status == MATCHED and clean_cell(record.get("match_strategy")) == SAME_RECORDING_EDITION_MATCH_STRATEGY:
+    if match_status == MATCHED and clean_cell(record.get("match_strategy")) in RECORDING_COHORT_STRATEGIES:
         return bool(cached_recording_edition_cohort(track, record))
     return bool(
         match_status == MATCHED
@@ -604,7 +694,7 @@ def cache_track_match(
         return False
     timestamp = matched_at or utc_timestamp()
     track = decision.track
-    cache_key, existing_record = track_match_cache_entry(track, matches, refresh_match_cache=refresh_match_cache)
+    cache_key, existing_record = track_match_cache_entry(track, matches)
     if existing_record is not None and not refresh_match_cache:
         if clean_cell(existing_record.get("match_status")) == "manual":
             return False
@@ -653,7 +743,14 @@ def cache_track_match(
             record["match_strategy"] = match_strategy
         if decision.strict_album_recovery:
             record[STRICT_ALBUM_RECOVERY_FIELD] = True
-        if match_strategy == SAME_RECORDING_EDITION_MATCH_STRATEGY:
+        if match_strategy == REPEATED_PERFORMER_CREDIT_STRATEGY:
+            record["repeated_credit_candidate_count"] = len(decision.review_candidates)
+        if match_strategy in CATALOGUE_RECORDING_STRATEGIES:
+            record["recording_candidate_count"] = len(decision.review_candidates)
+            record["version_sensitive"] = True
+        if decision.title_search_complete:
+            record["title_search_complete"] = True
+        if match_strategy in RECORDING_COHORT_STRATEGIES:
             record["review_candidates"] = [
                 spotify_candidate_cache_record(candidate) for candidate in decision.review_candidates
             ]
@@ -663,6 +760,7 @@ def cache_track_match(
             CONSTRAINED_TYPO_MATCH_STRATEGY,
             ALBUM_POSITION_MATCH_STRATEGY,
             SAME_RECORDING_EDITION_MATCH_STRATEGY,
+            REPEATED_PERFORMER_CREDIT_STRATEGY,
             SPOTIFY_ORIGINAL_ANNOTATION_MATCH_STRATEGY,
             TRACK_CANDIDATE_ALBUM_ALPHANUMERIC_MATCH_STRATEGY,
             TRACK_CANDIDATE_ALBUM_EXACT_MATCH_STRATEGY,
@@ -687,7 +785,7 @@ def cache_track_match(
             }
         )
         _store_version_title_review_candidates(record, decision.review_candidates)
-    if refresh_match_cache:
+    if refresh_match_cache and cache_key == spotify_track_match_key(track):
         clear_manual_collision_cache_entry(track, matches)
     matches[cache_key] = record
     return True
@@ -732,6 +830,10 @@ def spotify_candidate_cache_record(candidate: SpotifyTrackCandidate) -> dict[str
         record["spotify_isrc"] = candidate.isrc
     if candidate.is_playable is not None:
         record["spotify_is_playable"] = candidate.is_playable
+    if not candidate.has_complete_recording_metadata:
+        record["spotify_metadata_incomplete"] = True
+    if candidate.title_only_search:
+        record["title_only_search"] = True
     observed_metadata = candidate.observed_recording_metadata
     if observed_metadata is not None and observed_metadata != spotify_recording_metadata_from_values(
         title=candidate.name, artist_names=candidate.artists, album_name=candidate.album_name, album_id=candidate.album_id,
@@ -751,9 +853,9 @@ def spotify_track_match_key(track: PlaylistTrack) -> str:
         (
             clean_cell(track.release_id),
             clean_cell(track.track_number),
-            normalize_music_text(track.artist_name),
-            normalize_music_text(track.album_name),
-            normalize_music_text(track.track_name),
+            legacy_music_text(track.artist_name),
+            legacy_music_text(track.album_name),
+            legacy_music_text(track.track_name),
         )
     )
 

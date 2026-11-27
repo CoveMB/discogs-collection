@@ -109,6 +109,21 @@ class FakeAlbumLookupClient:
 
 
 class SpotifyReleaseMatchingTests(unittest.TestCase):
+    def test_album_position_cannot_select_an_arranged_composer_title(self) -> None:
+        tracks = (source_track(1, "Northern Lights", "Ayla Reed"), source_track(2, "Canon / Largo", "Ayla Reed"),
+                  source_track(3, "Silver Lake", "Ayla Reed"))
+        spotify = (album_track(1, "Northern Lights", ("Ayla Reed",)),
+                   album_track(2, "Reed: Canon/Largo (Orchestral Arrangement)", ("Ayla Reed",)),
+                   album_track(3, "Silver Lake", ("Ayla Reed",)))
+        decisions = match_release_tracks_to_album(tracks, album_candidate(), spotify, "album search")
+        self.assertEqual([decision.spotify_uri for decision in decisions], ["spotify:track:1", "spotify:track:3"])
+
+    def test_album_position_does_not_bypass_distinct_script_titles(self) -> None:
+        tracks = (source_track(1, "Northern Lights"), source_track(2, "東京"), source_track(3, "Silver Lake"))
+        spotify = (album_track(1, "Northern Lights"), album_track(2, "京都"), album_track(3, "Silver Lake"))
+        decisions = match_release_tracks_to_album(tracks, album_candidate(), spotify, "album search")
+        self.assertEqual([decision.spotify_uri for decision in decisions], ["spotify:track:1", "spotify:track:3"])
+
     def setUp(self) -> None:
         self.source_tracks = (
             source_track(1, "1", "Example Artist, Collaborator"),
@@ -849,10 +864,15 @@ class SpotifyCachedAlbumFallbackTests(unittest.TestCase):
                 )
 
                 self.assertEqual(result.decisions, ())
-                self.assertTrue(result.used_fallback_track_candidates)
-                self.assertEqual(result.validation_diagnostics[-1].exact_anchor_count, 3)
                 self.assertTrue(result.diagnostic)
-                self.assertEqual(client.album_track_requests[-1], ("access-token", "recovered-album"))
+                if label == "album":
+                    self.assertFalse(result.used_fallback_track_candidates)
+                    self.assertEqual(client.album_track_requests, [("access-token", "direct-album")])
+                else:
+                    self.assertTrue(result.used_fallback_track_candidates)
+                    self.assertEqual(result.validation_diagnostics[-1].exact_anchor_count,
+                                     3 if label == "version punctuation" else 2)
+                    self.assertEqual(client.album_track_requests[-1], ("access-token", "recovered-album"))
 
     def test_cached_album_requires_consistent_titles_for_the_same_id(self) -> None:
         source_album = "Numbers and Colours 夜"

@@ -236,6 +236,7 @@ def build_spotify_publisher_args(args: argparse.Namespace) -> list[str]:
     return spotify_publisher.build_spotify_publisher_argv(
         playlist_output_dir=args.playlist_output_dir,
         publisher_config=args.publisher_config,
+        tracklist_cache=args.tracklist_cache,
         no_progress=args.no_progress,
         dry_run=args.publishing_dry_run,
         max_new_searches_per_run=args.max_new_searches_per_run,

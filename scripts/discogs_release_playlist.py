@@ -267,6 +267,7 @@ def build_spotify_publisher_args(
         report=args.publisher_report,
         token_cache=args.token_cache,
         match_cache=args.match_cache,
+        tracklist_cache=args.tracklist_cache,
         publisher_config=args.publisher_config,
         debug_log=args.debug_log,
         reauthorize=args.reauthorize,

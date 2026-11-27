@@ -234,7 +234,8 @@ class SpotifyClientTests(unittest.TestCase):
         for response, error in (
             (HttpResponse(0, {}, "synthetic timeout"), SpotifyApiError),
             (HttpResponse(500, {}, "synthetic server failure"), SpotifyApiError),
-            (HttpResponse(200, {}, "malformed JSON"), ValueError),
+            (HttpResponse(200, {}, "malformed JSON"), SpotifyApiError),
+            (HttpResponse(200, {}, "{}"), SpotifyApiError),
         ):
             with self.subTest(status=response.status):
                 client = SpotifyClient(transport=lambda request: response)

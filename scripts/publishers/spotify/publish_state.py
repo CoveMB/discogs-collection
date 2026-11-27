@@ -6,6 +6,7 @@ import json
 from collections.abc import Mapping
 from pathlib import Path
 
+from publishers.spotify.match_cache import compare_cached_manual_source
 from publishers.spotify.matching import PlaylistTrack
 from shared.files import write_json_file
 from shared.text import clean_cell
@@ -13,6 +14,7 @@ from shared.text import clean_cell
 
 PUBLISH_STATE_SCHEMA_VERSION = 1
 PUBLISH_STATE_RECORD_TYPE = "spotify_publish_state_cache"
+PUBLISH_IDENTITY_VERSION = 2
 
 
 SpotifyPublishState = dict[str, dict[str, dict[str, object]]]
@@ -69,10 +71,25 @@ def spotify_publish_state_has_track(
     state: Mapping[str, Mapping[str, Mapping[str, object]]],
     playlist_name: str,
     identity_key: str,
+    *,
+    track: PlaylistTrack | None = None,
+    spotify_uri: str = "",
+    legacy_identity_key: str = "",
 ) -> bool:
     clean_playlist_name = clean_cell(playlist_name)
     clean_identity_key = clean_cell(identity_key)
-    return bool(clean_playlist_name and clean_identity_key and clean_identity_key in state.get(clean_playlist_name, {}))
+    history = state.get(clean_playlist_name, {})
+    current = history.get(clean_identity_key)
+    if current is not None and (track is None or current.get("identity_version") == PUBLISH_IDENTITY_VERSION):
+        return True
+    legacy = history.get(legacy_identity_key)
+    return track is not None and any(
+        record is not None and (
+            (spotify_uri and record.get("spotify_uri") == spotify_uri)
+            or compare_cached_manual_source(track, record) is True
+        )
+        for record in (current, legacy)
+    )
 
 
 def record_spotify_publish_state_track(
@@ -92,6 +109,7 @@ def record_spotify_publish_state_track(
     playlist_state = state.setdefault(clean_playlist_name, {})
     record = dict(playlist_state.get(clean_identity_key, {}))
     record["identity_key"] = clean_identity_key
+    record["identity_version"] = PUBLISH_IDENTITY_VERSION
     record["spotify_uri"] = clean_cell(spotify_uri)
     if source_position is not None and source_position > 0:
         if "first_source_position" not in record:

@@ -369,13 +369,17 @@ class SpotifyManualMatchTests(unittest.TestCase):
                 overrides_path, directory, cache_path, apply=True, replace_existing=True,
             )
             self.assertEqual(result.applied_count, 1)
-            record = load_spotify_track_match_cache(cache_path)["release-1|1|source artist|source album|signal"]
-            self.assertEqual((record["track_name"], record["spotify_uri"]), ("Signal 月", "spotify:track:manual-one"))
+            rebound = cached_track_match(colliding_track, load_spotify_track_match_cache(cache_path))
+            assert rebound is not None
+            self.assertEqual((rebound.decision.track.track_name, rebound.decision.spotify_uri),
+                             ("Signal 月", "spotify:track:manual-one"))
+            self.assertTrue(rebound.is_manual)
 
             write_playlist_master(master, source_values={"Track Name": "Signal 星"})
             write_override_file(overrides_path, source_values={"track_name": "Signal 星"})
             import_manual_match_overrides(overrides_path, directory, cache_path, apply=True, replace_existing=True)
-            self.assertIsNone(cached_track_match(colliding_track, load_spotify_track_match_cache(cache_path)))
+            preserved = cached_track_match(colliding_track, load_spotify_track_match_cache(cache_path))
+            self.assertEqual(preserved, rebound)
 
     def test_rebinding_partial_manual_match_requires_flag_for_each_conflicting_field(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
+    from discogs_tracklists import ReleaseTracklistLookup
     from publishers.spotify.request_control import SpotifyRequestControl
     from publishers.spotify.session import SpotifySession
 
@@ -38,6 +39,7 @@ class SpotifyAlbumAttemptKey:
     fallback_track_candidates: tuple[SpotifyTrackCandidate, ...]
     search_limit: int
     matcher_version: int
+    source_tracklist: ReleaseTracklistLookup | None = None
 
 
 @dataclass(frozen=True)
@@ -122,6 +124,9 @@ class SpotifyPublishInvocation:
     completed_pass_count: int = 0
     current_user_id: str | None = None
     latest_summary: SpotifyPublishSummary | None = None
+    completed_spelling_positions: dict[
+        SpotifyAlbumAttemptKey, tuple[tuple[PlaylistTrack, SpotifyTrackCandidate], ...],
+    ] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

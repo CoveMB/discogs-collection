@@ -217,6 +217,8 @@ class DiscogsMakePlaylistsTests(unittest.TestCase):
                     [
                         "--playlist-output-dir",
                         "collection/custom-playlists",
+                        "--tracklist-cache",
+                        "collection/cache/tracks.json",
                         "--publisher-config",
                         "config/custom-publisher.json",
                         "--no-progress",

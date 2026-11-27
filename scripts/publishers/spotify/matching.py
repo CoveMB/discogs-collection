@@ -7,6 +7,11 @@ import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 
+from publishers.spotify.spelling import (
+    conjunction_difference,
+    normalize_recording_evidence_text as normalize_recording_evidence_text,
+    spelling_difference,
+)
 
 MATCHED = "matched"
 AMBIGUOUS = "ambiguous"
@@ -48,6 +53,16 @@ ALPHANUMERIC_SPACING_MATCH_REASON = "track and album matched after normalizing l
 ALPHANUMERIC_SPACING_MATCH_STRATEGY = "alphanumeric_spacing"
 VERSION_SUBSTITUTE_MATCH_STRATEGY = "version_substitute"
 SAME_RECORDING_EDITION_MATCH_STRATEGY = "same_recording_edition"
+REPEATED_PERFORMER_CREDIT_STRATEGY = "repeated_performer_credit"
+TRAILING_PERFORMER_CREDIT = re.compile(r"\s*\(\s*with\s+([^()[\]]+?)\s*\)$")
+TRAILING_FEATURING_CREDIT = re.compile(r"\s+featuring\s+([^()[\]]+?)$")
+COMPOSER_PREFIX_STRATEGY = "credited_composer_prefix"
+TITLE_CONJUNCTION_STRATEGY = "title_conjunction"
+CATALOGUE_SPELLING_STRATEGY = "catalogue_spelling"
+EXACT_TITLE_RECORDING_STRATEGY = "exact_title_recording"
+CATALOGUE_RECORDING_STRATEGIES = frozenset((
+    COMPOSER_PREFIX_STRATEGY, TITLE_CONJUNCTION_STRATEGY, CATALOGUE_SPELLING_STRATEGY, EXACT_TITLE_RECORDING_STRATEGY,
+))
 TRAILING_ENCLOSED_VERSION_PATTERN = re.compile(
     r"\s*[\(\[]\s*(?P<label>remaster(?:ed)?|live|(?:radio\s+)?edit)\s*[\)\]]\s*$",
     re.IGNORECASE,
@@ -129,6 +144,7 @@ class SpotifyTrackCandidate:
     has_complete_recording_metadata: bool = field(default=True, compare=False)
     observed_recording_metadata: SpotifyRecordingMetadata | None = field(default=None, compare=False)
     version_title_review_only: bool = False
+    title_only_search: bool = False
 
     def recording_metadata(self) -> SpotifyRecordingMetadata:
         if self.observed_recording_metadata is not None:
@@ -149,6 +165,7 @@ class TrackMatchDecision:
     search_queries: tuple[str, ...] = ()
     match_strategy: str = ""
     strict_album_recovery: bool = False
+    title_search_complete: bool = False
 
 
 def build_spotify_track_search_query(track: PlaylistTrack) -> str:
@@ -471,7 +488,13 @@ def choose_best_track_match(
     allow_alphanumeric_spacing_fallback: bool = True,
     allow_constrained_typo_fallback: bool = True,
     allow_version_substitute: bool = True,
+    *,
+    repeated_credit_observations: Sequence[SpotifyTrackCandidate] | None = None,
+    allow_catalogue_recovery: bool = True,
+    spelling_positions: Sequence[SpotifyTrackCandidate] = (),
 ) -> TrackMatchDecision:
+    if repeated_credit_observations is None:
+        repeated_credit_observations = candidates
     candidates = deduplicate_spotify_track_candidates(candidates)
     exact_matches = tuple(candidate for candidate in candidates if candidate_matches_track(track, candidate))
     if exact_matches:
@@ -617,6 +640,11 @@ def choose_best_track_match(
             match_strategy=ALPHANUMERIC_SPACING_MATCH_STRATEGY,
         )
 
+    if allow_catalogue_recovery:
+        recovery = match_catalogue_variants(track, repeated_credit_observations, search_queries, spelling_positions)
+        if recovery is not None:
+            return recovery
+
     constrained_typo_matches: tuple[tuple[SpotifyTrackCandidate, int], ...] = ()
     if allow_constrained_typo_fallback:
         constrained_typo_matches = tuple(
@@ -667,6 +695,344 @@ def choose_best_track_match(
         candidate=None,
         review_candidates=candidates,
         search_queries=search_queries,
+    )
+
+
+def trailing_performer_credit(label: str) -> tuple[str, str] | None:
+    label = normalize_recording_evidence_text(label)
+    match = TRAILING_PERFORMER_CREDIT.search(label) or TRAILING_FEATURING_CREDIT.search(label)
+    if not match:
+        return None
+    base = label[:match.start()]
+    depth = 0
+    for character in base:
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth < 0:
+                return None
+    if not base or depth or TRAILING_PERFORMER_CREDIT.search(base) or TRAILING_FEATURING_CREDIT.search(base):
+        return None
+    return base, match[1]
+
+
+def match_repeated_performer_credit(
+    track: PlaylistTrack,
+    observations: Sequence[SpotifyTrackCandidate],
+    search_queries: tuple[str, ...] = (),
+) -> TrackMatchDecision | None:
+    if not observations:
+        return None
+    source_credit = normalize_recording_evidence_text(track.artist_name)
+    artists = sorted(split_source_artist_names(source_credit))
+    if len(set(artists)) < 2 or any(not part.strip() for part in source_credit.split(",")):
+        return None
+    title = normalize_recording_evidence_text(track.track_name)
+    competitors: dict[str, SpotifyTrackCandidate] = {}
+    preferred: set[str] = set()
+    source_album = normalize_recording_evidence_text(track.album_name)
+    for candidate in observations:
+        credit = trailing_performer_credit(candidate.name)
+        if (
+            candidate.version_title_review_only or candidate.title_only_search or not credit or credit[0] != title
+            or artists.count(credit[1]) != 1
+            or sorted(normalize_recording_evidence_text(name) for name in candidate.artists) != artists
+        ):
+            continue
+        competitors.setdefault(candidate.uri, candidate)
+        if source_album and (
+            normalize_recording_evidence_text(candidate.album_name) == source_album
+            or trailing_performer_credit(candidate.album_name) == (source_album, credit[1])
+        ):
+            preferred.add(candidate.uri)
+    if not competitors:
+        return None
+    cohort = tuple(competitors.values())
+    decision = TrackMatchDecision(
+        track=track, status=AMBIGUOUS, spotify_uri="", reason="", review_candidates=cohort,
+        search_queries=search_queries, match_strategy=REPEATED_PERFORMER_CREDIT_STRATEGY,
+    )
+    # A later search can return an unavailable or incomplete observation for a competing URI.
+    for candidate in observations:
+        first = competitors.get(candidate.uri)
+        if first is None:
+            continue
+        metadata = spotify_recording_metadata_from_values(
+            title=candidate.name, artist_names=candidate.artists, album_name=candidate.album_name, album_id=candidate.album_id,
+        )
+        if (
+            candidate.is_playable is not True or candidate.version_title_review_only
+            or not candidate.has_complete_recording_metadata or not metadata.album_id or not metadata.album_name
+            or not spotify_track_uri_is_structurally_valid(candidate.uri)
+            or metadata != candidate.recording_metadata() or metadata != first.recording_metadata()
+            or normalize_spotify_isrc(candidate.isrc) != normalize_spotify_isrc(first.isrc)
+        ):
+            return replace(decision, reason="repeated performer credit has incomplete or conflicting Spotify evidence")
+    selected = cohort[0]
+    reason = "matched Spotify title with repeated performer credit"
+    if len(cohort) > 1:
+        codes = {normalize_spotify_isrc(item.isrc) for item in cohort}
+        if "" in codes or len(codes) != 1:
+            return replace(decision, reason="repeated performer credit has Spotify copies with missing or conflicting ISRCs")
+        if len({item.album_id.strip() for item in cohort}) != len(cohort) or len(preferred) != 1:
+            return replace(decision, reason="repeated performer credit has no unique source-album edition")
+        selected = competitors[preferred.pop()]
+        reason += " on the source album among editions with the same ISRC"
+    return replace(
+        decision, status=MATCHED, candidate=selected, spotify_uri=selected.uri, reason=f'{reason}: "{selected.name}"',
+    )
+
+
+def complete_credit_keys(names: Sequence[str]) -> tuple[str, ...]:
+    keys = tuple(sorted(normalize_recording_evidence_text(name) for name in names))
+    return keys if keys and all(keys) and len(set(keys)) == len(keys) else ()
+
+
+def source_credit_names(artist: str) -> tuple[str, ...]:
+    return split_source_artist_names(artist) or (artist,)
+
+
+def exact_title_and_full_credits(track: PlaylistTrack, candidate: SpotifyTrackCandidate) -> bool:
+    title = normalize_recording_evidence_text(track.track_name)
+    credits = complete_credit_keys(source_credit_names(track.artist_name))
+    return (
+        bool(title) and title == normalize_recording_evidence_text(candidate.name)
+        and bool(credits) and credits == complete_credit_keys(candidate.artists)
+    )
+
+
+def artist_spelling_difference(left: str, right: str) -> str:
+    if spelling_difference(left, right):
+        return "accent or letter"
+    if conjunction_difference(left, right):
+        return "conjunction"
+    left, right = (normalize_recording_evidence_text(value) for value in (left, right))
+    if left != right and left.replace(" ", "") == right.replace(" ", ""):
+        return "spacing"
+    return ""
+
+
+def catalogue_spelling_strategy(
+    source_title: str, source_artists: Sequence[str], candidate: SpotifyTrackCandidate,
+) -> str:
+    title = normalize_recording_evidence_text(source_title)
+    differences: set[str] = set()
+    title_conjunction = False
+    if not title:
+        return ""
+    if title != normalize_recording_evidence_text(candidate.name):
+        if spelling_difference(source_title, candidate.name):
+            differences.add("accent or letter")
+        elif conjunction_difference(source_title, candidate.name):
+            title_conjunction = True
+        else:
+            return ""
+    source_keys = complete_credit_keys(source_artists)
+    other_keys = complete_credit_keys(candidate.artists)
+    if not source_keys or len(source_keys) != len(other_keys):
+        return ""
+    remaining = set(other_keys) - set(source_keys)
+    matched_credits: set[str] = set()
+    for source in set(source_keys) - set(other_keys):
+        matches = [(other, rule) for other in remaining if (rule := artist_spelling_difference(source, other))]
+        if len(matches) != 1 or matches[0][0] in matched_credits:
+            return ""
+        other, rule = matches[0]
+        matched_credits.add(other)
+        differences.add(rule)
+    # Only accent/letter differences may combine across the title and individual credits.
+    if len(differences) > 1 or (title_conjunction and differences):
+        return ""
+    if title_conjunction:
+        return TITLE_CONJUNCTION_STRATEGY
+    return CATALOGUE_SPELLING_STRATEGY if differences else ""
+
+
+def _composer_title_key(title: str) -> str:
+    return re.sub(r"\s*/\s*", "/", normalize_recording_evidence_text(title))
+
+
+def _composer_album_forms(label: str) -> set[str]:
+    clean = _composer_title_key(label)
+    subtitle = re.fullmatch(r"([^()]+?)\s*\(([^()]+)\)", clean)
+    return {clean, _composer_title_key(f"{subtitle[1]}/{subtitle[2]}")} if subtitle else {clean}
+
+
+def _composer_prefix_matches(prefix: str, artist: str) -> bool:
+    label = normalize_recording_evidence_text(prefix)
+    names = normalize_recording_evidence_text(artist).split()
+    if not label or not names:
+        return False
+    surname, comma, suffix = label.partition(",")
+    if comma:
+        initials = re.sub(r"[.\s]", "", suffix)
+        return (
+            surname.strip() == names[-1] and 0 < len(initials) < len(names)
+            and initials == "".join(name[0] for name in names[:len(initials)])
+        )
+    parts = label.replace(".", " ").split()
+    if not parts or parts[-1] != names[-1]:
+        return False
+    initials = parts[:-1]
+    return len(initials) <= len(names) - 1 and all(
+        len(initial) == 1 and name.startswith(initial) for initial, name in zip(initials, names)
+    )
+
+
+def _composer_prefix_candidates(
+    track: PlaylistTrack, candidates: Sequence[SpotifyTrackCandidate],
+) -> tuple[SpotifyTrackCandidate, ...]:
+    source_title = _composer_title_key(track.track_name)
+    source_album = _composer_album_forms(track.album_name) - {""}
+    credits = complete_credit_keys(source_credit_names(track.artist_name))
+    rivals: list[SpotifyTrackCandidate] = []
+    verified_prefix = False
+    for candidate in candidates:
+        prefix, delimiter, remainder = candidate.name.partition(":")
+        if (
+            not source_title or not credits or not set(credits) <= set(complete_credit_keys(candidate.artists))
+            or not source_album.intersection(_composer_album_forms(candidate.album_name))
+        ):
+            continue
+        prefixed = bool(delimiter) and _composer_title_key(remainder) == source_title
+        if prefixed or _composer_title_key(candidate.name) == source_title:
+            rivals.append(candidate)
+            verified_prefix = verified_prefix or (
+                prefixed and sum(_composer_prefix_matches(prefix, artist) for artist in candidate.artists) == 1
+            )
+    return tuple(rivals) if verified_prefix else ()
+
+
+def select_catalogue_recording(
+    track: PlaylistTrack,
+    competitors: Sequence[SpotifyTrackCandidate],
+    observations: Sequence[SpotifyTrackCandidate],
+    strategy: str,
+    search_queries: tuple[str, ...],
+    *,
+    spelling_positions: Sequence[SpotifyTrackCandidate] = (),
+) -> TrackMatchDecision:
+    rivals: dict[str, SpotifyTrackCandidate] = {}
+    for candidate in competitors:
+        rivals.setdefault(candidate.uri, candidate)
+    label = strategy.replace("_", " ")
+    hold = TrackMatchDecision(track, AMBIGUOUS, "", "", review_candidates=tuple(rivals.values()),
+                              search_queries=search_queries, match_strategy=strategy)
+    if strategy == COMPOSER_PREFIX_STRATEGY and len(rivals) != 1:
+        return replace(hold, reason="composer prefix has competing copies on the source album")
+    playable: list[SpotifyTrackCandidate] = []
+    for uri, rival in rivals.items():
+        expected = rival.recording_metadata()
+        variants = [candidate for candidate in observations if candidate.uri == uri]
+        codes = {code for candidate in variants if (code := normalize_spotify_isrc(candidate.isrc))}
+        supporting = [
+            candidate for candidate in variants
+            if not candidate.version_title_review_only
+            and (not candidate.title_only_search or strategy == EXACT_TITLE_RECORDING_STRATEGY)
+        ]
+        if (
+            not spotify_track_uri_is_structurally_valid(uri) or not expected.album_id or not expected.album_name
+            or any(
+                not candidate.has_complete_recording_metadata or candidate.recording_metadata() != expected
+                or candidate.is_playable is False for candidate in variants
+            )
+            or len(codes) > 1
+            or not any(candidate.is_playable is True for candidate in supporting)
+        ):
+            return replace(hold, reason=f"{label} has incomplete or conflicting Spotify evidence")
+        isrc = next((code for candidate in supporting if (code := normalize_spotify_isrc(candidate.isrc))), "")
+        playable.append(replace(rival, is_playable=True, isrc=isrc))
+    if len(playable) > 1 and (
+        not playable[0].isrc or len({candidate.isrc for candidate in playable}) != 1
+        or len({candidate.album_id for candidate in playable}) != len(playable)
+    ):
+        return replace(hold, reason=f"{label} has competing copies without one shared recording code")
+
+    preferred = [
+        candidate for candidate in playable
+        if normalized_nonempty_music_values_match(track.album_name, candidate.album_name)
+    ]
+    if strategy == CATALOGUE_SPELLING_STRATEGY:
+        anchored = [
+            candidate for candidate in playable
+            if any(
+                candidate.uri == position.uri and candidate.recording_metadata() == position.recording_metadata()
+                for position in spelling_positions
+            )
+        ]
+        if not anchored:
+            return replace(hold, reason="catalogue spelling requires a verified recording or an independently aligned position")
+        preferred = anchored
+    choice = min(preferred or playable, key=lambda candidate: candidate.uri)
+    return replace(
+        hold, status=MATCHED, candidate=choice, spotify_uri=choice.uri, review_candidates=tuple(playable),
+        reason=f'{label} matched "{choice.name}"',
+    )
+
+
+def match_catalogue_variants(
+    track: PlaylistTrack,
+    observations: Sequence[SpotifyTrackCandidate],
+    search_queries: tuple[str, ...],
+    spelling_positions: Sequence[SpotifyTrackCandidate] = (),
+) -> TrackMatchDecision | None:
+    eligible = tuple(
+        candidate for candidate in observations if not candidate.version_title_review_only and not candidate.title_only_search
+    )
+    competitors: dict[str, list[SpotifyTrackCandidate]] = {}
+    credits = source_credit_names(track.artist_name)
+    for candidate in eligible:
+        strategy = catalogue_spelling_strategy(track.track_name, credits, candidate)
+        if strategy:
+            competitors.setdefault(strategy, []).append(candidate)
+    spelling_uris = {candidate.uri for candidate in competitors.get(CATALOGUE_SPELLING_STRATEGY, ())}
+    for position in spelling_positions:
+        if position.uri not in spelling_uris:
+            competitors.setdefault(CATALOGUE_SPELLING_STRATEGY, []).append(position)
+    if composer := _composer_prefix_candidates(track, eligible):
+        competitors[COMPOSER_PREFIX_STRATEGY] = list(composer)
+    matches = [
+        select_catalogue_recording(
+            track, rivals, observations, strategy, search_queries, spelling_positions=spelling_positions,
+        )
+        for strategy, rivals in competitors.items()
+    ]
+    if repeated := match_repeated_performer_credit(track, observations, search_queries):
+        matches.append(repeated)
+    if len(matches) > 1 and (not matches[0].spotify_uri or any(
+        decision.spotify_uri != matches[0].spotify_uri for decision in matches[1:]
+    )):
+        return TrackMatchDecision(
+            track, AMBIGUOUS, "", "catalogue spelling or credit rules found competing candidates",
+            review_candidates=deduplicate_spotify_track_candidates(tuple(
+                candidate for decision in matches for candidate in decision.review_candidates
+            )), search_queries=search_queries,
+        )
+    return matches[0] if matches else None
+
+
+def match_exact_title_recording(
+    track: PlaylistTrack,
+    observations: Sequence[SpotifyTrackCandidate],
+    search_queries: tuple[str, ...],
+    *,
+    title_search_complete: bool = False,
+) -> TrackMatchDecision | None:
+    competitors = tuple(
+        candidate for candidate in observations
+        if not candidate.version_title_review_only and exact_title_and_full_credits(track, candidate)
+    )
+    if not competitors:
+        return None
+    if not title_search_complete and any(candidate.title_only_search for candidate in competitors):
+        return TrackMatchDecision(
+            track, AMBIGUOUS, "", "exact-title results need review because title-only search coverage was incomplete",
+            review_candidates=deduplicate_spotify_track_candidates(competitors), search_queries=search_queries,
+        )
+    return replace(
+        select_catalogue_recording(track, competitors, observations, EXACT_TITLE_RECORDING_STRATEGY, search_queries),
+        title_search_complete=title_search_complete,
     )
 
 
@@ -828,13 +1194,13 @@ def track_match_error(track: PlaylistTrack, reason: str, search_queries: tuple[s
 def candidate_matches_track(track: PlaylistTrack, candidate: SpotifyTrackCandidate) -> bool:
     return (
         candidate_matches_track_and_artist(track, candidate)
-        and normalize_music_text(track.album_name) == normalize_music_text(candidate.album_name)
+        and normalized_nonempty_music_values_match(track.album_name, candidate.album_name)
     )
 
 
 def candidate_matches_track_and_artist(track: PlaylistTrack, candidate: SpotifyTrackCandidate) -> bool:
     return (
-        normalize_music_text(track.track_name) == normalize_music_text(candidate.name)
+        normalized_nonempty_music_values_match(track.track_name, candidate.name)
         and source_artist_matches_candidate(track.artist_name, candidate.artists)
     )
 
@@ -842,7 +1208,7 @@ def candidate_matches_track_and_artist(track: PlaylistTrack, candidate: SpotifyT
 def candidate_matches_original_mix_track(track: PlaylistTrack, candidate: SpotifyTrackCandidate) -> bool:
     return (
         candidate_matches_original_mix_track_and_artist(track, candidate)
-        and normalize_music_text(track.album_name) == normalize_music_text(candidate.album_name)
+        and normalized_nonempty_music_values_match(track.album_name, candidate.album_name)
     )
 
 
@@ -854,7 +1220,7 @@ def candidate_matches_original_mix_track_and_artist(
     base_track_name = title_without_original_mix_suffix(source_track_name)
     return (
         base_track_name != source_track_name
-        and normalize_music_text(base_track_name) == normalize_music_text(candidate.name)
+        and normalized_nonempty_music_values_match(base_track_name, candidate.name)
         and source_artist_matches_candidate(track.artist_name, candidate.artists)
     )
 
@@ -869,7 +1235,7 @@ def candidate_matches_spotify_original_annotation(
     source_album = normalize_music_text(track.album_name)
     return bool(
         base_candidate_title != candidate_title
-        and normalize_music_text(track.track_name) == normalize_music_text(base_candidate_title)
+        and normalized_nonempty_music_values_match(track.track_name, base_candidate_title)
         and source_artist_set
         and source_artist_set == normalized_candidate_artist_set(candidate.artists)
         and source_album
@@ -883,7 +1249,7 @@ def candidate_matches_one_sided_featured_credit_track(
 ) -> bool:
     return (
         candidate_matches_one_sided_featured_credit_track_and_artist(track, candidate)
-        and normalize_music_text(track.album_name) == normalize_music_text(candidate.album_name)
+        and normalized_nonempty_music_values_match(track.album_name, candidate.album_name)
     )
 
 
@@ -904,7 +1270,7 @@ def candidate_matches_one_sided_featured_credit_track_and_artist(
     else:
         return False
     return (
-        normalize_music_text(base_title) == normalize_music_text(compared_title)
+        normalized_nonempty_music_values_match(base_title, compared_title)
         and source_artist_matches_candidate_without_featured_credit(
             track.artist_name,
             featured_artist_name,
@@ -1017,6 +1383,9 @@ def tightly_constrained_title_distance(source_title: str, candidate_title: str) 
         return None
 
     source_token, candidate_token = differing_tokens[0]
+    # An edit distance does not distinguish an accented letter or another script from a typo.
+    if not source_token.isascii() or not candidate_token.isascii():
+        return None
     if min(len(source_token), len(candidate_token)) < MINIMUM_TYPO_TOKEN_LENGTH:
         return None
     if source_token in PROTECTED_TITLE_TOKENS or candidate_token in PROTECTED_TITLE_TOKENS:
@@ -1103,6 +1472,12 @@ def source_artist_set_is_subset_of_candidate(
 
 
 def source_artist_matches_candidate(artist_name: str, candidate_artists: tuple[str, ...]) -> bool:
+    source_names = source_credit_names(artist_name)
+    if len(source_names) > 1 and (
+        any(has_legacy_loss(name) for name in (*source_names, *candidate_artists))
+        or any(artist_spelling_difference(source, candidate) for source in source_names for candidate in candidate_artists)
+    ):
+        return source_artist_set_is_subset_of_candidate(artist_name, candidate_artists)
     return any(
         normalized_artist_in_candidates(source_artist_name, candidate_artists)
         for source_artist_name in source_artist_match_names(artist_name)
@@ -1164,11 +1539,6 @@ def normalized_artist_in_candidates(artist_name: str, candidate_artists: tuple[s
     return bool(artist_key) and artist_key in {normalize_music_text(artist) for artist in candidate_artists}
 
 
-def normalize_recording_evidence_text(value: str) -> str:
-    text = unicodedata.normalize("NFC", value).casefold()
-    return " ".join(unicodedata.normalize("NFC", text).split())
-
-
 def artist_spelling(value: str) -> str:
     """Compare documented artist spellings while preserving letters, accents and words."""
     text = normalize_recording_evidence_text(value)
@@ -1185,6 +1555,15 @@ def recording_proof_source_matches(track: PlaylistTrack, *, title: str, artist: 
 
 
 def normalize_music_text(value: str) -> str:
+    return " ".join("".join(
+        character if character not in LETTERLIKE_APOSTROPHE_CHARACTERS
+        and unicodedata.category(character)[0] in "LMN" else " "
+        for character in normalize_recording_evidence_text(value)
+    ).split())
+
+
+def legacy_music_text(value: str) -> str:
+    """Read the original on-disk cache key without applying it to matching."""
     normalized = unicodedata.normalize("NFKD", value)
     punctuation_separated = "".join(
         " "
@@ -1196,6 +1575,12 @@ def normalize_music_text(value: str) -> str:
     ascii_text = punctuation_separated.encode("ascii", "ignore").decode("ascii")
     ascii_text = re.sub(r"[^a-zA-Z0-9]+", " ", ascii_text.casefold())
     return re.sub(r"\s+", " ", ascii_text).strip()
+
+
+def has_legacy_loss(value: str) -> bool:
+    return bool(value.strip()) and (
+        not (current := normalize_music_text(value)) or current != legacy_music_text(value)
+    )
 
 
 def spotify_candidate_identity_key(target_playlist_name: str, candidate: SpotifyTrackCandidate) -> str:
@@ -1216,10 +1601,10 @@ def spotify_track_identity_key(
     normalized_artists = normalized_identity_artists(artist_names)
     return "|".join(
         (
-            normalize_music_text(target_playlist_name),
-            " ".join(normalized_artists),
-            normalize_music_text(album_name),
-            normalize_music_text(track_name),
+            music_identity_component(target_playlist_name),
+            ",".join(normalized_artists),
+            music_identity_component(album_name),
+            music_identity_component(track_name),
         )
     )
 
@@ -1228,10 +1613,22 @@ def normalized_identity_artists(artist_names: Sequence[str]) -> tuple[str, ...]:
     return tuple(
         sorted(
             normalized_artist
-            for normalized_artist in (normalize_music_text(artist_name) for artist_name in artist_names)
+            for normalized_artist in (music_identity_component(artist_name) for artist_name in artist_names)
             if normalized_artist
         )
     )
+
+
+def music_identity_component(value: str) -> str:
+    if normalized := normalize_music_text(value):
+        return normalized
+    literal = normalize_recording_evidence_text(value)
+    return "#" + literal.encode("utf-8").hex() if literal else ""
+
+
+def legacy_spotify_track_identity_key(target: str, artists: Sequence[str], album: str, title: str) -> str:
+    legacy_artists = sorted(key for name in artists if (key := legacy_music_text(name)))
+    return "|".join((legacy_music_text(target), " ".join(legacy_artists), legacy_music_text(album), legacy_music_text(title)))
 
 
 def normalize_alphanumeric_spacing(value: str) -> str:

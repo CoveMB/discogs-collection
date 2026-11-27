@@ -38,6 +38,10 @@ class UnverifiedPressing(ValueError):
     """The catalog evidence does not identify the exact source pressing."""
 
 
+class MissingPressingLink(UnverifiedPressing):
+    """MusicBrainz has no link to the Discogs pressing."""
+
+
 @dataclass(frozen=True)
 class DiscogsTrackEvidence:
     position: str
@@ -151,7 +155,7 @@ class MusicBrainzClient:
         resource = f"https://www.discogs.com/release/{release_id}"
         links = self.read("url", resource=resource, inc="release-rels")
         if links is None:
-            raise UnverifiedPressing("MusicBrainz has no relationship to the exact Discogs release URL.")
+            raise MissingPressingLink("MusicBrainz has no relationship to the exact Discogs release URL.")
         if links.get("resource") != resource:
             raise IncompleteMusicBrainzEvidence("MusicBrainz returned a different URL resource.")
         release_ids = {
@@ -160,6 +164,8 @@ class MusicBrainzClient:
         }
         if "" in release_ids:
             raise IncompleteMusicBrainzEvidence("A MusicBrainz release relationship has an invalid ID.")
+        if not release_ids:
+            raise MissingPressingLink("No active Discogs pressing relationship was found.")
         valid: list[PressingEvidence] = []
         reasons: list[str] = []
         for mbid in sorted(release_ids):
@@ -174,7 +180,7 @@ class MusicBrainzClient:
             return valid[0]
         if valid:
             raise UnverifiedPressing("More than one MusicBrainz release corroborates the exact pressing.")
-        raise UnverifiedPressing(" ".join(dict.fromkeys(reasons)) or "No active Discogs pressing relationship was found.")
+        raise UnverifiedPressing(" ".join(dict.fromkeys(reasons)))
 
     def recordings_for_isrc(self, isrc: str) -> frozenset[str]:
         if not recording_code(isrc):

@@ -1,3 +1,4 @@
+import argparse
 import csv
 import io
 import json
@@ -112,6 +113,10 @@ class SpotifyArtistReviewTests(unittest.TestCase):
         self.assertEqual(request.method, "GET")
         self.assertEqual(request.headers["Authorization"], "Bearer fictional-access")
         url = urlsplit(request.url)
+        if url.path.startswith("/v1/tracks/"):
+            self.assertEqual(url.netloc, "api.spotify.com")
+            response = self.search_responses.get(url.path)
+            return HttpResponse(200, {}, json.dumps(response)) if response else HttpResponse(404, {}, "{}")
         self.assertEqual((url.netloc, url.path), ("api.spotify.com", "/v1/search"))
         params = parse_qs(url.query)
         self.assertEqual(params["type"], ["track"])
@@ -279,16 +284,103 @@ class SpotifyArtistReviewTests(unittest.TestCase):
         self.assertEqual(artifact["matches"][0]["spotify_album_name"], "Field Notes")
         self.assertEqual(self.proposals.stat().st_mode & 0o777, 0o600)
 
-    def test_recording_proposal_spends_no_isrc_requests_on_new_singleton(self) -> None:
+    def test_recording_proposal_verifies_single_discovered_alias(self) -> None:
         track, link, pressing, reverse = self.recording_fixture(alias=True)
         self.cache_negative(track)
         self.search_responses[PRINTED_QUERY] = []
-        self.search_responses[CANONICAL_QUERY] = [spotify_hit("studio", "Mara Vale")]
+        self.search_responses[CANONICAL_QUERY] = [spotify_hit("studio", "Mara Vale", album="Field Notes")]
+        self.set_isrc_hits(reverse["isrc"], self.recording_hit("studio", reverse["isrc"]))
         report, paths = self.run_recording_review(link, pressing, reverse)
-        self.assertEqual(paths, [])
-        self.assertEqual(len(self.requests), 2)
-        self.assertEqual(report["rows"][0]["status"], "suggestions")
+        self.assertEqual(len(paths), 3)
+        self.assertEqual(report["rows"][0]["status"], "proposal")
+
+    def test_recording_proposal_verifies_singleton_with_optional_mark_and_no_artist_alias(self) -> None:
+        track, link, pressing, reverse = self.recording_fixture()
+        track = replace(track, track_name="Night Signál")
+        self.write_master("Fictional Shelf", (track,))
+        self.payload["tracklist"] = [discogs_track(track.track_name, "1", duration="3:02")]
+        mb_track = pressing["media"][0]["tracks"][0]
+        mb_track["title"] = mb_track["recording"]["title"] = track.track_name
+        self.cache_negative(track, SpotifyTrackCandidate(
+            "spotify:track:studio", "Night Signal", ("Mara Vale",), "Field Notes", "FieldNotes",
+        ))
+        self.set_isrc_hits(reverse["isrc"], self.recording_hit("studio", reverse["isrc"]))
+        report, paths = self.run_recording_review(link, pressing, reverse)
+        self.assertEqual(len(paths), 3)
+        row, = report["rows"]
+        self.assertEqual(row["status"], "proposal")
+        self.assertEqual(row["recording_proof"]["chosen"]["uri"], "spotify:track:studio")
+        self.assertEqual(manual_matches.import_manual_match_overrides(self.proposals, self.root, self.cache).planned_count, 1)
+
+    def test_recording_proposal_verifies_single_exact_title_and_artist(self) -> None:
+        track, link, pressing, reverse = self.recording_fixture()
+        self.cache_negative(track, SpotifyTrackCandidate(
+            "spotify:track:studio", "Night Signal", ("Mara Vale",), "Field Notes", "FieldNotes",
+        ))
+        self.set_isrc_hits(reverse["isrc"], self.recording_hit("studio", reverse["isrc"]))
+        report, paths = self.run_recording_review(link, pressing, reverse)
+        self.assertEqual(len(paths), 3)
+        self.assertEqual(report["rows"][0]["status"], "proposal")
+
+    def test_recording_review_checks_missing_cross_album_evidence_once_per_uri(self) -> None:
+        track, link, pressing, reverse = self.recording_fixture()
+        self.seed_recording_tie(track)
+        self.write_master("Second Shelf", (track,))
+        link["relations"] = []
+        self.search_responses["/v1/tracks/studio"] = self.recording_hit("studio", reverse["isrc"])
+        self.search_responses["/v1/tracks/other"] = self.recording_hit("other", "ZZABC2600099", album="Other Disc")
+        report, _ = self.run_recording_review(link, pressing, reverse)
+        self.assertCountEqual([urlsplit(request.url).path for request in self.requests],
+                              ["/v1/tracks/studio", "/v1/tracks/other"])
+        row, = report["rows"]
+        self.assertEqual(row["status"], "recording_unverified")
+        self.assertTrue(any("track_lookup" in observation["origins"] and observation["is_playable"]
+                            for result in row["candidates"] for observation in result["observations"]))
         self.assertEqual(json.loads(self.proposals.read_text())["matches"], [])
+
+    def test_read_only_review_checks_known_exact_tie_even_without_a_proposal_file(self) -> None:
+        track, _, _, reverse = self.recording_fixture()
+        self.cache_negative(
+            track, SpotifyTrackCandidate("spotify:track:studio", "Night Signal", ("Mara Vale",), "", ""),
+            SpotifyTrackCandidate("spotify:track:other", "Night Signal", ("Mara Vale",), "Other Disc", "OtherDisc"),
+        )
+        self.search_responses["/v1/tracks/studio"] = self.recording_hit("studio", reverse["isrc"])
+        self.search_responses["/v1/tracks/other"] = self.recording_hit("other", "ZZABC2600099", album="Other Disc")
+        report, _ = self.run_review()
+        self.assertCountEqual([urlsplit(request.url).path for request in self.requests],
+                              ["/v1/tracks/studio", "/v1/tracks/other"])
+        row, = report["rows"]
+        self.assertEqual(row["status"], "suggestions")
+        self.assertCountEqual([item["uri"] for item in row["candidates"]], ["spotify:track:studio", "spotify:track:other"])
+
+    def test_read_only_alias_review_retains_the_missing_track_lookup_diagnostic(self) -> None:
+        track, _, _, _ = self.recording_fixture(alias=True)
+        self.seed_recording_tie(track)
+        self.search_responses.update({PRINTED_QUERY: [], CANONICAL_QUERY: []})
+        report, _ = self.run_review()
+        self.assertCountEqual([urlsplit(request.url).path for request in self.requests],
+                              ["/v1/search", "/v1/search", "/v1/tracks/studio", "/v1/tracks/other"])
+        row, = report["rows"]
+        self.assertEqual(row["status"], "suggestions")
+        self.assertIn("track lookup lacked complete", row["reason"])
+
+    def test_review_keeps_conflicting_search_observations_when_track_lookups_are_unnecessary(self) -> None:
+        track, _, _, reverse = self.recording_fixture()
+        code = reverse["isrc"]
+        row = review_track_matches.ReviewRow({}, ["Fictional Shelf"])
+        review_track_matches.bind_discogs_sources(self.payload, RELEASE_ID, ((track, row),))
+        first = SpotifyTrackCandidate("spotify:track:studio", "Night Signal", ("Mara Vale",),
+                                      "Field Notes", "FieldNotes", code, True)
+        other = replace(first, uri="spotify:track:other", album_name="Other Disc", album_id="OtherDisc")
+        evidence = review_track_matches.CandidateEvidence((first, other))
+        search = review_track_matches.SpotifySearch(argparse.Namespace())
+        search.pages["other query"] = review_track_matches.RawSearchPage({
+            "items": [{**self.recording_hit("studio", code), "name": "Night Signal (Live)"}]
+        })
+        with patch.object(search, "get_track", side_effect=AssertionError("Unnecessary track lookup")):
+            review_track_matches.report_incomplete_recording_tie(track, row, evidence, search)
+        result = next(candidate for candidate in row.candidates if candidate["uri"] == first.uri)
+        self.assertTrue(result["conflicting_observations"])
 
     def test_recording_proposal_rejects_reverse_isrc_clash(self) -> None:
         track, link, pressing, reverse = self.recording_fixture()
@@ -765,7 +857,9 @@ class SpotifyArtistReviewTests(unittest.TestCase):
         report, discogs_calls = self.run_review()
         row, = report["rows"]
         self.assertEqual(discogs_calls, 1)
-        self.assertEqual(len(self.requests), 2)
+        self.assertCountEqual([urlsplit(request.url).path for request in self.requests], [
+            "/v1/search", "/v1/search", "/v1/tracks/printed", "/v1/tracks/canonical", "/v1/tracks/oldcanonical",
+        ])
         self.assertEqual(row["source"]["track_number"], "1")
         self.assertEqual(row["source"]["discogs_position"], "A1")
         self.assertEqual(row["source"]["artist"], "M. Vale")
@@ -974,7 +1068,8 @@ class SpotifyArtistReviewTests(unittest.TestCase):
 
         report, _ = self.run_review()
         row, = report["rows"]
-        self.assertEqual([candidate["uri"] for candidate in row["candidates"]], ["spotify:track:formatting"])
+        self.assertEqual([candidate["uri"] for candidate in row["candidates"]],
+                         ["spotify:track:formatting", "spotify:track:accent", "spotify:track:titleaccent"])
 
     def test_separate_featuring_credits_hold_the_source(self) -> None:
         self.write_master("Shelf A", (TRACK,))
