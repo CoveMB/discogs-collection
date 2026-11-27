@@ -47,6 +47,7 @@ from publishers.spotify.match_cache import (
     load_spotify_track_match_cache,
     source_bound_cached_candidates,
     spotify_track_match_key,
+    source_track_binding,
     track_match_cache_entry,
 )
 from publishers.spotify.matching import (
@@ -58,13 +59,16 @@ from publishers.spotify.matching import (
     SpotifyRecordingMetadata,
     SpotifyTrackCandidate,
     artist_spelling,
+    artist_spelling_difference,
     build_spotify_track_search_query,
+    catalogue_spelling_strategy,
     normalize_recording_evidence_text,
     spotify_track_uri_is_structurally_valid,
 )
 from publishers.spotify.musicbrainz_recordings import (
     DiscogsTrackEvidence,
     IncompleteMusicBrainzEvidence,
+    MissingPressingLink,
     MusicBrainzClient,
     UnverifiedPressing,
     conflicting_recording_claims,
@@ -76,6 +80,7 @@ from publishers.spotify.recording_proposals import (
     SpotifyRecordingHit,
     check_spotify_recordings,
     ordered_editions,
+    track_id,
 )
 from publishers.spotify.session import SpotifySession, get_spotify_access_token, load_existing_token
 from shared.discogs_api import DEFAULT_REQUEST_INTERVAL_SECONDS, DiscogsRateLimiter, default_discogs_rate_limit
@@ -109,9 +114,15 @@ class ReviewRow:
 
 @dataclass
 class CandidateEvidence:
-    prior_status: str
     cached_hits: tuple[SpotifyTrackCandidate, ...]
-    discovery_hits: list[SpotifyTrackCandidate] = field(default_factory=list)
+    prior_status: str = ""
+    discovery_origins: dict[tuple[SpotifyTrackCandidate, SpotifyRecordingMetadata], list[str]] = field(default_factory=dict)
+
+    def observations(self) -> dict[tuple[SpotifyTrackCandidate, SpotifyRecordingMetadata], list[str]]:
+        observations = {(hit, hit.recording_metadata()): ["cached_review"] for hit in self.cached_hits}
+        for key, origins in self.discovery_origins.items():
+            observations.setdefault(key, []).extend(origins)
+        return observations
 
 
 @dataclass(frozen=True)
@@ -175,13 +186,7 @@ def source_groups(tracks: Sequence[PlaylistTrack], release_id: str) -> list[tupl
             continue
         sources = groups.setdefault(spotify_track_match_key(track), [])
         for source, row in sources:
-            if (
-                track == replace(source, playlist_name=track.playlist_name, spotify_search_query=track.spotify_search_query)
-                or compare_manual_source(
-                    source, release_id=track.release_id, track_number=track.track_number,
-                    title=track.track_name, artist=track.artist_name, album=track.album_name,
-                )
-            ):
+            if source_track_binding(track) == source_track_binding(source):
                 if track.playlist_name not in row.playlists:
                     row.playlists.append(track.playlist_name)
                 break
@@ -209,12 +214,15 @@ def assess_row(
 ) -> CandidateEvidence | None:
     primary = matches.get(spotify_track_match_key(track))
     _, selected = track_match_cache_entry(track, matches)
-    records = (primary, selected)
-    if any(record is not None and strict_text(record.get("match_status")) == "manual" for record in records):
+    other_manual_holds = (
+        primary is not None and primary is not selected and primary.get("match_status") == "manual"
+        and (proposals or not spotify_track_uri_is_structurally_valid(strict_text(primary.get("spotify_uri"))))
+    )
+    if other_manual_holds or (selected is not None and selected.get("match_status") == "manual"):
         row.status, row.reason = "manual_hold", "The match cache key has a manual owner."
-    elif any(cache_record_has_recording_conflict(record) for record in records):
+    elif cache_record_has_recording_conflict(selected) or (proposals and cache_record_has_recording_conflict(primary)):
         row.status, row.reason = "recording_conflict", "The match cache has a recording-conflict hold."
-    elif proposals and any(record is not None and strict_text(record.get("match_status")) == MATCHED for record in records):
+    elif proposals and any(record is not None and record.get("match_status") == MATCHED for record in (primary, selected)):
         row.status, row.reason = "already_matched", "The match cache key has a positive match."
     elif (effective := cached_track_match(track, matches)) and effective.decision.status == MATCHED:
         row.status, row.reason = "already_matched", "The publisher has a current match."
@@ -224,7 +232,9 @@ def assess_row(
         and effective.decision.status in {AMBIGUOUS, UNMATCHED}
         and compare_cached_manual_source(track, selected) is True
     ):
-        return CandidateEvidence(effective.decision.status, source_bound_cached_candidates(selected))
+        return CandidateEvidence(
+            source_bound_cached_candidates(selected, allow_incomplete_album=True), effective.decision.status,
+        )
     else:
         row.status = "unassessed"
         row.reason = "Run the ordinary publisher preview to obtain a current assessment for this exact source."
@@ -308,17 +318,27 @@ def bind_discogs_sources(
 
 def matching_credits(
     source_title: str, credits: tuple[DiscogsCredit, ...], hit: SpotifyTrackCandidate,
+    *,
+    allow_variants: bool = False,
+    allow_incomplete_album: bool = False,
 ) -> list[dict[str, object]] | None:
-    if not hit.has_complete_recording_metadata or (
-        normalize_recording_evidence_text(source_title) != normalize_recording_evidence_text(hit.name)
+    metadata = hit.recording_metadata()
+    if (
+        hit.version_title_review_only or not metadata.title or not metadata.artist_names
+        or (not hit.has_complete_recording_metadata and not allow_incomplete_album)
     ):
         return None
     if len(hit.artists) != len(credits):
         return None
-    # Different Discogs credits with overlapping spellings were rejected at source binding.
+    source_title_matches = normalize_recording_evidence_text(source_title) == normalize_recording_evidence_text(hit.name)
+    if not allow_variants and not source_title_matches:
+        return None
     remaining = list(credits)
     evidence: list[dict[str, object]] = []
-    for artist in hit.artists:
+    expected: list[str] = []
+    artist_variation = False
+    documented = {artist_spelling(name) for credit in credits for name in (credit.printed, credit.canonical)}
+    for artist in sorted(hit.artists, key=lambda name: artist_spelling(name) not in documented):
         name = artist_spelling(artist)
         for index, credit in enumerate(remaining):
             printed = name == artist_spelling(credit.printed)
@@ -329,10 +349,30 @@ def matching_credits(
                     "discogs_artist_id": credit.artist_id,
                     "spelling": "both" if printed and canonical else "printed" if printed else "canonical",
                 })
+                expected.append(name)
                 remaining.pop(index)
                 break
         else:
-            return None
+            if not allow_variants:
+                return None
+            options = []
+            for index, credit in enumerate(remaining):
+                for value in (credit.printed, credit.canonical):
+                    base = artist_spelling(value)
+                    if artist_spelling_difference(base, name):
+                        options.append((index, base))
+                        break
+            if len(options) != 1:
+                return None
+            index, chosen = options[0]
+            credit = remaining.pop(index)
+            expected.append(chosen)
+            evidence.append({"artist": artist, "discogs_artist_id": credit.artist_id, "spelling": "catalogue variation"})
+            artist_variation = True
+    if (not source_title_matches or artist_variation) and not catalogue_spelling_strategy(
+        source_title, expected, replace(hit, artists=tuple(artist_spelling(artist) for artist in hit.artists)),
+    ):
+        return None
     return evidence
 
 
@@ -396,20 +436,38 @@ class SpotifySearch:
         self.access_token = ""
         self.stopped = ""
         self.pages: dict[str, RawSearchPage] = {}
+        self.track_details: dict[str, SpotifyTrackCandidate | None] = {}
+
+    def active_client(self) -> SpotifyClient | None:
+        if self.stopped:
+            return None
+        if self.client is None:
+            try:
+                self.client, self.access_token = open_spotify_search(self.args)
+            except (SpotifyAuthenticationError, ValueError, OSError, http.client.HTTPException):
+                self.stopped = "Spotify authentication could not start. Check the OAuth settings or reauthorize."
+        return self.client
 
     def get(self, query: str) -> RawSearchPage | None:
-        if query not in self.pages and not self.stopped:
-            if self.client is None:
-                try:
-                    self.client, self.access_token = open_spotify_search(self.args)
-                except (SpotifyAuthenticationError, ValueError, OSError, http.client.HTTPException):
-                    self.stopped = "Spotify authentication could not start. Check the OAuth settings or reauthorize."
-            if self.client is not None:
-                page = search_raw_page(self.client, self.access_token, query)
-                self.pages[query] = page
-                if page.terminal:
-                    self.stopped = page.reason
+        if query not in self.pages and (client := self.active_client()) is not None:
+            page = search_raw_page(client, self.access_token, query)
+            self.pages[query] = page
+            if page.terminal:
+                self.stopped = page.reason
         return self.pages.get(query)
+
+    def get_track(self, uri: str) -> SpotifyTrackCandidate | None:
+        if uri not in self.track_details and (identifier := track_id(uri)) and (client := self.active_client()):
+            self.track_details[uri] = None
+            try:
+                self.track_details[uri] = client.get_track_observation(self.access_token, identifier)
+            except SpotifyAuthenticationError:
+                self.stopped = "Spotify authentication failed. Reauthorize before restarting."
+            except (SpotifyRateLimitDeferredError, SpotifyRateLimitRetriesExhaustedError) as error:
+                self.stopped = f"Spotify rate limit. Retry after {format_wait_duration(error.retry_after_seconds)}."
+            except (SpotifyApiError, OSError, http.client.HTTPException, UnicodeDecodeError):
+                pass
+        return self.track_details.get(uri)
 
 
 def review_search_page(raw: RawSearchPage) -> SearchPage:
@@ -436,11 +494,16 @@ def observations_conflict(left: SpotifyTrackCandidate, right: SpotifyTrackCandid
             known_artists = Counter(normalize_recording_evidence_text(artist) for artist in partial.artists)
             if known_artists - Counter(complete_artists):
                 return True
-    return bool(left.isrc and right.isrc and left.isrc != right.isrc)
+    return bool(
+        (left.isrc and right.isrc and left.isrc != right.isrc)
+        or (left.is_playable is not None and right.is_playable is not None and left.is_playable != right.is_playable)
+    )
 
 
 def report_candidates(
     track: PlaylistTrack, row: ReviewRow, observations: Mapping[tuple[SpotifyTrackCandidate, SpotifyRecordingMetadata], list[str]],
+    *,
+    allow_variants: bool = False,
 ) -> None:
     by_uri: dict[str, list[tuple[SpotifyTrackCandidate, dict[str, object]]]] = {}
     for (hit, metadata), origins in observations.items():
@@ -450,10 +513,11 @@ def report_candidates(
             "album": hit.album_name,
             "album_id": hit.album_id,
             "isrc": hit.isrc,
+            "is_playable": hit.is_playable,
             "origins": origins,
             "metadata_complete": hit.has_complete_recording_metadata,
             "artist_credits_complete": bool(metadata.artist_names),
-            "credit_evidence": matching_credits(track.track_name, row.discogs_credits, hit),
+            "credit_evidence": matching_credits(track.track_name, row.discogs_credits, hit, allow_variants=allow_variants),
         }))
     for uri, variants in by_uri.items():
         if not any(observation["credit_evidence"] is not None for _, observation in variants):
@@ -470,13 +534,12 @@ def report_candidates(
 def collect_candidates(
     search: SpotifySearch, rows: Sequence[tuple[PlaylistTrack, ReviewRow]],
     candidates: Mapping[PlaylistTrack, CandidateEvidence],
+    *,
+    allow_variants: bool = False,
 ) -> None:
     for track, row in rows:
         credit = next(credit for credit in row.discogs_credits if credit.printed != credit.canonical)
         evidence = candidates[track]
-        observations: dict[tuple[SpotifyTrackCandidate, SpotifyRecordingMetadata], list[str]] = {
-            (hit, hit.recording_metadata()): ["cached_review"] for hit in evidence.cached_hits
-        }
         for origin, artist_name in (("printed_search", credit.printed), ("canonical_search", credit.canonical)):
             query = build_spotify_track_search_query(replace(track, artist_name=artist_name, album_name=""))
             entry = {"origin": origin, "credit": artist_name, "query": query}
@@ -487,12 +550,11 @@ def collect_candidates(
             else:
                 page = review_search_page(raw)
                 entry.update(status="incomplete" if page.reason else "complete", reason=page.reason)
-                evidence.discovery_hits.extend(page.hits)
                 for hit in page.hits:
-                    origins = observations.setdefault((hit, hit.recording_metadata()), [])
+                    origins = evidence.discovery_origins.setdefault((hit, hit.recording_metadata()), [])
                     if origin not in origins:
                         origins.append(origin)
-        report_candidates(track, row, observations)
+        report_candidates(track, row, evidence.observations(), allow_variants=allow_variants)
         if any(query["status"] != "complete" for query in row.queries):
             row.status, row.reason = "incomplete", "At least one Spotify search was incomplete."
         else:
@@ -530,8 +592,8 @@ def unresolved_uris(track: PlaylistTrack, row: ReviewRow, evidence: CandidateEvi
     if row.status == "no_variation" and evidence.prior_status != AMBIGUOUS:
         return set()
     return {
-        hit.uri for hit in (*evidence.cached_hits, *evidence.discovery_hits)
-        if matching_credits(track.track_name, row.discogs_credits, hit) is not None
+        hit.uri for hit, _ in evidence.observations()
+        if matching_credits(track.track_name, row.discogs_credits, hit, allow_variants=True) is not None
     }
 
 
@@ -567,7 +629,7 @@ def resolve_recording_proposals(
             if row.status == "no_variation":
                 report_candidates(track, row, {
                     (hit, hit.recording_metadata()): ["cached_review"] for hit in evidence.cached_hits
-                })
+                }, allow_variants=True)
             rows_to_verify.append((track, row, uris))
     if not rows_to_verify:
         return []
@@ -579,9 +641,11 @@ def resolve_recording_proposals(
         source_tracks = source_evidence(payload)
         pressing = musicbrainz.pressing(args.release_id, payload, source_tracks)
     except (UnverifiedPressing, IncompleteMusicBrainzEvidence) as error:
-        for _, row, _ in rows_to_verify:
+        for track, row, _ in rows_to_verify:
             row.status = "incomplete" if isinstance(error, IncompleteMusicBrainzEvidence) else "recording_unverified"
             row.reason = str(error)
+            if isinstance(error, MissingPressingLink):
+                report_incomplete_recording_tie(track, row, candidates[track], search)
         return []
 
     conflicts = conflicting_recording_claims(source_tracks, pressing.tracks)
@@ -647,7 +711,7 @@ def resolve_recording_proposals(
         assessment = assess_row(track, latest_row, matches, proposals=True)
         if assessment is not None:
             if initial is not None:
-                assessment.discovery_hits = initial.discovery_hits
+                assessment.discovery_origins = initial.discovery_origins
             cached_observations.extend(assessment.cached_hits)
         elif latest_row.status != "unassessed":
             cached_observations.extend(held_cache_observations(track, matches))
@@ -664,11 +728,12 @@ def resolve_recording_proposals(
         try:
             hits, reason = check_spotify_recordings(
                 lookup.items, lookup.code, lookup.durations, lookup.candidate_uris, cached_observations, catalog_observations,
-                lambda hit: matching_credits(track.track_name, row.discogs_credits, hit) is not None,
+                lambda hit: matching_credits(track.track_name, row.discogs_credits, hit, allow_variants=True) is not None,
                 observations_conflict,
             )
         except IncompleteSpotifyRecordingEvidence as error:
             row.status, row.reason = "incomplete", str(error)
+            report_incomplete_recording_tie(track, row, candidates[track], search)
             continue
         if not hits:
             row.status, row.reason = "recording_unverified", reason
@@ -688,6 +753,40 @@ def resolve_recording_proposals(
             continue
         overrides.append(recording_override(track, row, current_hits))
     return overrides
+
+
+def report_incomplete_recording_tie(
+    track: PlaylistTrack, row: ReviewRow, evidence: CandidateEvidence, search: SpotifySearch,
+) -> None:
+    observations = evidence.observations()
+    rivals = [hit for hit, _ in observations if matching_credits(
+        track.track_name, row.discogs_credits, hit, allow_incomplete_album=True,
+    ) is not None]
+    uris = {hit.uri for hit in rivals}
+    if len(uris) < 2 or len({(hit.album_id, hit.album_name) for hit in rivals}) < 2:
+        return
+    if len(uris) > 10:
+        row.reason += " The track lookup limit is ten candidates."
+        return
+    prior_observation_count = len(observations)
+    for page in search.pages.values():
+        if page.tracks is not None and isinstance(items := page.tracks.get("items"), list):
+            for hit in parse_search_track_items(items):
+                if hit.uri in uris:
+                    observations.setdefault((hit, hit.recording_metadata()), ["spotify_search"])
+    complete = {hit.uri for hit, _ in observations if hit.uri in uris and hit.has_complete_recording_metadata
+                and hit.isrc and hit.is_playable is not None}
+    if complete == uris and len(observations) == prior_observation_count:
+        return
+    incomplete = False
+    for uri in sorted(uris - complete):
+        if (hit := search.get_track(uri)) is not None:
+            observations.setdefault((hit, hit.recording_metadata()), []).append("track_lookup")
+        incomplete = incomplete or hit is None or not hit.isrc or hit.is_playable is None
+    row.candidates.clear()
+    report_candidates(track, row, observations, allow_variants=True)
+    if incomplete:
+        row.reason += " At least one track lookup lacked complete recording evidence."
 
 
 def source_is_importable(track: PlaylistTrack, same_key: Sequence[PlaylistTrack]) -> bool:
@@ -762,10 +861,26 @@ def review_release(args: argparse.Namespace) -> list[ReviewRow]:
         except (RuntimeError, OSError, http.client.HTTPException):
             for _, row in pending:
                 row.status, row.reason = "incomplete", "The Discogs pressing request failed."
-        collect_candidates(search, [(track, row) for track, row in pending if row.status == "pending"], candidates)
+        collect_candidates(
+            search, [(track, row) for track, row in pending if row.status == "pending"], candidates,
+            allow_variants=True,
+        )
     if proposals:
         overrides = resolve_recording_proposals(args, payload, rows, candidates, matches, search)
         write_proposals(args.proposals, overrides, args.playlist_output_directory, args.match_cache)
+    else:
+        for track, row in pending:
+            previous_reason = row.reason
+            if row.status == "no_variation":
+                report_candidates(track, row, candidates[track].observations(), allow_variants=True)
+                row.reason = ""
+            if row.status in {"no_variation", "suggestions", "no_suggestions"}:
+                report_incomplete_recording_tie(track, row, candidates[track], search)
+                if row.candidates and row.status in {"no_variation", "no_suggestions"}:
+                    row.status = "suggestions"
+                    row.reason = ("Candidates for the documented Discogs credits. " + row.reason.strip()).strip()
+            if not row.reason and previous_reason and row.status == "no_variation":
+                row.reason = previous_reason
     return [row for _, row in rows]
 
 

@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import combinations
 
-from publishers.spotify.client import parse_search_track_items
+from publishers.spotify.client import parse_search_track_items, spotify_track_is_unavailable
 from publishers.spotify.matching import (
     PlaylistTrack,
     SpotifyTrackCandidate,
@@ -43,19 +43,6 @@ def artist_ids(item: Mapping[str, object]) -> tuple[str, ...]:
         artist["id"] if isinstance(artist, dict) and isinstance(artist.get("id"), str) else ""
         for artist in artists
     ) if isinstance(artists, list) else ()
-
-
-def unavailable(item: Mapping[str, object]) -> bool:
-    album = item.get("album")
-    return any(
-        item.get(field) not in allowed for field, allowed in (
-            ("restrictions", (None, {})),
-            ("linked_from", (None, {})),
-        )
-    ) or (
-        ("is_local" in item and item["is_local"] is not False)
-        or (isinstance(album, dict) and album.get("restrictions") not in (None, {}))
-    )
 
 
 def conflicting_observation(
@@ -105,7 +92,7 @@ def check_spotify_recordings(
         ):
             raise IncompleteSpotifyRecordingEvidence("Spotify returned malformed playability evidence.")
 
-        all_playable = all_playable and item.get("is_playable") is True and not unavailable(item)
+        all_playable = all_playable and item.get("is_playable") is True and not spotify_track_is_unavailable(item)
         by_uri.setdefault(track.uri, []).append(SpotifyRecordingHit(track, duration, ids))
 
     if not all_playable:
@@ -145,8 +132,7 @@ def check_spotify_recordings(
             return (), "Another Spotify search disagrees with the complete Spotify ISRC results."
         external_ids = item.get("external_ids")
         if variants and (
-            unavailable(item)
-            or item.get("type", "track") != "track"
+            spotify_track_is_unavailable(item)
             or ("id" in item and item["id"] != track_id(observation.uri))
             or ("external_ids" in item and not isinstance(external_ids, dict))
             or (isinstance(external_ids, dict) and "isrc" in external_ids and not normalize_spotify_isrc(external_ids["isrc"]))

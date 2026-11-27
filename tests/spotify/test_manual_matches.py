@@ -24,6 +24,7 @@ from publishers.spotify.match_cache import (
     load_spotify_track_match_cache,
     save_spotify_track_match_cache,
     spotify_track_match_key,
+    track_match_cache_entry,
 )
 from publishers.spotify.matching import MATCHED, UNMATCHED, PlaylistTrack, TrackMatchDecision
 from shared.tunemymusic import TUNEMYMUSIC_COLUMNS
@@ -565,8 +566,12 @@ class SpotifyManualMatchTests(unittest.TestCase):
                     save_spotify_track_match_cache(cache, {key: record})
                     import_manual_match_overrides(review, directory, cache, apply=True, replace_existing=True)
                     stored = load_spotify_track_match_cache(cache)
-                    self.assertEqual(stored[key]["match_strategy"], "manual_uri_only")
-                    self.assertTrue(V2_TARGET_LABELS.keys().isdisjoint(stored[key]))
+                    selected_key, selected = track_match_cache_entry(track, stored)
+                    assert selected is not None
+                    self.assertEqual(selected["match_strategy"], "manual_uri_only")
+                    self.assertTrue(V2_TARGET_LABELS.keys().isdisjoint(selected))
+                    if selected_key != key:
+                        self.assertEqual(stored[key], record)
                     cached = cached_track_match(track, stored)
                     assert cached is not None and cached.decision.candidate is not None
                     self.assertEqual(cached.decision.candidate.name, "")
@@ -910,13 +915,17 @@ class SpotifyManualMatchTests(unittest.TestCase):
                 overrides_path, directory, cache_path, apply=True, replace_existing=True,
             )
             self.assertEqual(result.applied_count, 1)
-            record = load_spotify_track_match_cache(cache_path)["release-1|1|source artist|source album|signal"]
-            self.assertEqual((record["track_name"], record["spotify_uri"]), ("Signal 月", "spotify:track:manual-one"))
+            rebound = cached_track_match(colliding_track, load_spotify_track_match_cache(cache_path))
+            assert rebound is not None
+            self.assertEqual((rebound.decision.track.track_name, rebound.decision.spotify_uri),
+                             ("Signal 月", "spotify:track:manual-one"))
+            self.assertTrue(rebound.is_manual)
 
             write_playlist_master(master, source_values={"Track Name": "Signal 星"})
             write_override_file(overrides_path, source_values={"track_name": "Signal 星"})
             import_manual_match_overrides(overrides_path, directory, cache_path, apply=True, replace_existing=True)
-            self.assertIsNone(cached_track_match(colliding_track, load_spotify_track_match_cache(cache_path)))
+            preserved = cached_track_match(colliding_track, load_spotify_track_match_cache(cache_path))
+            self.assertEqual(preserved, rebound)
 
     def test_rebinding_partial_manual_match_requires_flag_for_each_conflicting_field(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -312,6 +312,182 @@ def make_collection_args(
 
 
 class DiscogsReleasePlaylistE2ETests(unittest.TestCase):
+    def test_allow_partial_configured_publish_previews_and_applies_the_ordered_matched_subset(self):
+        from dataclasses import replace
+        from publishers.spotify.client import SpotifyPlaylist, SpotifyPlaylistItem
+        from tests.spotify.test_publish_playlist import PublishingSpotifyClient, matching_candidate, playlist_row
+
+        def candidate(release_id):
+            return matching_candidate(playlist_row(
+                release_id, f"Album {release_id}", f"Track {release_id}", f"Artist {release_id}",
+            ))
+
+        first, tied, last = (candidate(release_id) for release_id in ("111", "222", "333"))
+        rival = replace(tied, uri="spotify:track:rival")
+        queries = {
+            'track:"Track 111" artist:"Artist 111" album:"Album 111"': (first,),
+            'track:"Track 222" artist:"Artist 222" album:"Album 222"': (tied, rival),
+            'track:"Track 333" artist:"Artist 333" album:"Album 333"': (last,),
+        }
+        existing = SpotifyPlaylistItem(first.uri, first.name, first.artists, first.album_name)
+        old = SpotifyPlaylistItem("spotify:track:old", "Old Track", ("Old Artist",), "Old Album")
+        names = ("Picks", "New Picks", "No Matches", "Missing Target", "Intentional Empty")
+        release_ids_by_name = dict(zip(names, (
+            ["111", "222", "333", "444", "555"], ["333", "444"], ["444"], ["444"], [],
+        )))
+        releases = {
+            release_id: discogs_release_payload("111" if release_id == "555" else release_id)
+            for release_id in ("111", "222", "333", "444", "555")
+        }
+        client = PublishingSpotifyClient(
+            queries,
+            playlists=tuple(SpotifyPlaylist(name, name, "", "current-user", public=False)
+                            for name in ("Picks", "No Matches", "Intentional Empty")),
+            playlist_items_by_id={
+                "Picks": (existing, old, existing, existing),
+                "No Matches": (old,),
+                "Intentional Empty": (old,),
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            output = directory / "release-playlists"
+            report = directory / "publish.txt"
+            write_json(directory / "map.json", {"playlists": {"Mapped": ["House"]},
+                                               "release_playlists": release_ids_by_name})
+            write_json(directory / "publisher.json", {"default_publisher": "spotify"})
+            run_publisher = spotify_publisher.run_spotify_publish_from_args
+
+            def with_test_client(args, **kwargs):
+                args.publish_state_cache = directory / "state.json"
+                return run_publisher(args, spotify_client=client, **kwargs)
+
+            argv = [
+                "--from-config", "--allow-partial", "--access-token", "test-token", "--no-progress",
+                "--config", str(directory / "map.json"), "--workflow-config", str(directory / "workflow.json"),
+                "--output-dir", str(output), "--report", str(directory / "export.txt"), "--split-report",
+                str(directory / "split.txt"), "--publisher-report", str(report), "--publisher-config",
+                str(directory / "publisher.json"), "--match-cache", str(directory / "matches.json"),
+                "--tracklist-cache", str(directory / "tracks.json"),
+            ]
+            with (patched_discogs(releases, [], []), patch.object(spotify_publisher, "load_spotify_settings"),
+                  patch.object(spotify_publisher, "run_spotify_publish_from_args", side_effect=with_test_client),
+                  patch("sys.stdout", new_callable=io.StringIO), patch("sys.stderr", new_callable=io.StringIO) as errors):
+                self.assertEqual(release_playlist.main([*argv, "--publishing-dry-run"]), 0, errors.getvalue())
+                self.assertEqual((client.created_playlists, client.replace_calls, client.add_calls), ([], [], []))
+                preview = report.read_text(encoding="utf-8")
+                self.assertEqual(release_playlist.main(argv), 0, errors.getvalue())
+                applied = report.read_text(encoding="utf-8")
+
+            self.assertEqual(release_ids_from_csv(output / "Picks" / "Picks.csv", "Release Id"),
+                             release_ids_by_name["Picks"])
+
+        self.assertEqual([name for name, _, _ in client.created_playlists], ["New Picks"])
+        self.assertCountEqual(client.replace_calls, [
+            ("Picks", (first.uri, last.uri, first.uri)), ("created-1", (last.uri,)), ("Intentional Empty", ()),
+        ])
+        self.assertEqual(client.playlist_items_by_id["No Matches"], [old])
+        for report_text in (preview, applied):
+            self.assertIn("Run status: partial", report_text)
+            self.assertIn("Playlist Picks has 3 matched, 1 unmatched, 1 ambiguous", report_text)
+            self.assertIn("Playlist No Matches has 0 matched, 1 unmatched, 0 ambiguous", report_text)
+            self.assertIn("Playlist Missing Target has 0 matched, 1 unmatched, 0 ambiguous", report_text)
+            self.assertIn("Ambiguous tracks needing review", report_text)
+            self.assertIn("Unmatched tracks needing review", report_text)
+            self.assertIn("Existing tracks omitted by the replacement plan", report_text)
+            self.assertEqual(report_text.count("Picks | Track 111 | Artist 111 | spotify:track:111"), 1)
+            self.assertIn("Picks | Old Track | Old Artist | spotify:track:old", report_text)
+            self.assertNotIn("No Matches | Old Track | Old Artist | spotify:track:old", report_text)
+            self.assertIn("No Matches | 1 | existing | Old Artist | Old Track | Old Album | spotify:track:old",
+                          report_text)
+        self.assertIn("Tracks that would be included in replacement: 4", preview)
+        self.assertIn("Tracks included in replacement: 4", applied)
+
+    def test_allow_partial_requires_configured_spotify_publishing(self):
+        with patch("sys.stderr", new_callable=io.StringIO) as errors:
+            with self.assertRaises(SystemExit):
+                release_playlist.parse_args(["--name", "Ad Hoc", "111", "--publisher", "spotify", "--allow-partial"])
+        self.assertIn("--allow-partial requires --from-config", errors.getvalue())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            write_json(directory / "map.json", {"playlists": {"Mapped": ["House"]}, "release_playlists": {"Picks": []}})
+            write_json(directory / "publisher.json", {"default_publisher": "none"})
+            with patch("sys.stderr", new_callable=io.StringIO) as errors:
+                result = release_playlist.main([
+                    "--from-config", "--allow-partial", "--config", str(directory / "map.json"),
+                    "--workflow-config", str(directory / "workflow.json"), "--report", str(directory / "export.txt"),
+                    "--publisher-config", str(directory / "publisher.json"), "--output-dir", str(directory / "masters"),
+                ])
+            self.assertNotEqual(result, 0)
+            self.assertIn("--allow-partial requires Spotify publishing", errors.getvalue())
+            self.assertFalse((directory / "masters").exists())
+
+    def test_configured_title_variation_replaces_in_order_and_holds_all_playlists_on_conflict(self):
+        from dataclasses import replace
+        from publishers.spotify.match_cache import MATCHER_VERSION, save_spotify_track_match_cache, spotify_track_match_key
+        from tests.spotify.test_publish_playlist import (
+            PublishingSpotifyClient, cached_negative_match_record, performer_credit_copies, playlist_row, playlist_track,
+        )
+
+        titles = ("Night Ferry", "Day Boat", "Night Ferry")
+        first, rival = performer_credit_copies(album="Album 111")
+        single = replace(first, name="Day Boat (with Sol)", uri="spotify:track:boat", album_name="Elsewhere")
+        releases = {"222": discogs_release_payload("222"), "111": discogs_release_payload("111", tracklist=[
+            discogs_track("111", str(index), title) for index, title in enumerate(titles, 1)
+        ])}
+        releases["111"]["artists"] = [{"name": "North"}, {"name": "Sol"}]
+        run_publisher = spotify_publisher.run_spotify_publish_from_args
+        for conflict in (False, True):
+            with self.subTest(conflict=conflict), tempfile.TemporaryDirectory() as name:
+                directory = Path(name)
+                client = PublishingSpotifyClient({
+                    'track:"Track 222" artist:"Artist 222" album:"Album 222"': (
+                        replace(rival, name="Track 222", artists=("Artist 222",), album_name="Album 222",
+                                uri=rival.uri if conflict else "spotify:track:other", isrc="USABC2600002"),),
+                    'track:"Night Ferry" artist:"North, Sol" album:"Album 111"': (first, rival),
+                    'track:"Day Boat" artist:"North, Sol" album:"Album 111"': (single,),
+                })
+                write_json(directory / "map.json", {"playlists": {"Mapped": ["House"]},
+                           "release_playlists": {"First": ["222"], "Picks": ["111"]}})
+                row = playlist_row("111", "Album 111", titles[0], "North, Sol")
+                track = playlist_track("Picks", "111", "Album 111", titles[0], "North, Sol")
+                cache = directory / "matches.json"
+                save_spotify_track_match_cache(cache, {spotify_track_match_key(track): {
+                    **cached_negative_match_record(row, ()), "matcher_version": MATCHER_VERSION - 1,
+                }})
+
+                def with_test_client(args, **kwargs):
+                    args.publish_state_cache = directory / "state.json"
+                    return run_publisher(args, spotify_client=client, **kwargs)
+
+                argv = ["--from-config", "--publisher", "spotify", "--access-token", "test-token", "--no-progress",
+                        "--config", str(directory / "map.json"), "--workflow-config", str(directory / "workflow.json"),
+                        "--output-dir", str(directory / "release-playlists"), "--report", str(directory / "export.txt"),
+                        "--split-report", str(directory / "split.txt"), "--publisher-report", str(directory / "publish.txt"),
+                        "--publisher-config", str(directory / "publisher.json"), "--match-cache", str(cache),
+                        "--tracklist-cache", str(directory / "tracks.json")]
+                with (patched_discogs(releases, [], []), patch.object(spotify_publisher, "load_spotify_settings"),
+                      patch.object(spotify_publisher, "run_spotify_publish_from_args", side_effect=with_test_client),
+                      patch("sys.stdout", new_callable=io.StringIO), patch("sys.stderr", new_callable=io.StringIO) as errors):
+                    if not conflict:
+                        self.assertEqual(release_playlist.main([*argv, "--publishing-dry-run"]), 0, errors.getvalue())
+                        self.assertEqual((client.created_playlists, client.replace_calls, client.add_calls), ([], [], []))
+                        self.assertIn(first.name, (directory / "publish.txt").read_text())
+                        self.assertTrue(client.searches)
+                        client.searches.clear()
+                    result = release_playlist.main(argv)
+                if conflict:
+                    self.assertNotEqual(result, 0)
+                    self.assertIn("replace mode aborted before writing", errors.getvalue())
+                    self.assertIn("different ISRC", (directory / "publish.txt").read_text())
+                    self.assertEqual((client.created_playlists, client.replace_calls, client.add_calls), ([], [], []))
+                else:
+                    self.assertEqual(result, 0, errors.getvalue())
+                    self.assertIn((first.uri, single.uri, first.uri), [uris for _, uris in client.replace_calls])
+                    self.assertEqual(client.searches, [])
+
     def test_collection_workflow_handles_mixed_rows_reports_and_outputs(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)

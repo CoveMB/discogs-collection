@@ -11,8 +11,16 @@ playlist CSVs, can publish matched tracks to Spotify, and still supports
 explicit dry-run previews. It can resolve exact track-search ties between
 Spotify editions whose full source metadata agrees and whose ISRC is shared.
 Append uses the proven group of Spotify URIs to recognize an existing copy.
-For eligible unmatched tracks, the publisher makes one base-title search and
-shows the new candidates for manual review. Those tracks stay unmatched.
+The Spotify publisher preserves Unicode letters and marks. It can recover
+credited composer prefixes, repeated performer suffixes and title conjunctions
+when the full title or credit comparison and recording evidence support them.
+Accent, letter and artist spacing variations need corroboration from an aligned
+complete release or an independently verified recording. After the normal
+searches miss, a bounded title-only search can find an exact song and artist
+credit on another release. New automatic choices require playability and
+consistent evidence across competing copies. The publisher rechecks this
+evidence on cache reuse. A separate base-title search shows compatible version
+candidates for manual review.
 A standalone review command checks current unresolved generated rows for one
 pressing and reports Spotify candidates found under its documented credited
 and canonical Discogs artist names. It writes the review to stdout.
@@ -55,8 +63,9 @@ explicit Discogs `release_id` values without adding those releases to the
 collection master. The same script can rebuild durable configured release
 playlists from ordered release IDs, by default under
 `collection/playlists/release-playlists`, without reading or changing enriched
-collection rows or playlist associations. Configured Spotify publishing uses
-exact-mirror replace semantics.
+collection rows or playlist associations. Configured Spotify publishing replaces
+with an exact mirror by default and supports an explicit `--allow-partial` mode
+that reports unresolved rows and publishes the matched subset.
 
 The tool should stay focused on this workflow: read Discogs export rows, use
 `release_id` to find explicit Discogs metadata, write an enriched CSV with audit
@@ -160,7 +169,10 @@ The tool should:
   `collection/playlists/release-playlists`
 - treat empty configured definitions as authoritative empty playlists
 - publish configured release playlists from their exact current master paths in
-  replace mode only, after every non-empty source row resolves to Spotify
+  replace mode only. Require every row to resolve by default. With
+  `--allow-partial`, require all rows to be evaluated without operational errors,
+  report unmatched and ambiguous rows, and skip non-empty definitions with zero
+  matches
 - prepare manual overrides from the explicitly selected publisher section and
   verify the recorded source at its generated release and track position before
   an explicit apply

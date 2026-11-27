@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -15,6 +16,7 @@ SCRIPTS_DIRECTORY = Path(__file__).resolve().parents[2]
 if str(SCRIPTS_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 
+from discogs_tracklists import ReleaseTracklistLookup, load_tracklist_cache  # noqa: E402
 from publishers.spotify.authorization_flow import DEFAULT_AUTHORIZE_SCOPES, authorize_spotify_interactively  # noqa: E402
 from publishers.spotify.client import (  # noqa: E402
     SpotifyAlbumLookupError,
@@ -29,6 +31,8 @@ from publishers.spotify.client import (  # noqa: E402
     SpotifyRateLimitPauseError,
     SpotifyRateLimitRetriesExhaustedError,
     SpotifyTrackSearchClient,
+    SpotifyTrackPageClient,
+    SpotifyTrackCoverageClient,
 )
 from publishers.spotify.env import DEFAULT_ENV_PATH, DEFAULT_TOKEN_CACHE_PATH, load_spotify_settings  # noqa: E402
 from publishers.spotify.request_control import SpotifyRequestControl, normalize_request_interval_seconds  # noqa: E402
@@ -45,13 +49,16 @@ from publishers.spotify.match_cache import (  # noqa: E402
     record_cached_recording_conflict,
     record_cached_version_title_review,
     save_spotify_track_match_cache,
-    spotify_track_match_key,
+    source_track_binding,
     track_match_cache_entry,
     utc_timestamp,
 )
 from publishers.spotify.matching import (  # noqa: E402
     ALPHANUMERIC_SPACING_MATCH_STRATEGY,
     AMBIGUOUS,
+    CATALOGUE_RECORDING_STRATEGIES,
+    COMPOSER_PREFIX_STRATEGY,
+    EXACT_TITLE_RECORDING_STRATEGY,
     CONSTRAINED_TYPO_MATCH_REASON_PREFIX,
     ERROR,
     FEATURED_ARTIST_MATCH_REASON_PREFIX,
@@ -59,6 +66,8 @@ from publishers.spotify.matching import (  # noqa: E402
     MANUAL_URI_ONLY_MATCH_STRATEGY,
     MATCHED,
     ORIGINAL_MIX_MATCH_REASON_PREFIX,
+    REPEATED_PERFORMER_CREDIT_STRATEGY,
+    SPOTIFY_TRACK_SEARCH_QUERY_CHARACTER_LIMIT,
     SAME_RECORDING_EDITION_MATCH_STRATEGY,
     SPOTIFY_ORIGINAL_ANNOTATION_MATCH_STRATEGY,
     SPOTIFY_FEATURED_ARTIST_MATCH_REASON_PREFIX,
@@ -70,13 +79,18 @@ from publishers.spotify.matching import (  # noqa: E402
     SpotifyTrackCandidate,
     build_base_title_version_review_query,
     build_spotify_track_search_queries,
+    candidate_matches_track,
     choose_best_track_match,
     complete_version_title_review,
+    exact_title_and_full_credits,
+    has_aligned_album_position,
+    match_exact_title_recording,
+    legacy_spotify_track_identity_key,
     normalize_music_text,
     normalize_spotify_isrc,
     normalized_identity_artists,
-    recording_proof_source_matches,
     resolve_spotify_edition_tie,
+    source_credit_names,
     spotify_candidate_identity_key,
     spotify_recording_metadata_from_values,
     spotify_track_identity_key,
@@ -163,6 +177,7 @@ from shared.workflow_paths import (  # noqa: E402
     DEFAULT_PLAYLIST_OUTPUT_DIRECTORY as SHARED_PLAYLIST_OUTPUT_DIRECTORY,
     DEFAULT_SPOTIFY_MATCH_CACHE_PATH,
     DEFAULT_SPOTIFY_PUBLISH_STATE_CACHE_PATH,
+    DEFAULT_TRACKLIST_CACHE_PATH,
 )
 
 
@@ -170,6 +185,7 @@ DEFAULT_PLAYLIST_OUTPUT_DIRECTORY = SHARED_PLAYLIST_OUTPUT_DIRECTORY
 DEFAULT_MATCH_CACHE_PATH = DEFAULT_SPOTIFY_MATCH_CACHE_PATH
 DEFAULT_PUBLISH_STATE_CACHE_PATH = DEFAULT_SPOTIFY_PUBLISH_STATE_CACHE_PATH
 PLAYLIST_DESCRIPTION = "Generated from Discogs collection"
+MAXIMUM_TITLE_SEARCH_PAGES = 3
 
 
 @dataclass(frozen=True)
@@ -217,9 +233,9 @@ class PlaylistSourceMatches:
             return playlist_uri
 
         cohort_uris = edition_cohort_uris(decision)
-        earlier = self.by_identity.get(identity_key)
+        earlier = self.earlier_append_match(identity_key, decision, publish_decision.target_playlist_name)
         if status == DUPLICATE_IN_SOURCE:
-            if earlier is not None and earlier.playlist_uri in cohort_uris:
+            if earlier is not None and earlier.playlist_uri in append_equivalent_uris(decision):
                 playlist_uri = earlier.playlist_uri
             elif earlier is not None or not self.planned_uri_only_by_uri.get(playlist_uri):
                 return ""
@@ -233,6 +249,13 @@ class PlaylistSourceMatches:
                 self.by_identity[identity_key] = SourceMatchEvidence(playlist_uri, decision)
             elif earlier.playlist_uri in cohort_uris and not edition_cohort_uris(earlier.match):
                 self.by_identity[identity_key] = replace(earlier, match=decision)
+            if (
+                decision.match_strategy == EXACT_TITLE_RECORDING_STRATEGY
+                and playlist_uri in append_equivalent_uris(decision)
+            ):
+                for edition in decision.review_candidates:
+                    edition_key = spotify_candidate_identity_key(publish_decision.target_playlist_name, edition)
+                    self.by_identity.setdefault(edition_key, SourceMatchEvidence(playlist_uri, decision))
         if playlist_uri:
             identities = self.identities_by_uri.setdefault(playlist_uri, {})
             identities[identity_key] = identities.get(identity_key, False) or playlist_uri in cohort_uris
@@ -240,6 +263,19 @@ class PlaylistSourceMatches:
             if uri in self.starting_uris or identity_key in self.identities_by_uri.get(uri, {}):
                 self.identities_by_uri.setdefault(uri, {})[identity_key] = True
         return playlist_uri if status != WOULD_INCLUDE else ""
+
+    def earlier_append_match(
+        self, identity_key: str, decision: TrackMatchDecision, target_playlist_name: str,
+    ) -> SourceMatchEvidence | None:
+        existing = self.by_identity.get(identity_key)
+        if existing is not None or decision.match_strategy != EXACT_TITLE_RECORDING_STRATEGY:
+            return existing
+        linked_uris = append_equivalent_uris(decision)
+        for edition in decision.review_candidates:
+            earlier = self.by_identity.get(spotify_candidate_identity_key(target_playlist_name, edition))
+            if earlier is not None and earlier.playlist_uri in linked_uris:
+                return earlier
+        return None
 
 
 @dataclass(frozen=True)
@@ -315,6 +351,9 @@ def search_spotify_track(
     access_token: str,
     search_limit: int,
     fail_on_api_error: bool = False,
+    *,
+    aligned_album_positions: Sequence[SpotifyTrackCandidate] = (),
+    on_search: Callable[[], None] | None = None,
 ) -> SpotifyTrackSearchResult:
     search_queries = build_spotify_track_search_queries(track)
     searched_queries: list[str] = []
@@ -323,16 +362,26 @@ def search_spotify_track(
     query_errors: list[str] = []
     search_count = 0
     successful_search_count = 0
+    ordinary_complete = True
+    scoped_complete = True
+    scoped_uris: set[str] = set()
+    cross_release_tie: TrackMatchDecision | None = None
 
     for query in search_queries:
         searched_queries.append(query)
         search_count += 1
+        if on_search is not None:
+            on_search()
         try:
-            query_candidates = spotify_client.search_tracks(
-                access_token=access_token,
-                query=query,
-                limit=search_limit,
-            )
+            if isinstance(spotify_client, SpotifyTrackCoverageClient):
+                query_candidates, complete = spotify_client.search_tracks_with_coverage(access_token, query, search_limit)
+                ordinary_complete = ordinary_complete and complete
+                if query.startswith('track:"'):
+                    scoped_complete = scoped_complete and complete
+                    if complete:
+                        scoped_uris.update(candidate.uri for candidate in query_candidates)
+            else:
+                query_candidates = spotify_client.search_tracks(access_token=access_token, query=query, limit=search_limit)
         except (SpotifyAuthenticationError, SpotifyRateLimitPauseError, SpotifyRateLimitDeferredError, SpotifyRateLimitRetriesExhaustedError):
             raise
         except SpotifyApiError as error:
@@ -357,11 +406,23 @@ def search_spotify_track(
             allow_alphanumeric_spacing_fallback=False,
             allow_constrained_typo_fallback=False,
             allow_version_substitute=False,
+            search_observations=observed_candidates,
+            allow_catalogue_recovery=False,
         )
         if decision.status in {MATCHED, AMBIGUOUS}:
+            if cross_release_tie is not None:
+                continue
+            if (
+                decision.status == AMBIGUOUS and decision.review_candidates
+                and all(
+                    exact_title_and_full_credits(track, hit) and not candidate_matches_track(track, hit)
+                    for hit in decision.review_candidates
+                )
+            ):
+                cross_release_tie = decision
+                continue
             return SpotifyTrackSearchResult(
-                decision=resolve_spotify_edition_tie(decision, observed_candidates),
-                search_count=search_count,
+                resolve_spotify_edition_tie(decision, observed_candidates), search_count,
             )
 
     if successful_search_count == 0 and query_errors:
@@ -369,10 +430,106 @@ def search_spotify_track(
             decision=track_match_error(track, "; ".join(query_errors), search_queries=tuple(searched_queries)),
             search_count=search_count,
         )
-    decision = choose_best_track_match(track, tuple(candidates), search_queries=tuple(searched_queries))
+    queries = tuple(searched_queries)
+    if cross_release_tie is not None:
+        decision = match_exact_title_recording(track, observed_candidates, queries)
+        if decision is None:
+            decision = replace(cross_release_tie, search_queries=queries)
+    else:
+        decision = choose_best_track_match(
+            track, tuple(candidates), queries, allow_constrained_typo_fallback=False, allow_version_substitute=False,
+            search_observations=observed_candidates, aligned_album_positions=aligned_album_positions,
+        )
+    if decision.status == UNMATCHED and isinstance(spotify_client, SpotifyTrackPageClient):
+        title_query = " ".join(track.track_name.split())
+        if (
+            0 < len(title_query) <= SPOTIFY_TRACK_SEARCH_QUERY_CHARACTER_LIMIT
+            and title_query not in {" ".join(query.split()) for query in queries}
+        ):
+            return search_spotify_title_only(
+                track, spotify_client, access_token, search_limit, observed_candidates, queries, search_count,
+                ordinary_complete=ordinary_complete and not query_errors, fail_on_api_error=fail_on_api_error,
+                on_search=on_search,
+            )
+    if decision.status == UNMATCHED:
+        decision = choose_best_track_match(
+            track, tuple(candidates), queries, search_observations=observed_candidates,
+            allow_catalogue_recovery=False,
+        )
+    if query_errors and decision.match_strategy in CATALOGUE_RECORDING_STRATEGIES | {REPEATED_PERFORMER_CREDIT_STRATEGY}:
+        decision = track_match_error(track, "; ".join(query_errors), search_queries=queries)
+    elif decision.status == MATCHED and (
+        decision.match_strategy in CATALOGUE_RECORDING_STRATEGIES | {REPEATED_PERFORMER_CREDIT_STRATEGY}
+    ):
+        composer = decision.match_strategy == COMPOSER_PREFIX_STRATEGY
+        album_covers_composer = (
+            not ordinary_complete and composer and scoped_complete and decision.candidate is not None
+            and decision.spotify_uri in scoped_uris
+            and has_aligned_album_position(decision.candidate, aligned_album_positions)
+        )
+        if not ordinary_complete and not album_covers_composer:
+            decision = replace(
+                decision, status=AMBIGUOUS, candidate=None, spotify_uri="",
+                reason="recovery needs review because ordinary search coverage was incomplete",
+            )
+        elif album_covers_composer:
+            decision = replace(
+                decision, composer_coverage="album",
+                reason=f"{decision.reason}. The complete source album confirms its position.",
+            )
+        elif composer:
+            decision = replace(decision, composer_coverage="search")
+    return SpotifyTrackSearchResult(resolve_spotify_edition_tie(decision, observed_candidates), search_count)
+
+
+def search_spotify_title_only(
+    track: PlaylistTrack,
+    spotify_client: SpotifyTrackPageClient,
+    access_token: str,
+    search_limit: int,
+    ordinary: Sequence[SpotifyTrackCandidate],
+    queries: tuple[str, ...],
+    search_count: int,
+    *,
+    ordinary_complete: bool,
+    fail_on_api_error: bool,
+    on_search: Callable[[], None] | None,
+) -> SpotifyTrackSearchResult:
+    query = " ".join(track.track_name.split())
+    searched = (*queries, query)
+    hits: list[SpotifyTrackCandidate] = []
+    offset = 0
+    complete = False
+    for page_number in range(1, MAXIMUM_TITLE_SEARCH_PAGES + 1):
+        search_count += 1
+        if on_search is not None:
+            on_search()
+        try:
+            page = spotify_client.search_track_page(access_token, query, search_limit, offset)
+        except (SpotifyAuthenticationError, SpotifyRateLimitPauseError, SpotifyRateLimitDeferredError, SpotifyRateLimitRetriesExhaustedError):
+            raise
+        except SpotifyApiError as error:
+            if fail_on_api_error and not is_query_specific_spotify_search_error(error):
+                raise
+            return SpotifyTrackSearchResult(track_match_error(track, str(error), searched), search_count)
+        hits.extend(replace(candidate, title_only_search=True) for candidate in page.candidates)
+        if page.next_offset is None:
+            complete = len({candidate.uri for candidate in hits}) == len(hits)
+            break
+        offset = page.next_offset
+
+    exact = match_exact_title_recording(
+        track, (*ordinary, *hits), searched, title_search_complete=complete and ordinary_complete,
+    )
+    if exact is None:
+        exact = choose_best_track_match(
+            track, tuple(candidate for candidate in ordinary if candidate.name), searched,
+            search_observations=(*ordinary, *hits), allow_catalogue_recovery=False,
+        )
+    coverage = "complete" if complete else "limited"
     return SpotifyTrackSearchResult(
-        decision=resolve_spotify_edition_tie(decision, observed_candidates),
-        search_count=search_count,
+        replace(exact, reason=f"{exact.reason}; title-only search had {coverage} coverage over {page_number} page(s)"),
+        search_count,
     )
 
 
@@ -403,9 +560,14 @@ def publish_spotify_playlists(
     spotify_session: SpotifySession | None = None,
     invocation: SpotifyPublishInvocation | None = None,
     completed_album_attempts: set[SpotifyAlbumAttemptKey] | None = None,
+    discogs_tracklists: Mapping[str, ReleaseTracklistLookup] | None = None,
+    *,
+    allow_partial: bool = False,
 ) -> SpotifyPublishSummary:
     if publisher_sync_mode not in PUBLISHER_SYNC_MODES:
         raise ValueError(f"publisher_sync_mode must be one of: {', '.join(PUBLISHER_SYNC_MODES)}")
+    if allow_partial and publisher_sync_mode != REPLACE_SYNC_MODE:
+        raise ValueError("partial publishing requires replace mode")
     if max_new_searches_per_run < 0:
         raise ValueError("max_new_searches_per_run must be non-negative")
     if playlist_selectors is not None and playlist_master_paths is not None:
@@ -430,6 +592,9 @@ def publish_spotify_playlists(
     cache_hit_count = 0
     processed_track_count = 0
     resume_progress_made = False
+    def count_track_search() -> None:
+        nonlocal search_count
+        search_count += 1
     replace_validation_error: ValueError | None = None
     primary_error: BaseException | None = None
     try:
@@ -443,6 +608,9 @@ def publish_spotify_playlists(
             match_cache = load_spotify_track_match_cache(match_cache_path)
             publish_state = load_spotify_publish_state(resolved_publish_state_cache_path)
             planned_write_uris_by_playlist: dict[str, tuple[str, ...]] = {}
+            partial_inventory: dict[str, tuple[SpotifyPlaylistItem, ...]] = {}
+            replacement_rows_by_proof_uri: dict[str, set[int]] = {}
+            conflicting_recording_uris: set[str] = set()
             tracks_by_master_path = {
                 playlist_master_path: read_playlist_tracks_from_master_paths(
                     (playlist_master_path,),
@@ -457,7 +625,8 @@ def publish_spotify_playlists(
                 else None
             )
             attempted_album_release_ids: set[str] = set()
-            album_decisions_by_track_key: dict[str, TrackMatchDecision] = {}
+            album_decisions_by_track_key: dict[tuple[str, ...], TrackMatchDecision] = {}
+            aligned_album_positions_by_track: dict[tuple[str, ...], list[SpotifyTrackCandidate]] = {}
             album_lookup_diagnostics_by_release_id: dict[str, str] = {}
             preexisting_matched_cache_keys = (
                 set()
@@ -490,17 +659,17 @@ def publish_spotify_playlists(
                     playlist_name=playlist_name,
                     target_playlist_name=target_playlist_name,
                     apply=apply,
-                    info_log=info_log,
+                    info_log=None if allow_partial else info_log,
                 )
+                if allow_partial:
+                    partial_inventory[target_playlist_name] = existing_items
+                    context = replace(
+                        context, info_message=f"Playlist {target_playlist_name} has {len(existing_items)} existing tracks.",
+                    )
                 context_index = len(playlist_contexts)
                 playlist_contexts.append(context)
                 planned_write_uris: list[str] = []
                 append_candidates: list[PendingAppendTrack] = []
-                source_positions_by_identity, source_tracks_by_identity = source_order_anchors(
-                    target_playlist_name,
-                    playlist_tracks,
-                    match_cache if publisher_sync_mode == APPEND_SYNC_MODE and not refresh_match_cache else {},
-                )
                 source_matches = PlaylistSourceMatches(
                     {item.uri for item in existing_items} if publisher_sync_mode == APPEND_SYNC_MODE else set()
                 )
@@ -510,21 +679,26 @@ def publish_spotify_playlists(
                     existing_items_by_identity.setdefault(identity_key, []).append(item)
                 existing_incomplete_spotify_uris = incomplete_spotify_playlist_item_uris(existing_items)
                 existing_complete_items_by_uri = complete_playlist_items_by_uri(existing_items)
+                source_positions_by_identity, source_tracks_by_identity = source_order_anchors(
+                    target_playlist_name,
+                    playlist_tracks,
+                    match_cache if publisher_sync_mode == APPEND_SYNC_MODE and not refresh_match_cache else {},
+                    existing_incomplete_spotify_uris,
+                    existing_complete_items_by_uri,
+                )
                 for source_position, track in enumerate(playlist_tracks, start=1):
-                    track_cache_key, _ = track_match_cache_entry(
-                        track, match_cache, refresh_match_cache=refresh_match_cache,
-                    )
+                    track_binding = source_track_binding(track)
                     cached_match = None
                     if not refresh_match_cache:
                         cached_match = cached_track_match(track, match_cache, seen_at=timestamp)
                     album_decision = reusable_album_decision(
-                        track, album_decisions_by_track_key.get(track_cache_key),
+                        track, album_decisions_by_track_key.get(track_binding),
                     )
                     cached_match_is_protected = (
                         cached_match is not None
                         and (
                             cached_match.is_manual
-                            or track_cache_key in preexisting_matched_cache_keys
+                            or track_binding in preexisting_matched_cache_keys
                             or cached_match.has_recording_conflict
                         )
                     )
@@ -571,7 +745,12 @@ def publish_spotify_playlists(
                                 )
                             ):
                                 fallback_candidates = () if refresh_match_cache or album_recovery_attempt_is_current else cached_album_candidates
-                                attempt_key = SpotifyAlbumAttemptKey(tuple(release_tracks), tuple(fallback_candidates), search_limit, MATCHER_VERSION)
+                                discogs_tracklist = discogs_tracklists.get(track.release_id) if discogs_tracklists else None
+                                attempt_key = SpotifyAlbumAttemptKey(
+                                    tuple(release_tracks), tuple(fallback_candidates), search_limit, MATCHER_VERSION,
+                                    discogs_tracklist,
+                                )
+                                positions: tuple[tuple[PlaylistTrack, SpotifyTrackCandidate], ...] = ()
                                 if completed_album_attempts is None or attempt_key not in completed_album_attempts:
                                     album_result = resolve_release_with_album(
                                         source_tracks=release_tracks,
@@ -579,10 +758,14 @@ def publish_spotify_playlists(
                                         access_token=access_token,
                                         search_limit=search_limit,
                                         fallback_track_candidates=fallback_candidates,
+                                        source_tracklist=discogs_tracklist,
                                     )
+                                    positions = album_result.aligned_album_positions
                                     if completed_album_attempts is not None:
                                         completed_album_attempts.add(attempt_key)
                                         resume_progress_made = True
+                                        if invocation is not None:
+                                            invocation.completed_aligned_album_positions[attempt_key] = positions
                                     search_count += album_result.search_count
                                     if album_result.diagnostic:
                                         album_lookup_diagnostics_by_release_id[track.release_id] = album_result.diagnostic
@@ -596,22 +779,30 @@ def publish_spotify_playlists(
                                             cached_album_ids,
                                         )
                                     for resolved_decision in album_result.decisions:
-                                        resolved_key, resolved_record = track_match_cache_entry(
-                                            resolved_decision.track, match_cache, refresh_match_cache=refresh_match_cache,
-                                        )
-                                        if resolved_key in preexisting_matched_cache_keys or (
+                                        _, resolved_record = track_match_cache_entry(resolved_decision.track, match_cache)
+                                        resolved_binding = source_track_binding(resolved_decision.track)
+                                        if resolved_binding in preexisting_matched_cache_keys or (
                                             not refresh_match_cache
                                             and cache_record_has_recording_conflict(resolved_record)
                                         ):
                                             continue
-                                        album_decisions_by_track_key[resolved_key] = resolved_decision
+                                        album_decisions_by_track_key[resolved_binding] = resolved_decision
                                         cache_track_match(
                                             match_cache, resolved_decision, matched_at=timestamp, refresh_match_cache=refresh_match_cache,
                                         )
                                     save_spotify_track_match_cache(match_cache_path, match_cache)
                                     album_decision = reusable_album_decision(
-                                        track, album_decisions_by_track_key.get(track_cache_key),
+                                        track, album_decisions_by_track_key.get(track_binding),
                                     )
+                                elif invocation is not None:
+                                    positions = invocation.completed_aligned_album_positions.get(attempt_key) or ()
+                                for position_source, candidate in positions:
+                                    aligned_album_positions_by_track.setdefault(source_track_binding(position_source), []).append(candidate)
+                    aligned_album_positions = aligned_album_positions_by_track.get(track_binding, ())
+                    if cached_match is None and not refresh_match_cache and aligned_album_positions:
+                        cached_match = cached_track_match(
+                            track, match_cache, seen_at=timestamp, aligned_album_positions=aligned_album_positions,
+                        )
                     cached_review_query = (
                         build_base_title_version_review_query(cached_match.decision)
                         if cached_match is not None and album_decision is None
@@ -690,19 +881,23 @@ def publish_spotify_playlists(
                             match_source = MATCH_SOURCE_ALBUM
                             track_search_count = 0
                         else:
-                            search_result = search_spotify_track(
-                                track=track,
-                                spotify_client=spotify_client,
-                                access_token=access_token,
-                                search_limit=search_limit,
-                                fail_on_api_error=invocation is not None,
-                            )
+                            searches_before_row = search_count
+                            try:
+                                search_result = search_spotify_track(
+                                    track=track,
+                                    spotify_client=spotify_client,
+                                    access_token=access_token,
+                                    search_limit=search_limit,
+                                    fail_on_api_error=invocation is not None,
+                                    aligned_album_positions=aligned_album_positions,
+                                    on_search=count_track_search,
+                                )
+                            finally:
+                                track_search_count = search_count - searches_before_row
+                                if track_search_count:
+                                    searched_row_count += 1
                             decision = search_result.decision
                             match_source = MATCH_SOURCE_SEARCH
-                            track_search_count = search_result.search_count
-                            search_count += track_search_count
-                            if track_search_count:
-                                searched_row_count += 1
                         if decision.status == UNMATCHED and match_source == MATCH_SOURCE_SEARCH:
                             album_lookup_diagnostic = album_lookup_diagnostics_by_release_id.get(track.release_id, "")
                             if album_lookup_diagnostic:
@@ -756,7 +951,7 @@ def publish_spotify_playlists(
                         if match_source == MATCH_SOURCE_CACHE:
                             cache_hit_count += 1
                         observed_candidates = recording_candidates_for_match(decision)
-                        edition_proof = decision.match_strategy == SAME_RECORDING_EDITION_MATCH_STRATEGY
+                        edition_proof = uses_recording_edition_proof(decision.match_strategy, observed_candidates)
                         recording_conflict = recording_observations.conflict(observed_candidates, edition_proof=edition_proof)
                         publish_decision = build_publish_decision(
                             playlist_name=playlist_name,
@@ -793,6 +988,14 @@ def publish_spotify_playlists(
                                     publish_state,
                                     target_playlist_name,
                                     identity_key,
+                                    track=track,
+                                    spotify_uri=publish_decision.spotify_uri,
+                                    legacy_identity_key=legacy_spotify_track_identity_key(
+                                        target_playlist_name,
+                                        decision.candidate.artists if decision.candidate else (track.artist_name,),
+                                        decision.candidate.album_name if decision.candidate else track.album_name,
+                                        decision.candidate.name if decision.candidate else track.track_name,
+                                    ),
                                 )
                                 publish_decision = replace(
                                     publish_decision,
@@ -812,19 +1015,44 @@ def publish_spotify_playlists(
                                         final_item=final_playlist_item_from_decision(source_position, publish_decision),
                                     )
                                 )
-                            else:
+                            elif not allow_partial:
                                 planned_write_uris.append(publish_decision.spotify_uri)
                                 final_items.append(final_playlist_item_from_decision(len(final_items) + 1, publish_decision))
                         if review_query is None and match_source in {MATCH_SOURCE_ALBUM, MATCH_SOURCE_SEARCH}:
                             cache_track_match(
                                 match_cache, decision, matched_at=timestamp, refresh_match_cache=refresh_match_cache,
                             )
-                            if cached_match is None and cached_track_match(track, match_cache) is not None:
+                            if cached_match is None and cached_track_match(
+                                track, match_cache, aligned_album_positions=aligned_album_positions,
+                            ) is not None:
                                 resume_progress_made = True
-                        if recording_conflict:
+                        current_conflict = recording_conflict
+                        if allow_partial and publish_decision.status == AMBIGUOUS and decision.status == MATCHED:
+                            current_conflict = publish_decision.reason
+                        if current_conflict:
                             _, record = track_match_cache_entry(track, match_cache)
                             if record is not None:
-                                record_cached_recording_conflict(record, recording_conflict)
+                                record_cached_recording_conflict(record, current_conflict)
+                        if allow_partial and publish_decision.status == WOULD_INCLUDE:
+                            proof_uris = {publish_decision.spotify_uri, *(candidate.uri for candidate in observed_candidates)}
+                            if conflicting_recording_uris.isdisjoint(proof_uris):
+                                for uri in proof_uris:
+                                    replacement_rows_by_proof_uri.setdefault(uri, set()).add(decision_index)
+                            else:
+                                decisions[decision_index] = hold_conflicting_replacement(publish_decision, match_cache)
+                        elif allow_partial and publish_decision.status == AMBIGUOUS:
+                            conflicted_uris: set[str] = set()
+                            if current_conflict:
+                                conflicted_uris = {decision.spotify_uri, *(candidate.uri for candidate in observed_candidates)}
+                            elif cached_match is not None and cached_match.has_recording_conflict:
+                                conflicted_uris = {candidate.uri for candidate in decision.review_candidates}
+                            conflicting_recording_uris.update(conflicted_uris)
+                            # A later conflict can invalidate a match already planned in another target.
+                            for uri in conflicted_uris:
+                                for earlier_index in replacement_rows_by_proof_uri.pop(uri, ()):
+                                    earlier = decisions[earlier_index]
+                                    if earlier.status == WOULD_INCLUDE:
+                                        decisions[earlier_index] = hold_conflicting_replacement(earlier, match_cache)
                         if len(decisions) % 25 == 0:
                             save_spotify_track_match_cache(match_cache_path, match_cache)
                         if publisher_sync_mode == APPEND_SYNC_MODE and apply and len(append_candidates) >= 100:
@@ -963,16 +1191,26 @@ def publish_spotify_playlists(
                         searched_row_count=searched_row_count,
                         timestamp=timestamp,
                     )
-                else:
+                elif not allow_partial:
                     planned_write_uris_by_playlist[target_playlist_name] = tuple(planned_write_uris)
+
             save_spotify_track_match_cache(match_cache_path, match_cache)
             if apply and publisher_sync_mode == APPEND_SYNC_MODE:
                 save_spotify_publish_state(resolved_publish_state_cache_path, publish_state)
-            if apply and publisher_sync_mode == REPLACE_SYNC_MODE:
+            if publisher_sync_mode == REPLACE_SYNC_MODE and (apply or allow_partial):
                 try:
-                    validate_replace_apply_decisions(tuple(decisions))
+                    validate_replace_apply_decisions(decisions, allow_partial=allow_partial)
                 except ValueError as error:
                     replace_validation_error = error
+            run_status = "complete"
+            if replace_validation_error:
+                run_status = str(replace_validation_error)
+            elif allow_partial:
+                planned_write_uris_by_playlist, final_items = plan_partial_replacements(
+                    playlist_contexts, decisions, partial_inventory, info_log,
+                )
+                if any(decision.status in {AMBIGUOUS, UNMATCHED} for decision in decisions):
+                    run_status = "partial - unmatched or ambiguous source rows omitted"
             summary = write_publish_summary(
                 request_count=request_control.request_count if request_control is not None else None,
                 token_refresh_count=spotify_session.refresh_count if spotify_session is not None else None,
@@ -986,7 +1224,7 @@ def publish_spotify_playlists(
                 cache_hit_count=cache_hit_count,
                 search_count=search_count,
                 searched_row_count=searched_row_count,
-                run_status=str(replace_validation_error) if replace_validation_error else "complete",
+                run_status=run_status,
                 run_state="complete" if invocation is None and not (apply and publisher_sync_mode == REPLACE_SYNC_MODE) else "processing",
                 resume_progress_made=resume_progress_made,
             )
@@ -1012,6 +1250,7 @@ def publish_spotify_playlists(
                     cache_hit_count=cache_hit_count,
                     search_count=search_count,
                     searched_row_count=searched_row_count,
+                    run_status=run_status,
                 )
                 summary = write_publish_summary(
                     request_count=request_control.request_count if request_control is not None else None,
@@ -1026,6 +1265,7 @@ def publish_spotify_playlists(
                     cache_hit_count=cache_hit_count,
                     search_count=search_count,
                     searched_row_count=searched_row_count,
+                    run_status=run_status,
                     run_state="complete",
                 )
             return summary
@@ -1128,13 +1368,13 @@ def group_unique_tracks_by_release_id(
     tracks_by_master_path: Mapping[Path, Sequence[PlaylistTrack]],
 ) -> dict[str, tuple[PlaylistTrack, ...]]:
     grouped_tracks: dict[str, list[PlaylistTrack]] = {}
-    seen_track_keys_by_release_id: dict[str, set[str]] = {}
+    seen_track_keys_by_release_id: dict[str, set[tuple[str, ...]]] = {}
     for playlist_tracks in tracks_by_master_path.values():
         for track in playlist_tracks:
             release_id = track.release_id.strip()
             if not release_id:
                 continue
-            track_key = spotify_track_match_key(track)
+            track_key = source_track_binding(track)
             seen_track_keys = seen_track_keys_by_release_id.setdefault(release_id, set())
             if track_key in seen_track_keys:
                 continue
@@ -1147,12 +1387,7 @@ def group_unique_tracks_by_release_id(
 
 
 def reusable_album_decision(track: PlaylistTrack, decision: TrackMatchDecision | None) -> TrackMatchDecision | None:
-    if decision is None or not decision.strict_album_recovery:
-        return decision
-    proved_source = decision.track
-    if not recording_proof_source_matches(
-        track, title=proved_source.track_name, artist=proved_source.artist_name, album=proved_source.album_name,
-    ):
+    if decision is None or source_track_binding(track) != source_track_binding(decision.track):
         return None
     return replace(decision, track=track)
 
@@ -1170,7 +1405,7 @@ def cached_review_candidates_for_release(
         candidates = album_lookup_candidates_from_cache_record(track, record)
         if clean_cell(record.get("match_status")) == MATCHED:
             conflict = recording_observations.conflict(
-                candidates, edition_proof=clean_cell(record.get("match_strategy")) == SAME_RECORDING_EDITION_MATCH_STRATEGY,
+                candidates, edition_proof=uses_recording_edition_proof(clean_cell(record.get("match_strategy")), candidates),
             )
             if conflict:
                 record_cached_recording_conflict(record, conflict)
@@ -1237,13 +1472,13 @@ def order_release_tracks(tracks: Sequence[PlaylistTrack]) -> tuple[PlaylistTrack
 def existing_matched_cache_keys(
     release_tracks_by_id: Mapping[str, Sequence[PlaylistTrack]],
     match_cache: Mapping[str, Mapping[str, object]],
-) -> set[str]:
-    matched_keys: set[str] = set()
+) -> set[tuple[str, ...]]:
+    matched_keys: set[tuple[str, ...]] = set()
     for release_tracks in release_tracks_by_id.values():
         for track in release_tracks:
             cached_match = cached_track_match(track, match_cache)
             if cached_match and cached_match.decision.status == MATCHED:
-                matched_keys.add(cached_match.cache_key)
+                matched_keys.add(source_track_binding(track))
     return matched_keys
 
 
@@ -1466,25 +1701,12 @@ def append_plan_item_from_existing(
         for key in identity_keys
         if (previous := previous_final_items_by_identity.get(key)) is not None and previous.spotify_uri == item.uri
     ), None)
-    final_item = (
-        previous_final_item
-        or FinalPlaylistItem(
-            playlist_name=target_playlist_name,
-            position=0,
-            status="existing",
-            spotify_uri=item.uri,
-            track_name=item.name,
-            artist_names=item.artists,
-            album_name=item.album_name,
-            source_track=None,
-        )
-    )
     return AppendPlanItem(
         source_position=next(
             (source_positions_by_identity[key] for key in identity_keys if key in source_positions_by_identity),
             None,
         ),
-        final_item=final_item,
+        final_item=previous_final_item or final_playlist_item_from_existing(target_playlist_name, item),
     )
 
 
@@ -1662,11 +1884,10 @@ def build_publish_decision(
         else:
             status, reason = WOULD_ADD, "Selected Spotify URI will be appended to playlist"
     else:
-        earlier_match = source_matches.by_identity.get(identity_key)
+        earlier_match = source_matches.earlier_append_match(identity_key, decision, target_playlist_name)
         status, spotify_uri, reason = append_track_disposition(
             decision,
             target_playlist_name,
-            identity_key,
             existing_items_by_identity.get(identity_key, ()),
             existing_incomplete_spotify_uris,
             existing_complete_items_by_uri,
@@ -1696,10 +1917,16 @@ def build_publish_decision(
     )
 
 
+def uses_recording_edition_proof(strategy: str, candidates: Sequence[SpotifyTrackCandidate]) -> bool:
+    return strategy in CATALOGUE_RECORDING_STRATEGIES or strategy == SAME_RECORDING_EDITION_MATCH_STRATEGY or (
+        strategy == REPEATED_PERFORMER_CREDIT_STRATEGY and len(candidates) > 1
+    )
+
+
 def recording_candidates_for_match(decision: TrackMatchDecision) -> tuple[SpotifyTrackCandidate, ...]:
     if decision.status != MATCHED:
         return ()
-    if decision.match_strategy == SAME_RECORDING_EDITION_MATCH_STRATEGY:
+    if uses_recording_edition_proof(decision.match_strategy, decision.review_candidates):
         return decision.review_candidates
     return (decision.candidate,) if decision.candidate else ()
 
@@ -1710,24 +1937,43 @@ def edition_cohort_uris(decision: TrackMatchDecision) -> set[str]:
     return set()
 
 
+def append_equivalent_uris(decision: TrackMatchDecision) -> set[str]:
+    if decision.match_strategy == EXACT_TITLE_RECORDING_STRATEGY:
+        return {candidate.uri for candidate in decision.review_candidates}
+    if decision.match_strategy in CATALOGUE_RECORDING_STRATEGIES and decision.spotify_uri:
+        return {decision.spotify_uri}
+    return edition_cohort_uris(decision)
+
+
+def playlist_recording_metadata_conflicts(
+    target_playlist_name: str,
+    candidates: Sequence[SpotifyTrackCandidate],
+    existing_complete_items_by_uri: Mapping[str, Sequence[SpotifyPlaylistItem]],
+) -> bool:
+    return any(
+        spotify_playlist_item_identity_key(target_playlist_name, item)
+        != spotify_candidate_identity_key(target_playlist_name, candidate)
+        or candidate.recording_metadata().conflicts_with(spotify_recording_metadata_from_values(
+            title=item.name, artist_names=item.artists, album_name=item.album_name, album_id="",
+        ))
+        for candidate in candidates
+        for item in existing_complete_items_by_uri.get(candidate.uri, ())
+    )
+
+
 def append_track_disposition(
     decision: TrackMatchDecision,
     target_playlist_name: str,
-    identity_key: str,
     existing_identity_items: Sequence[SpotifyPlaylistItem],
     existing_incomplete_spotify_uris: set[str],
     existing_complete_items_by_uri: Mapping[str, Sequence[SpotifyPlaylistItem]],
     earlier_source_match: TrackMatchDecision | None,
 ) -> tuple[str, str, str]:
-    cohort_uris = edition_cohort_uris(decision)
+    cohort_uris = append_equivalent_uris(decision)
     if cohort_uris:
-        if any(
-            spotify_playlist_item_identity_key(target_playlist_name, item) != identity_key
-            or candidate.recording_metadata().conflicts_with(spotify_recording_metadata_from_values(
-                title=item.name, artist_names=item.artists, album_name=item.album_name, album_id="",
-            ))
-            for candidate in decision.review_candidates
-            for item in existing_complete_items_by_uri.get(candidate.uri, ())
+        if playlist_recording_metadata_conflicts(
+            target_playlist_name, tuple(candidate for candidate in decision.review_candidates if candidate.uri in cohort_uris),
+            existing_complete_items_by_uri,
         ):
             return (
                 AMBIGUOUS,
@@ -1737,7 +1983,7 @@ def append_track_disposition(
         complete_identity_uris = [
             item.uri for item in existing_identity_items if spotify_playlist_item_has_identity_metadata(item)
         ]
-        existing_uri = next((uri for uri in complete_identity_uris if uri in cohort_uris), None)
+        existing_uri = next((uri for uri in existing_complete_items_by_uri if uri in cohort_uris), None)
         incomplete_uri = min(cohort_uris & existing_incomplete_spotify_uris, default="")
         if existing_uri is None and not incomplete_uri and complete_identity_uris:
             return (
@@ -1747,11 +1993,11 @@ def append_track_disposition(
                 "with a URI outside the proven recording copies",
             )
     else:
-        existing_uri = decision.spotify_uri if existing_identity_items else None
+        existing_uri = decision.spotify_uri if existing_identity_items or decision.spotify_uri in existing_complete_items_by_uri else None
         incomplete_uri = decision.spotify_uri if decision.spotify_uri in existing_incomplete_spotify_uris else ""
 
     if earlier_source_match is not None:
-        earlier_cohort_uris = edition_cohort_uris(earlier_source_match)
+        earlier_cohort_uris = append_equivalent_uris(earlier_source_match)
         if cohort_uris or earlier_cohort_uris:
             current_uris = cohort_uris or {decision.spotify_uri}
             earlier_uris = earlier_cohort_uris or {earlier_source_match.spotify_uri}
@@ -1780,8 +2026,9 @@ def publish_reason_with_match_details(
     publish_reason: str,
     decision: TrackMatchDecision,
 ) -> str:
-    if decision.match_strategy in {
+    if decision.match_strategy in CATALOGUE_RECORDING_STRATEGIES | {
         ALPHANUMERIC_SPACING_MATCH_STRATEGY,
+        REPEATED_PERFORMER_CREDIT_STRATEGY,
         SAME_RECORDING_EDITION_MATCH_STRATEGY,
         SPOTIFY_ORIGINAL_ANNOTATION_MATCH_STRATEGY,
         VERSION_SUBSTITUTE_MATCH_STRATEGY,
@@ -1813,23 +2060,91 @@ def publish_reason_with_original_mix_match_details(
 
 def validate_replace_apply_decisions(
     decisions: Sequence[PlaylistPublishDecision],
+    *,
+    allow_partial: bool = False,
 ) -> None:
-    blocking_decisions = [
-        decision
-        for decision in decisions
-        if decision.status in {AMBIGUOUS, UNMATCHED, ERROR}
-    ]
-    if not blocking_decisions:
+    permitted_statuses = {WOULD_INCLUDE, AMBIGUOUS, UNMATCHED} if allow_partial else {WOULD_INCLUDE}
+    blocking_counts = Counter(decision.status for decision in decisions if decision.status not in permitted_statuses)
+    if not blocking_counts:
         return
-    blocking_counts = ", ".join(
-        f"{status}={sum(1 for decision in blocking_decisions if decision.status == status)}"
-        for status in (ERROR, AMBIGUOUS, UNMATCHED)
-        if any(decision.status == status for decision in blocking_decisions)
-    )
+    counts = ", ".join(f"{status}={count}" for status, count in blocking_counts.items())
     raise ValueError(
         "replace mode aborted before writing because not every source row resolved "
-        f"to a publishable Spotify URI ({blocking_counts})"
+        f"to a publishable Spotify URI ({counts})"
     )
+
+
+def hold_conflicting_replacement(
+    decision: PlaylistPublishDecision,
+    match_cache: dict[str, dict[str, object]],
+) -> PlaylistPublishDecision:
+    reason = "pending review because another source row reported conflicting evidence for this recording"
+    _, record = track_match_cache_entry(decision.track, match_cache)
+    if record is not None:
+        record_cached_recording_conflict(record, reason)
+    review_candidates = decision.review_candidates or ((decision.candidate,) if decision.candidate else ())
+    return replace(decision, status=AMBIGUOUS, spotify_uri="", candidate=None, review_candidates=review_candidates, reason=reason)
+
+
+def plan_partial_replacements(
+    contexts: list[PlaylistPublishContext],
+    decisions: Sequence[PlaylistPublishDecision],
+    inventory: Mapping[str, tuple[SpotifyPlaylistItem, ...]],
+    info_log: InfoLog | None,
+) -> tuple[dict[str, tuple[str, ...]], list[FinalPlaylistItem]]:
+    by_target: dict[str, list[PlaylistPublishDecision]] = {}
+    for decision in decisions:
+        by_target.setdefault(decision.target_playlist_name, []).append(decision)
+    replacement_uris: dict[str, tuple[str, ...]] = {}
+    final_items: list[FinalPlaylistItem] = []
+    for index, context in enumerate(contexts):
+        target = context.target_playlist_name
+        source_rows = by_target.get(target, [])
+        matched_rows = [decision for decision in source_rows if decision.status == WOULD_INCLUDE]
+        existing_items = inventory[target]
+        if source_rows and not matched_rows:
+            planned_uris = None
+            final_items.extend(final_playlist_item_from_existing(target, item) for item in existing_items)
+        else:
+            planned_uris = tuple(decision.spotify_uri for decision in matched_rows)
+            replacement_uris[target] = planned_uris
+            final_items.extend(final_playlist_item_from_decision(0, decision) for decision in matched_rows)
+        context = partial_replacement_context(context, existing_items, source_rows, planned_uris)
+        contexts[index] = context
+        emit_info(info_log, context.info_message)
+    return replacement_uris, final_items
+
+
+def partial_replacement_context(
+    context: PlaylistPublishContext,
+    existing_items: Sequence[SpotifyPlaylistItem],
+    decisions: Sequence[PlaylistPublishDecision],
+    planned_uris: tuple[str, ...] | None,
+) -> PlaylistPublishContext:
+    counts = Counter(decision.status for decision in decisions)
+    message = (
+        f"Playlist {context.target_playlist_name} has {counts[WOULD_INCLUDE]} matched, "
+        f"{counts[UNMATCHED]} unmatched, {counts[AMBIGUOUS]} ambiguous and {counts[ERROR]} errored source rows."
+    )
+    if planned_uris is None:
+        return replace(context, info_message=(
+            f"{message} Skipping this target and keeping its {len(existing_items)} existing tracks."
+        ))
+    if not context.existed and not planned_uris:
+        return replace(context, info_message=f"{message} Skipping creation for the empty definition.")
+
+    remaining = Counter(planned_uris)
+    removed_items: list[SpotifyPlaylistItem] = []
+    for item in existing_items:
+        if remaining[item.uri]:
+            remaining[item.uri] -= 1
+        else:
+            removed_items.append(item)
+    action = "replace" if context.existed else "create"
+    message += f" Plan to {action} with {len(planned_uris)} tracks."
+    if context.existed:
+        message += f" The plan would remove {len(removed_items)} of {len(existing_items)} existing track occurrences."
+    return replace(context, info_message=message, removed_items=tuple(removed_items))
 
 
 def resolve_playlist_context(
@@ -1920,14 +2235,7 @@ def apply_playlist_writes(
             error.args = (message,)
             raise
         raise ValueError(message) from error
-    return PlaylistPublishContext(
-        playlist_name=context.playlist_name,
-        target_playlist_name=context.target_playlist_name,
-        playlist_id=playlist_id,
-        existed=context.existed,
-        current_item_count=context.current_item_count,
-        info_message=context.info_message,
-    )
+    return replace(context, playlist_id=playlist_id)
 
 
 def find_owned_private_spotify_playlist_by_name(
@@ -2083,33 +2391,46 @@ def source_order_anchors(
     target_playlist_name: str,
     tracks: Sequence[PlaylistTrack],
     match_cache: Mapping[str, Mapping[str, object]],
+    existing_incomplete_spotify_uris: set[str],
+    existing_complete_items_by_uri: Mapping[str, Sequence[SpotifyPlaylistItem]],
 ) -> tuple[dict[str, int], dict[str, PlaylistTrack]]:
     positions: dict[str, int] = {}
     sources: dict[str, PlaylistTrack] = {}
+    recovery_strategies = CATALOGUE_RECORDING_STRATEGIES | {REPEATED_PERFORMER_CREDIT_STRATEGY}
+    anchor_strategies = recovery_strategies | {MANUAL_URI_ONLY_MATCH_STRATEGY}
     for position, track in enumerate(tracks, start=1):
-        identity_key = ""
-        record = match_cache.get(spotify_track_match_key(track))
-        if (
-            record is not None
-            and clean_cell(record.get("match_status")) == "manual"
-            and clean_cell(record.get("match_strategy")) == MANUAL_URI_ONLY_MATCH_STRATEGY
-        ):
-            # A capped pass can restore a track before reaching later source rows.
-            cached_match = cached_track_match(track, match_cache)
-            if cached_match and cached_match.is_manual:
-                if cached_match.decision.status != MATCHED:
+        identity_keys = [source_track_identity_key(target_playlist_name, track)]
+        _, record = track_match_cache_entry(track, match_cache)
+        strategy = clean_cell(record.get("match_strategy")) if record is not None else ""
+        # A capped pass can restore an earlier track before reaching a later cached match.
+        cached = cached_track_match(track, match_cache) if strategy in anchor_strategies else None
+        if cached is not None:
+            decision = cached.decision
+            if cached.is_manual and strategy == MANUAL_URI_ONLY_MATCH_STRATEGY:
+                if decision.status != MATCHED:
                     continue
-                identity_key = spotify_uri_membership_key(target_playlist_name, cached_match.decision.spotify_uri)
-        identity_key = identity_key or source_track_identity_key(target_playlist_name, track)
-        positions.setdefault(identity_key, position)
-        sources.setdefault(identity_key, track)
+                identity_keys = [spotify_uri_membership_key(target_playlist_name, decision.spotify_uri)]
+            elif strategy in recovery_strategies and not cached.is_manual and decision.status == MATCHED:
+                uris = append_equivalent_uris(decision) or {decision.spotify_uri}
+                candidates = tuple(candidate for candidate in decision.review_candidates if candidate.uri in uris)
+                if not playlist_recording_metadata_conflicts(
+                    target_playlist_name, candidates, existing_complete_items_by_uri,
+                ):
+                    identity_keys.extend(
+                        spotify_uri_membership_key(target_playlist_name, candidate.uri)
+                        for candidate in candidates
+                        if candidate.uri in existing_complete_items_by_uri or candidate.uri in existing_incomplete_spotify_uris
+                    )
+        for identity_key in identity_keys:
+            positions.setdefault(identity_key, position)
+            sources.setdefault(identity_key, track)
     return positions, sources
 
 
 def source_track_identity_key(target_playlist_name: str, track: PlaylistTrack) -> str:
     return spotify_track_identity_key(
         target_playlist_name=target_playlist_name,
-        artist_names=(track.artist_name,),
+        artist_names=source_credit_names(track.artist_name),
         album_name=track.album_name,
         track_name=track.track_name,
     )
@@ -2166,6 +2487,18 @@ def publish_decision_identity_key(decision: PlaylistPublishDecision) -> str:
         artist_names=(decision.track.artist_name,),
         album_name=decision.track.album_name,
         track_name=decision.track.track_name,
+    )
+
+
+def final_playlist_item_from_existing(target_playlist_name: str, item: SpotifyPlaylistItem) -> FinalPlaylistItem:
+    return FinalPlaylistItem(
+        playlist_name=target_playlist_name,
+        position=0,
+        status="existing",
+        spotify_uri=item.uri,
+        track_name=item.name,
+        artist_names=item.artists,
+        album_name=item.album_name,
     )
 
 
@@ -2265,6 +2598,7 @@ def apply_planned_playlist_writes(
     spotify_session: SpotifySession | None = None,
     invocation: SpotifyPublishInvocation | None = None,
     progress: ProgressReporter | None = None,
+    run_status: str = "complete",
 ) -> tuple[
     tuple[PlaylistPublishDecision, ...],
     tuple[FinalPlaylistItem, ...],
@@ -2276,7 +2610,9 @@ def apply_planned_playlist_writes(
     current_contexts = playlist_contexts
     current_playlists = tuple(spotify_playlists)
     for index, context in enumerate(current_contexts):
-        planned_write_uris = planned_write_uris_by_playlist.get(context.target_playlist_name, ())
+        planned_write_uris = planned_write_uris_by_playlist.get(context.target_playlist_name)
+        if planned_write_uris is None:
+            continue
         if progress and (context.playlist_id or planned_write_uris):
             progress.label = "Updating Spotify playlists"
             progress.update(len(current_decisions))
@@ -2311,6 +2647,7 @@ def apply_planned_playlist_writes(
             cache_hit_count=cache_hit_count,
             search_count=search_count,
             searched_row_count=searched_row_count,
+            run_status=run_status,
         )
     if progress:
         progress.label = "Reconciling Spotify playlists"
@@ -2390,6 +2727,7 @@ def build_spotify_publisher_argv(
     report: Path | None = None,
     token_cache: Path | None = None,
     match_cache: Path | None = None,
+    tracklist_cache: Path | None = None,
     publish_state_cache: Path | None = None,
     publisher_config: Path | None = None,
     debug_log: Path | None = None,
@@ -2412,6 +2750,7 @@ def build_spotify_publisher_argv(
     append_cli_option(arguments, "--report", report)
     append_cli_option(arguments, "--token-cache", token_cache)
     append_cli_option(arguments, "--match-cache", match_cache)
+    append_cli_option(arguments, "--tracklist-cache", tracklist_cache)
     append_cli_option(arguments, "--publish-state-cache", publish_state_cache)
     append_cli_option(arguments, "--publisher-config", publisher_config)
     append_cli_option(arguments, "--debug-log", debug_log)
@@ -2440,6 +2779,7 @@ def build_spotify_publisher_namespace(
     report: Path | None = None,
     token_cache: Path = DEFAULT_TOKEN_CACHE_PATH,
     match_cache: Path = DEFAULT_MATCH_CACHE_PATH,
+    tracklist_cache: Path = DEFAULT_TRACKLIST_CACHE_PATH,
     publish_state_cache: Path = DEFAULT_PUBLISH_STATE_CACHE_PATH,
     publisher_config: Path = DEFAULT_PUBLISHER_CONFIG_PATH,
     debug_log: Path | None = None,
@@ -2461,6 +2801,7 @@ def build_spotify_publisher_namespace(
         report=report or default_report_path(),
         token_cache=token_cache,
         match_cache=match_cache,
+        tracklist_cache=tracklist_cache,
         publish_state_cache=publish_state_cache,
         publisher_config=publisher_config,
         debug_log=debug_log,
@@ -2518,6 +2859,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--report", type=Path, help="Publish report path. Defaults to reports/<timestamp>_publish_playlist.txt.")
     parser.add_argument("--token-cache", type=Path, default=DEFAULT_TOKEN_CACHE_PATH, help="Spotify token cache path.")
     parser.add_argument("--match-cache", type=Path, default=DEFAULT_MATCH_CACHE_PATH, help="Spotify track match cache path.")
+    parser.add_argument("--tracklist-cache", type=Path, default=DEFAULT_TRACKLIST_CACHE_PATH,
+                        help="Existing Discogs tracklist cache used to verify complete releases.")
     parser.add_argument("--publish-state-cache", type=Path, default=DEFAULT_PUBLISH_STATE_CACHE_PATH, help="Spotify publish state cache path.")
     parser.add_argument("--publisher-config", type=Path, default=DEFAULT_PUBLISHER_CONFIG_PATH, help="Publisher JSON config. Defaults to config/publisher.json.")
     parser.add_argument("--debug-log", type=Path, help="Write sanitized Spotify publisher debug logs to this path.")
@@ -2554,6 +2897,8 @@ def run_spotify_publish_from_args(
     publisher_config: PublisherConfig | None = None,
     debug_log: DebugLog | None = None,
     spotify_client: SpotifyPlaylistPlanningClient | None = None,
+    *,
+    allow_partial: bool = False,
 ) -> SpotifyPublishSummary:
     continuous = getattr(args, "continuous", False)
     request_interval_seconds = validate_continuous_publisher_args(args)
@@ -2616,6 +2961,11 @@ def run_spotify_publish_from_args(
         request_control.reset_fallback_after_progress()
     invocation = SpotifyPublishInvocation(request_control, spotify_session) if continuous and request_control else None
     completed_album_attempts: set[SpotifyAlbumAttemptKey] | None = set() if continuous else None
+    try:
+        discogs_tracklists = load_tracklist_cache(getattr(args, "tracklist_cache", DEFAULT_TRACKLIST_CACHE_PATH))
+    except (OSError, ValueError) as error:
+        emit_info(print, f"Discogs tracklist evidence unavailable for spelling recovery: {error}")
+        discogs_tracklists = {}
     while True:
         try:
             summary = publish_spotify_playlists(
@@ -2626,6 +2976,7 @@ def run_spotify_publish_from_args(
                 spotify_session=spotify_session,
                 invocation=invocation,
                 completed_album_attempts=completed_album_attempts,
+                discogs_tracklists=discogs_tracklists,
                 access_token=access_token,
                 search_limit=args.search_limit,
                 progress=progress,
@@ -2640,6 +2991,7 @@ def run_spotify_publish_from_args(
                 info_log=None if continuous else print,
                 refresh_match_cache=args.refresh_match_cache,
                 max_new_searches_per_run=args.max_new_searches_per_run,
+                allow_partial=allow_partial,
             )
         except SpotifyRateLimitPauseError as pause:
             if invocation is None or request_control is None:

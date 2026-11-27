@@ -10,13 +10,14 @@ import urllib.parse
 import urllib.request
 from collections.abc import Iterable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from publishers.spotify.matching import (
     SpotifyTrackCandidate,
     normalize_spotify_isrc,
     spotify_recording_metadata_from_values,
     spotify_recording_metadata_is_complete,
+    spotify_track_uri_is_structurally_valid,
 )
 from publishers.spotify.release_matching import SpotifyAlbumCandidate, SpotifyAlbumTrack
 from publishers.spotify.request_control import SpotifyRateLimitInfo, SpotifyRequestControl, parse_retry_after
@@ -137,6 +138,27 @@ class SpotifyTrackSearchClient(Protocol):
     ) -> tuple[SpotifyTrackCandidate, ...]: ...
 
 
+@dataclass(frozen=True)
+class SpotifyTrackSearchPage:
+    candidates: tuple[SpotifyTrackCandidate, ...]
+    total: int
+    next_offset: int | None
+
+
+@runtime_checkable
+class SpotifyTrackPageClient(Protocol):
+    def search_track_page(
+        self, access_token: str, query: str, limit: int, offset: int,
+    ) -> SpotifyTrackSearchPage: ...
+
+
+@runtime_checkable
+class SpotifyTrackCoverageClient(Protocol):
+    def search_tracks_with_coverage(
+        self, access_token: str, query: str, limit: int,
+    ) -> tuple[tuple[SpotifyTrackCandidate, ...], bool]: ...
+
+
 class SpotifyPlaylistReadClient(Protocol):
     def list_current_user_playlists(self, access_token: str) -> tuple[SpotifyPlaylist, ...]: ...
 
@@ -197,22 +219,40 @@ class SpotifyClient:
         query: str,
         limit: int = 10,
     ) -> tuple[SpotifyTrackCandidate, ...]:
+        return self.search_tracks_with_coverage(access_token, query, limit)[0]
+
+    def search_tracks_with_coverage(
+        self, access_token: str, query: str, limit: int = 10,
+    ) -> tuple[tuple[SpotifyTrackCandidate, ...], bool]:
         response = self.search_tracks_response(access_token, query, limit)
         if response.status != 200:
             raise SpotifyApiError(f"Spotify search failed with status {response.status}: {response.body}")
-        return parse_search_track_candidates(response.body)
+        page = search_track_page_object(response.body)
+        items = page["items"]
+        assert isinstance(items, list)
+        candidates = parse_search_track_items(items)
+        total = page.get("total")
+        complete = (
+            type(total) is int and total == len(items) == len(candidates) and total <= limit
+            and type(page.get("offset")) is int and page["offset"] == 0
+            and "next" in page and page["next"] is None
+            and all(candidate.has_complete_recording_metadata and spotify_track_uri_is_structurally_valid(candidate.uri)
+                    for candidate in candidates)
+        )
+        return candidates, complete
 
-    def search_tracks_response(self, access_token: str, query: str, limit: int = 10) -> HttpResponse:
+    def search_tracks_response(
+        self, access_token: str, query: str, limit: int = 10, *, offset: int = 0,
+    ) -> HttpResponse:
         """Run the shared search request and retain the response for strict page validation."""
         if limit < 1 or limit > 10:
             raise ValueError("Spotify search limit must be between 1 and 10")
-        params = urllib.parse.urlencode(
-            {
-                "q": query,
-                "type": "track",
-                "limit": str(limit),
-            }
-        )
+        if not 0 <= offset <= 1000:
+            raise ValueError("Spotify search offset must be between 0 and 1000")
+        fields = {"q": query, "type": "track", "limit": str(limit)}
+        if offset:
+            fields["offset"] = str(offset)
+        params = urllib.parse.urlencode(fields)
         request = HttpRequest(
             method="GET",
             url=f"{SPOTIFY_API_ROOT}/search?{params}",
@@ -222,6 +262,62 @@ class SpotifyClient:
             },
         )
         return self.request_with_rate_limit_retries(request, operation_name="spotify_search")
+
+    def search_track_page(self, access_token: str, query: str, limit: int, offset: int) -> SpotifyTrackSearchPage:
+        response = self.search_tracks_response(access_token, query, limit, offset=offset)
+        if response.status != 200:
+            raise SpotifyApiError(f"Spotify search failed with status {response.status}: {response.body}")
+        tracks = search_track_page_object(response.body)
+        items = tracks["items"]
+        assert isinstance(items, list)
+        total = tracks.get("total")
+        next_url = tracks.get("next")
+        if (
+            type(total) is not int or total < 0 or type(tracks.get("offset")) is not int
+            or tracks["offset"] != offset or type(tracks.get("limit")) is not int or tracks["limit"] != limit
+            or len(items) > limit or "next" not in tracks or (not items and (offset or next_url is not None))
+        ):
+            raise SpotifyApiError("Spotify returned inconsistent track search pagination")
+        next_offset = None
+        if next_url is not None:
+            if not isinstance(next_url, str):
+                raise SpotifyApiError("Spotify returned an invalid next track search offset")
+            # Use only the offset from the link. Requests keep the original query and endpoint.
+            next_offset = offset + len(items)
+            try:
+                parameters = urllib.parse.parse_qs(urllib.parse.urlsplit(next_url).query, keep_blank_values=True)
+            except ValueError as error:
+                raise SpotifyApiError("Spotify returned an invalid next track search offset") from error
+            if parameters.get("offset") != [str(next_offset)] or next_offset > 1000:
+                raise SpotifyApiError("Spotify returned an invalid next track search offset")
+        candidates = parse_search_track_items(items)
+        if len(candidates) != len(items) or any(
+            not candidate.has_complete_recording_metadata or not spotify_track_uri_is_structurally_valid(candidate.uri)
+            for candidate in candidates
+        ):
+            raise SpotifyApiError("Spotify returned incomplete track search metadata")
+        return SpotifyTrackSearchPage(candidates, total, next_offset)
+
+    def get_track_observation(self, access_token: str, track_id: str) -> SpotifyTrackCandidate:
+        if not track_id.isascii() or not track_id.isalnum():
+            raise ValueError("Spotify track ID is invalid")
+        response = self.request_with_rate_limit_retries(
+            HttpRequest("GET", f"{SPOTIFY_API_ROOT}/tracks/{track_id}", spotify_json_headers(access_token)),
+            operation_name="spotify_track",
+        )
+        if response.status != 200:
+            raise SpotifyApiError(f"Spotify track lookup failed with status {response.status}")
+        try:
+            payload = json.loads(response.body)
+        except ValueError as error:
+            raise SpotifyApiError("Spotify track lookup returned invalid JSON") from error
+        hits = parse_search_track_items((payload,))
+        if (
+            not hits or not hits[0].has_complete_recording_metadata
+            or hits[0].uri != f"spotify:track:{track_id}" or payload.get("id") != track_id
+        ):
+            raise SpotifyApiError("Spotify track lookup returned incomplete or different track evidence")
+        return hits[0]
 
     def search_albums(
         self,
@@ -553,10 +649,30 @@ class SpotifyClient:
 
 
 def parse_search_track_candidates(body: str) -> tuple[SpotifyTrackCandidate, ...]:
-    payload = json.loads(body or "{}")
-    tracks = payload.get("tracks", {}) if isinstance(payload, dict) else {}
-    items = tracks.get("items", []) if isinstance(tracks, dict) else []
+    items = search_track_page_object(body)["items"]
+    assert isinstance(items, list)
     return parse_search_track_items(items)
+
+
+def search_track_page_object(body: str) -> Mapping[str, object]:
+    try:
+        payload = json.loads(body)
+    except ValueError as error:
+        raise SpotifyApiError("Spotify search returned invalid JSON") from error
+    tracks = payload.get("tracks") if isinstance(payload, dict) else None
+    if not isinstance(tracks, dict) or not isinstance(tracks.get("items"), list):
+        raise SpotifyApiError("Spotify returned a malformed track search page")
+    return tracks
+
+
+def spotify_track_is_unavailable(item: Mapping[str, object]) -> bool:
+    album = item.get("album")
+    return (
+        any(item.get(field) not in (None, {}) for field in ("restrictions", "linked_from"))
+        or ("is_local" in item and item["is_local"] is not False)
+        or (isinstance(album, dict) and album.get("restrictions") not in (None, {}))
+        or item.get("type") not in (None, "track")
+    )
 
 
 def parse_search_track_items(items: Iterable[object]) -> tuple[SpotifyTrackCandidate, ...]:
@@ -578,10 +694,8 @@ def parse_search_track_items(items: Iterable[object]) -> tuple[SpotifyTrackCandi
         artist_names = tuple(artist_name for raw_artist in raw_artist_names if (artist_name := clean_cell(raw_artist)))
         if uri:
             external_ids = item.get("external_ids")
-            restrictions = item.get("restrictions")
-            restriction_reason = restrictions.get("reason") if isinstance(restrictions, dict) else None
             is_playable = item.get("is_playable")
-            if isinstance(restriction_reason, str) and restriction_reason.strip():
+            if spotify_track_is_unavailable(item):
                 is_playable = False
             candidates.append(
                 SpotifyTrackCandidate(
@@ -653,7 +767,7 @@ def parse_album_track_page(payload: object) -> tuple[SpotifyAlbumTrack, ...]:
         artist_credits_complete = bool(raw_artist_names) and all(
             isinstance(raw_name, str) and raw_name.strip() for raw_name in raw_artist_names
         )
-        is_playable_value = item.get("is_playable")
+        is_playable_value = False if spotify_track_is_unavailable(item) else item.get("is_playable")
         tracks.append(
             SpotifyAlbumTrack(
                 uri=uri,

@@ -19,6 +19,19 @@ from publishers.spotify.publish_state import (  # noqa: E402
 
 
 class SpotifyPublishStateTests(unittest.TestCase):
+    def test_legacy_history_requires_same_recording_or_source_binding(self):
+        track = PlaylistTrack("Mix", "101", "Crossings", "1", "Cafe", "North", "")
+        fields = {"release_id": "101", "album_name": "Crossings", "track_number": "1",
+                  "track_name": "Café", "artist_name": "North", "spotify_uri": "spotify:track:old"}
+        key = "mix|north|crossings|cafe"
+        state = {"Mix": {key: fields}}
+        self.assertFalse(spotify_publish_state_has_track(
+            state, "Mix", key, track=track, spotify_uri="spotify:track:new", legacy_identity_key=key,
+        ))
+        self.assertTrue(spotify_publish_state_has_track(
+            state, "Mix", key, track=track, spotify_uri="spotify:track:old", legacy_identity_key=key,
+        ))
+
     def test_missing_publish_state_cache_loads_empty(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "collection" / "cache" / "spotify-publish-state.cache.json"
