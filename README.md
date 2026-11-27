@@ -859,10 +859,11 @@ recordings. Verify the performance before using a URI in a manual override.
 The command leaves the generated masters, track caches, publisher state,
 and Spotify playlists untouched.
 
-## Propose a manual match for a tied Spotify recording
+## Propose a manual Spotify match by recording code
 
-Add `--proposals` to verify a tie using the source recording's ISRC and save
-the result for manual review. Use a new JSON filename in an existing directory.
+Add `--proposals` to verify eligible candidates using the source recording's
+ISRC and save verified matches for manual review. Use a new JSON filename in an
+existing directory.
 
 ```sh
 python3 scripts/publishers/spotify/review_track_matches.py \
@@ -871,10 +872,12 @@ python3 scripts/publishers/spotify/review_track_matches.py \
   --proposals ./spotify-recording-proposals.json
 ```
 
-This works for saved ties and individual candidates, including those with
-unchanged artist credits or a supported spelling variation. When MusicBrainz
-has no link to the pressing, the review can report missing Spotify metadata
-from up to ten known competitors on different albums.
+A saved ambiguous row can qualify from a current cached candidate, including
+one with a supported spelling variation or unchanged artist credit. A previously
+unmatched row needs a documented artist alias and an eligible cached or search
+result. One eligible Spotify URI is enough to trigger the recording lookup.
+If MusicBrainz has no link to the pressing, the review can report missing
+Spotify metadata from up to ten known competitors on different albums.
 
 The command looks up the exact Discogs pressing in MusicBrainz. It checks the
 links in both directions, the barcode and label/catalogue pair, and the ordered
@@ -886,10 +889,15 @@ album. When multiple editions qualify, the report explains the choice and shows
 the other verified editions. The file keeps one override per printed track
 position when the same recording appears more than once.
 
+Before writing proposals, the command rereads the generated masters and match
+cache. Source changes, new cache holds, and contradictory evidence can withhold
+a proposal.
+
 The JSON file contains only the overrides for the importer. It can be empty if
 no track qualifies. Read the stdout report for tracks held for review or
 incomplete catalog requests. Preview the file with the same playlist root and
-match cache you used for the review.
+match cache you used for the review. Review and approve each override before
+applying it.
 
 ```sh
 python3 scripts/publishers/spotify/manual_matches.py \
@@ -899,11 +907,69 @@ python3 scripts/publishers/spotify/manual_matches.py \
 
 ## Import manual Spotify matches
 
-Use a manual override when the report identifies the correct Spotify track but
-the automatic rules cannot select it safely. The importer checks the release ID,
-track number, title, artist, and album against the generated playlist masters.
-The text comparison keeps accents and non-Latin characters. Preview mode does
-not change the cache or call Spotify:
+Use a manual override when you know which Spotify track to select. The importer
+checks the release ID, track number, title, artist, and album against the
+generated playlist masters. The text comparison keeps accents and non-Latin
+characters. Preparation, preview, and apply all run offline.
+
+Preparation and preview can run while a publisher is active. Before using
+`--apply`, finish or stop all processes that write to the same match cache,
+including any continuous publisher. Apply reads and replaces the entire cache.
+Restart those processes after the import so an older in-memory snapshot cannot
+overwrite the new matches.
+
+### Prepare a hand-written map
+
+Save your choices in a separate `choices.json` file. This example uses synthetic
+release and track identifiers.
+
+```json
+{
+  "publishers": {
+    "spotify": {
+      "321": {
+        "1": "spotify:track:studio",
+        "10": "spotify:track:handpicked"
+      }
+    }
+  }
+}
+```
+
+Put Spotify choices under the `spotify` key. The importer reports any other
+publisher sections it skips. Use the one-based `Track Number` exported for the
+release. A vinyl position such as `B1` identifies a different field.
+
+Prepare a new review file outside the generated playlist folders, then check
+the displayed Discogs source and Spotify target. You can choose an uncached
+track URI. Its Spotify labels are shown as unknown, and append checks for the
+exact URI even if those labels become available later.
+
+```sh
+python3 scripts/publishers/spotify/manual_matches.py \
+  --prepare-map choices.json --output review.json \
+  --playlist-output-directory collection/playlists/release-playlists
+python3 scripts/publishers/spotify/manual_matches.py \
+  --overrides review.json \
+  --playlist-output-directory collection/playlists/release-playlists
+python3 scripts/publishers/spotify/manual_matches.py \
+  --overrides review.json --apply \
+  --playlist-output-directory collection/playlists/release-playlists
+```
+
+The version 2 review file records all five source fields. If the song moves or
+its identity at that position changes in a selected master, prepare a new
+review. Conflicting Spotify labels for the same source and URI also stop the
+import. For an intentional replacement, use `--replace-existing` when
+preparing, previewing, and applying while the old cache match remains.
+
+Keep publisher settings in `config/publisher.json`.
+
+### Import a detailed override file
+
+Use the same preview and apply commands with a version 1 file, such as a
+recording proposal from the review command. The default playlist root is
+`collection/playlists`.
 
 ```bash
 python3 scripts/publishers/spotify/manual_matches.py \

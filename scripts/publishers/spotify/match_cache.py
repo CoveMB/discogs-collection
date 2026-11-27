@@ -15,6 +15,7 @@ from publishers.spotify.matching import (
     AMBIGUOUS,
     CATALOGUE_RECORDING_STRATEGIES,
     CONSTRAINED_TYPO_MATCH_REASON_PREFIX,
+    MANUAL_URI_ONLY_MATCH_STRATEGY,
     MATCHED,
     EXACT_TITLE_RECORDING_STRATEGY,
     REPEATED_PERFORMER_CREDIT_STRATEGY,
@@ -456,6 +457,7 @@ def spotify_candidate_from_cache_record(
     *,
     require_recording_metadata: bool = False,
 ) -> SpotifyTrackCandidate | None:
+    uri_only = record.get("match_status") == "manual" and record.get("match_strategy") == MANUAL_URI_ONLY_MATCH_STRATEGY
     metadata_complete = record.get("spotify_metadata_incomplete") is not True and spotify_recording_metadata_is_complete(
         uri=record.get("spotify_uri"),
         title=record.get("spotify_track_name"),
@@ -465,6 +467,8 @@ def spotify_candidate_from_cache_record(
     )
     if require_recording_metadata and not metadata_complete:
         return None
+    if uri_only:
+        default_track = None
     spotify_uri = clean_cell(record.get("spotify_uri"))
     if not spotify_uri.startswith("spotify:track:"):
         return None
@@ -513,6 +517,36 @@ def review_candidates_from_cache_record(
             continue
         candidate = spotify_candidate_from_cache_record(candidate_record)
         if candidate:
+            candidates.append(candidate)
+    return tuple(candidates)
+
+
+def source_bound_cached_candidates(
+    record: Mapping[str, object], *, allow_incomplete_album: bool = False,
+) -> tuple[SpotifyTrackCandidate, ...]:
+    raw_candidates = record.get("review_candidates")
+    if not isinstance(raw_candidates, list):
+        return ()
+    candidates: list[SpotifyTrackCandidate] = []
+    for raw in raw_candidates:
+        if not isinstance(raw, Mapping):
+            continue
+        # Ordinary suggestions inherit their source only from the containing decision.
+        if any(field in raw for field in ("release_id", "track_number", "track_name", "artist_name", "album_name")):
+            continue
+        raw_artists = raw.get("spotify_artist_names")
+        if not isinstance(raw_artists, list) or not raw_artists or not all(
+            isinstance(name, str) and name.strip() for name in raw_artists
+        ):
+            continue
+        if not isinstance(raw_title := raw.get("spotify_track_name"), str) or not raw_title.strip():
+            continue
+        candidate = spotify_candidate_from_cache_record(raw, require_recording_metadata=not allow_incomplete_album)
+        if (
+            candidate and not candidate.version_title_review_only
+            and spotify_track_uri_is_structurally_valid(candidate.uri)
+            and "spotify_observed_recording_metadata" not in raw
+        ):
             candidates.append(candidate)
     return tuple(candidates)
 

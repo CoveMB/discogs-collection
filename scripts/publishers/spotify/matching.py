@@ -53,6 +53,7 @@ ALPHANUMERIC_SPACING_MATCH_REASON = "track and album matched after normalizing l
 ALPHANUMERIC_SPACING_MATCH_STRATEGY = "alphanumeric_spacing"
 VERSION_SUBSTITUTE_MATCH_STRATEGY = "version_substitute"
 SAME_RECORDING_EDITION_MATCH_STRATEGY = "same_recording_edition"
+MANUAL_URI_ONLY_MATCH_STRATEGY = "manual_uri_only"
 REPEATED_PERFORMER_CREDIT_STRATEGY = "repeated_performer_credit"
 TRAILING_PERFORMER_CREDIT = re.compile(r"\s*\(\s*with\s+([^()[\]]+?)\s*\)$")
 TRAILING_FEATURING_CREDIT = re.compile(r"\s+featuring\s+([^()[\]]+?)$")
