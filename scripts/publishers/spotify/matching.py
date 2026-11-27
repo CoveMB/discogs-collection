@@ -882,6 +882,14 @@ def _composer_prefix_matches(prefix: str, artist: str) -> bool:
     )
 
 
+def credited_composer(candidate: SpotifyTrackCandidate) -> str:
+    prefix, delimiter, _ = candidate.name.partition(":")
+    if not delimiter:
+        return ""
+    matches = [artist for artist in candidate.artists if _composer_prefix_matches(prefix, artist)]
+    return normalize_recording_evidence_text(matches[0]) if len(matches) == 1 else ""
+
+
 def composer_prefix_candidates(
     track: PlaylistTrack, candidates: Sequence[SpotifyTrackCandidate],
 ) -> tuple[SpotifyTrackCandidate, ...]:
@@ -891,7 +899,7 @@ def composer_prefix_candidates(
     rivals: list[SpotifyTrackCandidate] = []
     verified_prefix = False
     for candidate in candidates:
-        prefix, delimiter, remainder = candidate.name.partition(":")
+        _, delimiter, remainder = candidate.name.partition(":")
         if (
             not source_title or not credits or not set(credits) <= set(complete_credit_keys(candidate.artists))
             or not source_album.intersection(_composer_album_forms(candidate.album_name))
@@ -900,9 +908,7 @@ def composer_prefix_candidates(
         prefixed = bool(delimiter) and _composer_title_key(remainder) == source_title
         if prefixed or _composer_title_key(candidate.name) == source_title:
             rivals.append(candidate)
-            verified_prefix = verified_prefix or (
-                prefixed and sum(_composer_prefix_matches(prefix, artist) for artist in candidate.artists) == 1
-            )
+            verified_prefix = verified_prefix or (prefixed and bool(credited_composer(candidate)))
     return tuple(rivals) if verified_prefix else ()
 
 

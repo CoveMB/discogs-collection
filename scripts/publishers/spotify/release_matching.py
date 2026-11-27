@@ -16,6 +16,7 @@ from publishers.spotify.matching import (
     catalogue_spelling_strategy,
     complete_credit_keys,
     composer_prefix_candidates,
+    credited_composer,
     exact_title_and_full_credits,
     has_legacy_loss,
     normalized_nonempty_music_values_match,
@@ -288,7 +289,7 @@ def resolve_release_with_album(
             position
             for assessment in assessments
             for position in independently_aligned_spelling_positions(source_tracks, assessment)
-        ) + independently_aligned_composer_positions(source_tracks, assessments)
+        ) + independently_aligned_composer_positions(source_tracks, source_tracklist.artist_name, assessments)
     return SpotifyReleaseAlbumMatchResult(
         decisions=decisions,
         search_count=1,
@@ -319,8 +320,11 @@ def complete_source_tracklist_matches(
 
 
 def independently_aligned_composer_positions(
-    source_tracks: Sequence[PlaylistTrack], assessments: Sequence[_AlbumAssessment],
+    source_tracks: Sequence[PlaylistTrack], source_album_artist: str, assessments: Sequence[_AlbumAssessment],
 ) -> tuple[tuple[PlaylistTrack, SpotifyTrackCandidate], ...]:
+    release_credits = complete_credit_keys(source_credit_names(source_album_artist))
+    if not release_credits:
+        return ()
     observed: list[SpotifyTrackCandidate] = []
     aligned: list[tuple[tuple[PlaylistTrack, SpotifyTrackCandidate], ...]] = []
     for assessment in assessments:
@@ -332,6 +336,7 @@ def independently_aligned_composer_positions(
         observed.extend(hits)
         if (
             len(hits) != len(source_tracks) or len(hits) != album.total_tracks
+            or complete_credit_keys(album.artists) != release_credits
             or len({hit.uri for hit in hits}) != len(hits)
             or not complete_ordered_composer_album(assessment.spotify_tracks)
         ):
@@ -339,7 +344,13 @@ def independently_aligned_composer_positions(
 
         pairs = tuple(zip(source_tracks, hits))
         composer = tuple((row, hit) for row, hit in pairs if composer_prefix_candidates(row, (hit,)))
-        if composer and all(pair in composer or exact_title_and_full_credits(*pair) for pair in pairs):
+        # A common composer alone cannot distinguish two performances of the complete work.
+        has_credit_beyond_composer = any(
+            set(release_credits).intersection(complete_credit_keys(source_credit_names(row.artist_name)))
+            - {credited_composer(hit)}
+            for row, hit in composer
+        )
+        if has_credit_beyond_composer and all(pair in composer or exact_title_and_full_credits(*pair) for pair in pairs):
             aligned.append(composer)
     if len(aligned) != 1:
         return ()

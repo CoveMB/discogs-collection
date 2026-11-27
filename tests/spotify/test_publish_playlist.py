@@ -727,8 +727,10 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         )
 
         class CoveredAlbumClient(AlbumPublishingSpotifyClient):
-            def __init__(self, items, scoped_truncated=False, extra=(), warm=False):
-                super().__init__((album,), {album.album_id: items}, {} if warm else {queries[0]: (hit,), broad: extra})
+            def __init__(self, items, scoped_truncated=False, extra=(), warm=False, catalogue_album=album):
+                first = replace(hit, name=items[0].name, artists=items[0].artists)
+                search = {} if warm else {queries[0]: (first,), broad: extra}
+                super().__init__((catalogue_album,), {catalogue_album.album_id: items}, search)
                 self.incomplete = {broad, queries[0]} if scoped_truncated else {broad}
 
             def search_tracks_with_coverage(self, access_token, query, limit=10):
@@ -737,6 +739,10 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
             master = directory / "Test" / "Test.csv"
+            composer_only = tuple(
+                replace(item, name=f"N. Ensemble: {title}", artists=("North Ensemble", "Other Soloist"))
+                for item, title in zip(listing, titles)
+            )
             write_playlist_master(master, [
                 playlist_row(row.release_id, row.album_name, row.track_name, row.artist_name, row.track_number)
                 for row in tracks
@@ -745,6 +751,8 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
                 ("aligned", listing, pressing, False, (), "would_include"),
                 ("partial Spotify", listing[:-1], pressing, False, (), "ambiguous"),
                 ("partial Discogs", listing, replace(pressing, tracks=pressing.tracks[:-1]), False, (), "ambiguous"),
+                ("different album artist", listing, pressing, False, (), "ambiguous"),
+                ("composer is the only shared artist", composer_only, pressing, False, (), "ambiguous"),
                 ("changed movement", (listing[0], replace(listing[1], name="J. Vale: Other Work"), listing[2]),
                  pressing, False, (), "ambiguous"),
                 ("truncated structured", listing, pressing, True, (), "ambiguous"),
@@ -753,7 +761,8 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
             ):
                 with self.subTest(label=label):
                     cache = directory / "matches.json"
-                    client = CoveredAlbumClient(items, truncated, extra)
+                    catalogue_album = replace(album, artists=("Other Ensemble",)) if label == "different album artist" else album
+                    client = CoveredAlbumClient(items, truncated, extra, catalogue_album=catalogue_album)
                     result = publish_spotify_playlists(
                         directory, directory / "report", client, "token", apply=False, publisher_sync_mode="replace",
                         playlist_master_paths=(master,), match_cache_path=cache, discogs_tracklists={"111": source},

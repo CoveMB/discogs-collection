@@ -721,10 +721,11 @@ checks with the selected URI.
 The publisher can recognize a composer prefix such as `A. Reed: ` on the
 source album when the remaining title, the composer label and the source
 performers agree. If a broad search is truncated, a complete title-and-artist
-search and matching ordered Discogs and Spotify tracklists can still confirm
-the candidate. Conflicting results keep the track in review. For a title with
-`and` or `&`, the publisher checks the surrounding text and full credits.
-A short spelling difference in an artist or title, such as
+search and matching Discogs and Spotify release credits and track order can
+still confirm the candidate. The tracklist must corroborate a shared artist
+credit beyond the composer. Conflicting results keep the track in review.
+For a title with `and` or `&`, the publisher checks the surrounding text and
+full credits. A short spelling difference in an artist or title, such as
 an omitted accent, needs stronger evidence. The publisher checks the track's
 position on a complete release, using two other matching titles and
 corresponding credits. The recording review command can verify spelling
