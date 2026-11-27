@@ -167,6 +167,7 @@ class TrackMatchDecision:
     match_strategy: str = ""
     strict_album_recovery: bool = False
     title_search_complete: bool = False
+    composer_coverage: str = ""
 
 
 def build_spotify_track_search_query(track: PlaylistTrack) -> str:
@@ -492,7 +493,7 @@ def choose_best_track_match(
     *,
     repeated_credit_observations: Sequence[SpotifyTrackCandidate] | None = None,
     allow_catalogue_recovery: bool = True,
-    spelling_positions: Sequence[SpotifyTrackCandidate] = (),
+    aligned_album_positions: Sequence[SpotifyTrackCandidate] = (),
 ) -> TrackMatchDecision:
     if repeated_credit_observations is None:
         repeated_credit_observations = candidates
@@ -642,7 +643,7 @@ def choose_best_track_match(
         )
 
     if allow_catalogue_recovery:
-        recovery = match_catalogue_variants(track, repeated_credit_observations, search_queries, spelling_positions)
+        recovery = match_catalogue_variants(track, repeated_credit_observations, search_queries, aligned_album_positions)
         if recovery is not None:
             return recovery
 
@@ -881,7 +882,7 @@ def _composer_prefix_matches(prefix: str, artist: str) -> bool:
     )
 
 
-def _composer_prefix_candidates(
+def composer_prefix_candidates(
     track: PlaylistTrack, candidates: Sequence[SpotifyTrackCandidate],
 ) -> tuple[SpotifyTrackCandidate, ...]:
     source_title = _composer_title_key(track.track_name)
@@ -905,6 +906,15 @@ def _composer_prefix_candidates(
     return tuple(rivals) if verified_prefix else ()
 
 
+def has_aligned_album_position(
+    candidate: SpotifyTrackCandidate, positions: Sequence[SpotifyTrackCandidate],
+) -> bool:
+    return any(
+        candidate.uri == position.uri and candidate.recording_metadata() == position.recording_metadata()
+        for position in positions
+    )
+
+
 def select_catalogue_recording(
     track: PlaylistTrack,
     competitors: Sequence[SpotifyTrackCandidate],
@@ -912,7 +922,7 @@ def select_catalogue_recording(
     strategy: str,
     search_queries: tuple[str, ...],
     *,
-    spelling_positions: Sequence[SpotifyTrackCandidate] = (),
+    aligned_album_positions: Sequence[SpotifyTrackCandidate] = (),
 ) -> TrackMatchDecision:
     rivals: dict[str, SpotifyTrackCandidate] = {}
     for candidate in competitors:
@@ -956,11 +966,7 @@ def select_catalogue_recording(
     ]
     if strategy == CATALOGUE_SPELLING_STRATEGY:
         anchored = [
-            candidate for candidate in playable
-            if any(
-                candidate.uri == position.uri and candidate.recording_metadata() == position.recording_metadata()
-                for position in spelling_positions
-            )
+            candidate for candidate in playable if has_aligned_album_position(candidate, aligned_album_positions)
         ]
         if not anchored:
             return replace(hold, reason="catalogue spelling requires a verified recording or an independently aligned position")
@@ -976,7 +982,7 @@ def match_catalogue_variants(
     track: PlaylistTrack,
     observations: Sequence[SpotifyTrackCandidate],
     search_queries: tuple[str, ...],
-    spelling_positions: Sequence[SpotifyTrackCandidate] = (),
+    aligned_album_positions: Sequence[SpotifyTrackCandidate] = (),
 ) -> TrackMatchDecision | None:
     eligible = tuple(
         candidate for candidate in observations if not candidate.version_title_review_only and not candidate.title_only_search
@@ -988,14 +994,17 @@ def match_catalogue_variants(
         if strategy:
             competitors.setdefault(strategy, []).append(candidate)
     spelling_uris = {candidate.uri for candidate in competitors.get(CATALOGUE_SPELLING_STRATEGY, ())}
-    for position in spelling_positions:
-        if position.uri not in spelling_uris:
+    for position in aligned_album_positions:
+        if (
+            position.uri not in spelling_uris
+            and catalogue_spelling_strategy(track.track_name, credits, position) == CATALOGUE_SPELLING_STRATEGY
+        ):
             competitors.setdefault(CATALOGUE_SPELLING_STRATEGY, []).append(position)
-    if composer := _composer_prefix_candidates(track, eligible):
+    if composer := composer_prefix_candidates(track, eligible):
         competitors[COMPOSER_PREFIX_STRATEGY] = list(composer)
     matches = [
         select_catalogue_recording(
-            track, rivals, observations, strategy, search_queries, spelling_positions=spelling_positions,
+            track, rivals, observations, strategy, search_queries, aligned_album_positions=aligned_album_positions,
         )
         for strategy, rivals in competitors.items()
     ]

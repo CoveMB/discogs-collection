@@ -56,6 +56,7 @@ from publishers.spotify.matching import (  # noqa: E402
     ALPHANUMERIC_SPACING_MATCH_STRATEGY,
     AMBIGUOUS,
     CATALOGUE_RECORDING_STRATEGIES,
+    COMPOSER_PREFIX_STRATEGY,
     EXACT_TITLE_RECORDING_STRATEGY,
     CONSTRAINED_TYPO_MATCH_REASON_PREFIX,
     ERROR,
@@ -81,6 +82,7 @@ from publishers.spotify.matching import (  # noqa: E402
     choose_best_track_match,
     complete_version_title_review,
     exact_title_and_full_credits,
+    has_aligned_album_position,
     match_exact_title_recording,
     legacy_spotify_track_identity_key,
     normalize_music_text,
@@ -349,7 +351,7 @@ def search_spotify_track(
     search_limit: int,
     fail_on_api_error: bool = False,
     *,
-    spelling_positions: Sequence[SpotifyTrackCandidate] = (),
+    aligned_album_positions: Sequence[SpotifyTrackCandidate] = (),
     on_search: Callable[[], None] | None = None,
 ) -> SpotifyTrackSearchResult:
     search_queries = build_spotify_track_search_queries(track)
@@ -360,6 +362,8 @@ def search_spotify_track(
     search_count = 0
     successful_search_count = 0
     ordinary_complete = True
+    scoped_complete = True
+    scoped_uris: set[str] = set()
     cross_release_tie: TrackMatchDecision | None = None
 
     for query in search_queries:
@@ -371,6 +375,10 @@ def search_spotify_track(
             if isinstance(spotify_client, SpotifyTrackCoverageClient):
                 query_candidates, complete = spotify_client.search_tracks_with_coverage(access_token, query, search_limit)
                 ordinary_complete = ordinary_complete and complete
+                if query.startswith('track:"'):
+                    scoped_complete = scoped_complete and complete
+                    if complete:
+                        scoped_uris.update(candidate.uri for candidate in query_candidates)
             else:
                 query_candidates = spotify_client.search_tracks(access_token=access_token, query=query, limit=search_limit)
         except (SpotifyAuthenticationError, SpotifyRateLimitPauseError, SpotifyRateLimitDeferredError, SpotifyRateLimitRetriesExhaustedError):
@@ -429,7 +437,7 @@ def search_spotify_track(
     else:
         decision = choose_best_track_match(
             track, tuple(candidates), queries, allow_constrained_typo_fallback=False, allow_version_substitute=False,
-            repeated_credit_observations=observed_candidates, spelling_positions=spelling_positions,
+            repeated_credit_observations=observed_candidates, aligned_album_positions=aligned_album_positions,
         )
     if decision.status == UNMATCHED and isinstance(spotify_client, SpotifyTrackPageClient):
         title_query = " ".join(track.track_name.split())
@@ -448,13 +456,27 @@ def search_spotify_track(
         )
     if query_errors and decision.match_strategy in CATALOGUE_RECORDING_STRATEGIES | {REPEATED_PERFORMER_CREDIT_STRATEGY}:
         decision = track_match_error(track, "; ".join(query_errors), search_queries=queries)
-    elif not ordinary_complete and decision.status == MATCHED and (
+    elif decision.status == MATCHED and (
         decision.match_strategy in CATALOGUE_RECORDING_STRATEGIES | {REPEATED_PERFORMER_CREDIT_STRATEGY}
     ):
-        decision = replace(
-            decision, status=AMBIGUOUS, candidate=None, spotify_uri="",
-            reason="recovery needs review because ordinary search coverage was incomplete",
+        composer = decision.match_strategy == COMPOSER_PREFIX_STRATEGY
+        album_covers_composer = (
+            not ordinary_complete and composer and scoped_complete and decision.candidate is not None
+            and decision.spotify_uri in scoped_uris
+            and has_aligned_album_position(decision.candidate, aligned_album_positions)
         )
+        if not ordinary_complete and not album_covers_composer:
+            decision = replace(
+                decision, status=AMBIGUOUS, candidate=None, spotify_uri="",
+                reason="recovery needs review because ordinary search coverage was incomplete",
+            )
+        elif album_covers_composer:
+            decision = replace(
+                decision, composer_coverage="album",
+                reason=f"{decision.reason}. The complete source album confirms its position.",
+            )
+        elif composer:
+            decision = replace(decision, composer_coverage="search")
     return SpotifyTrackSearchResult(resolve_spotify_edition_tie(decision, observed_candidates), search_count)
 
 
@@ -599,7 +621,7 @@ def publish_spotify_playlists(
             )
             attempted_album_release_ids: set[str] = set()
             album_decisions_by_track_key: dict[tuple[str, ...], TrackMatchDecision] = {}
-            spelling_positions_by_track: dict[tuple[str, ...], list[SpotifyTrackCandidate]] = {}
+            aligned_album_positions_by_track: dict[tuple[str, ...], list[SpotifyTrackCandidate]] = {}
             album_lookup_diagnostics_by_release_id: dict[str, str] = {}
             preexisting_matched_cache_keys = (
                 set()
@@ -726,12 +748,12 @@ def publish_spotify_playlists(
                                         fallback_track_candidates=fallback_candidates,
                                         source_tracklist=discogs_tracklist,
                                     )
-                                    positions = album_result.spelling_positions
+                                    positions = album_result.aligned_album_positions
                                     if completed_album_attempts is not None:
                                         completed_album_attempts.add(attempt_key)
                                         resume_progress_made = True
                                         if invocation is not None:
-                                            invocation.completed_spelling_positions[attempt_key] = positions
+                                            invocation.completed_aligned_album_positions[attempt_key] = positions
                                     search_count += album_result.search_count
                                     if album_result.diagnostic:
                                         album_lookup_diagnostics_by_release_id[track.release_id] = album_result.diagnostic
@@ -761,13 +783,13 @@ def publish_spotify_playlists(
                                         track, album_decisions_by_track_key.get(track_binding),
                                     )
                                 elif invocation is not None:
-                                    positions = invocation.completed_spelling_positions.get(attempt_key) or ()
+                                    positions = invocation.completed_aligned_album_positions.get(attempt_key) or ()
                                 for position_source, candidate in positions:
-                                    spelling_positions_by_track.setdefault(source_track_binding(position_source), []).append(candidate)
-                    spelling_positions = spelling_positions_by_track.get(track_binding, ())
-                    if cached_match is None and not refresh_match_cache and spelling_positions:
+                                    aligned_album_positions_by_track.setdefault(source_track_binding(position_source), []).append(candidate)
+                    aligned_album_positions = aligned_album_positions_by_track.get(track_binding, ())
+                    if cached_match is None and not refresh_match_cache and aligned_album_positions:
                         cached_match = cached_track_match(
-                            track, match_cache, seen_at=timestamp, spelling_positions=spelling_positions,
+                            track, match_cache, seen_at=timestamp, aligned_album_positions=aligned_album_positions,
                         )
                     cached_review_query = (
                         build_base_title_version_review_query(cached_match.decision)
@@ -855,7 +877,7 @@ def publish_spotify_playlists(
                                     access_token=access_token,
                                     search_limit=search_limit,
                                     fail_on_api_error=invocation is not None,
-                                    spelling_positions=spelling_positions,
+                                    aligned_album_positions=aligned_album_positions,
                                     on_search=count_track_search,
                                 )
                             finally:
@@ -989,7 +1011,7 @@ def publish_spotify_playlists(
                                 match_cache, decision, matched_at=timestamp, refresh_match_cache=refresh_match_cache,
                             )
                             if cached_match is None and cached_track_match(
-                                track, match_cache, spelling_positions=spelling_positions,
+                                track, match_cache, aligned_album_positions=aligned_album_positions,
                             ) is not None:
                                 resume_progress_made = True
                         if recording_conflict:

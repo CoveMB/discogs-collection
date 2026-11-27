@@ -704,6 +704,77 @@ def publish_summary_stub(**overrides):
 
 
 class SpotifyPublishPlaylistTests(unittest.TestCase):
+    def test_composer_recovery_with_truncated_broad_search_requires_a_complete_aligned_release(self):
+        titles = ("Suite: I. Dawn", "Suite: II. Rain", "Suite: III. Sky")
+        tracks = tuple(
+            playlist_track("Test", "111", "Suite", title, "North Ensemble", str(index))
+            for index, title in enumerate(titles, start=1)
+        )
+        album = SpotifyAlbumCandidate("edition", "spotify:album:edition", "Suite", ("North Ensemble",), 3)
+        listing = tuple(
+            SpotifyAlbumTrack(f"spotify:track:{index}", f"J. Vale: {title}",
+                              ("Jordan Vale", "North Ensemble"), 1, index)
+            for index, title in enumerate(titles, start=1)
+        )
+        hit = SpotifyTrackCandidate(listing[0].uri, listing[0].name, listing[0].artists, "Suite", album.album_id,
+                                    "USABC2400001", True)
+        queries = build_spotify_track_search_queries(tracks[0])
+        broad = next(query for query in queries if not query.startswith('track:"'))
+        pressing = ReleaseTracklistLookup(
+            "111", "North Ensemble", "Suite", "2026",
+            tuple(DiscogsTrack(str(index), title, "North Ensemble") for index, title in enumerate(titles, start=1)),
+            (),
+        )
+
+        class CoveredAlbumClient(AlbumPublishingSpotifyClient):
+            def __init__(self, items, scoped_truncated=False, extra=(), warm=False):
+                super().__init__((album,), {album.album_id: items}, {} if warm else {queries[0]: (hit,), broad: extra})
+                self.incomplete = {broad, queries[0]} if scoped_truncated else {broad}
+
+            def search_tracks_with_coverage(self, access_token, query, limit=10):
+                return self.search_tracks(access_token, query, limit), query not in self.incomplete
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            master = directory / "Test" / "Test.csv"
+            write_playlist_master(master, [
+                playlist_row(row.release_id, row.album_name, row.track_name, row.artist_name, row.track_number)
+                for row in tracks
+            ])
+            for label, items, source, truncated, extra, expected in (
+                ("aligned", listing, pressing, False, (), "would_include"),
+                ("partial Spotify", listing[:-1], pressing, False, (), "ambiguous"),
+                ("partial Discogs", listing, replace(pressing, tracks=pressing.tracks[:-1]), False, (), "ambiguous"),
+                ("changed movement", (listing[0], replace(listing[1], name="J. Vale: Other Work"), listing[2]),
+                 pressing, False, (), "ambiguous"),
+                ("truncated structured", listing, pressing, True, (), "ambiguous"),
+                ("competing copy", listing, pressing, False, (replace(hit, uri="spotify:track:other"),), "ambiguous"),
+                ("contradictory observation", listing, pressing, False, (replace(hit, is_playable=False),), "ambiguous"),
+            ):
+                with self.subTest(label=label):
+                    cache = directory / "matches.json"
+                    client = CoveredAlbumClient(items, truncated, extra)
+                    result = publish_spotify_playlists(
+                        directory, directory / "report", client, "token", apply=False, publisher_sync_mode="replace",
+                        playlist_master_paths=(master,), match_cache_path=cache, discogs_tracklists={"111": source},
+                        refresh_match_cache=True,
+                    )
+                    self.assertEqual(result.decisions[0].status, expected)
+                    if label == "aligned":
+                        self.assertEqual(result.decisions[0].spotify_uri, hit.uri)
+                        cache_bytes = cache.read_bytes()
+                        for album_items, warm_status in ((listing, "would_include"), (listing[:-1], "unmatched")):
+                            cache.write_bytes(cache_bytes)
+                            warm = publish_spotify_playlists(
+                                directory, directory / "report", CoveredAlbumClient(album_items, warm=True), "token",
+                                apply=False, publisher_sync_mode="replace", playlist_master_paths=(master,),
+                                match_cache_path=cache, discogs_tracklists={"111": source},
+                            )
+                            self.assertEqual(warm.decisions[0].status, warm_status)
+                            if warm_status == "would_include":
+                                self.assertEqual((warm.decisions[0].match_source, warm.decisions[0].spotify_uri),
+                                                 ("cache", hit.uri))
+
     def test_title_pagination_pause_counts_dispatched_pages_and_restarts_the_row(self):
         track = playlist_track("Test", "111", "Source EP", "Lights", "North")
         hit = SpotifyTrackCandidate("spotify:track:lights", "Lights", ("North",), "Other Album", "edition",

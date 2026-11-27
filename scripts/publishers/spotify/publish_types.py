@@ -126,7 +126,7 @@ class SpotifyPublishInvocation:
     completed_pass_count: int = 0
     current_user_id: str | None = None
     latest_summary: SpotifyPublishSummary | None = None
-    completed_spelling_positions: dict[
+    completed_aligned_album_positions: dict[
         SpotifyAlbumAttemptKey, tuple[tuple[PlaylistTrack, SpotifyTrackCandidate], ...],
     ] = field(default_factory=dict)
 

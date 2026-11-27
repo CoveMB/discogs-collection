@@ -15,6 +15,8 @@ from publishers.spotify.matching import (
     CATALOGUE_SPELLING_STRATEGY,
     catalogue_spelling_strategy,
     complete_credit_keys,
+    composer_prefix_candidates,
+    exact_title_and_full_credits,
     has_legacy_loss,
     normalized_nonempty_music_values_match,
     MATCHED,
@@ -110,7 +112,7 @@ class SpotifyReleaseAlbumMatchResult:
     diagnostic: str = ""
     validation_diagnostics: tuple[SpotifyAlbumValidationDiagnostic, ...] = ()
     used_fallback_track_candidates: bool = False
-    spelling_positions: tuple[tuple[PlaylistTrack, SpotifyTrackCandidate], ...] = ()
+    aligned_album_positions: tuple[tuple[PlaylistTrack, SpotifyTrackCandidate], ...] = ()
 
 
 @runtime_checkable
@@ -280,20 +282,20 @@ def resolve_release_with_album(
         decisions = mark_track_candidate_album_decisions(
             decisions, strict_album_recovery=checking_cached_after_direct_rejection,
         )
-    spelling_positions = ()
+    aligned_album_positions = ()
     if source_tracklist is not None and complete_source_tracklist_matches(source_tracks, source_tracklist):
-        spelling_positions = tuple(
+        aligned_album_positions = tuple(
             position
             for assessment in assessments
             for position in independently_aligned_spelling_positions(source_tracks, assessment)
-        )
+        ) + independently_aligned_composer_positions(source_tracks, assessments)
     return SpotifyReleaseAlbumMatchResult(
         decisions=decisions,
         search_count=1,
         diagnostic=diagnostic,
         validation_diagnostics=validation_diagnostics,
         used_fallback_track_candidates=candidates_came_from_track_search,
-        spelling_positions=spelling_positions,
+        aligned_album_positions=aligned_album_positions,
     )
 
 
@@ -314,6 +316,55 @@ def complete_source_tracklist_matches(
             for index, (row, source) in enumerate(zip(tracks, tracklist.tracks), start=1)
         )
     )
+
+
+def independently_aligned_composer_positions(
+    source_tracks: Sequence[PlaylistTrack], assessments: Sequence[_AlbumAssessment],
+) -> tuple[tuple[PlaylistTrack, SpotifyTrackCandidate], ...]:
+    observed: list[SpotifyTrackCandidate] = []
+    aligned: list[tuple[tuple[PlaylistTrack, SpotifyTrackCandidate], ...]] = []
+    for assessment in assessments:
+        album = assessment.album
+        hits = tuple(
+            SpotifyTrackCandidate(track.uri, track.name, track.artists, album.name, album.album_id)
+            for track in assessment.spotify_tracks
+        )
+        observed.extend(hits)
+        if (
+            len(hits) != len(source_tracks) or len(hits) != album.total_tracks
+            or len({hit.uri for hit in hits}) != len(hits)
+            or not complete_ordered_composer_album(assessment.spotify_tracks)
+        ):
+            continue
+
+        pairs = tuple(zip(source_tracks, hits))
+        composer = tuple((row, hit) for row, hit in pairs if composer_prefix_candidates(row, (hit,)))
+        if composer and all(pair in composer or exact_title_and_full_credits(*pair) for pair in pairs):
+            aligned.append(composer)
+    if len(aligned) != 1:
+        return ()
+    return tuple(
+        (row, hit) for row, hit in aligned[0]
+        if {rival.uri for rival in composer_prefix_candidates(row, observed)} == {hit.uri}
+        and not any(
+            other.uri == hit.uri and other.recording_metadata() != hit.recording_metadata() for other in observed
+        )
+    )
+
+
+def complete_ordered_composer_album(tracks: Sequence[SpotifyAlbumTrack]) -> bool:
+    disc, number = 1, 0
+    for track in tracks:
+        position = (track.disc_number, track.track_number)
+        if (
+            position not in {(disc, number + 1), (disc + 1, 1)}
+            or (number == 0 and position != (1, 1))
+            or not track.artist_credits_complete or not track.name.strip()
+            or track.is_playable is False or not spotify_track_uri_is_structurally_valid(track.uri)
+        ):
+            return False
+        disc, number = position
+    return True
 
 
 def independently_aligned_spelling_positions(

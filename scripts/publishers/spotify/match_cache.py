@@ -14,6 +14,7 @@ from publishers.spotify.matching import (
     ALPHANUMERIC_SPACING_MATCH_STRATEGY,
     AMBIGUOUS,
     CATALOGUE_RECORDING_STRATEGIES,
+    COMPOSER_PREFIX_STRATEGY,
     CONSTRAINED_TYPO_MATCH_REASON_PREFIX,
     MANUAL_URI_ONLY_MATCH_STRATEGY,
     MATCHED,
@@ -28,6 +29,7 @@ from publishers.spotify.matching import (
     VERSION_SUBSTITUTE_MATCH_STRATEGY,
     build_spotify_track_search_query,
     choose_best_track_match,
+    has_aligned_album_position,
     has_legacy_loss,
     legacy_music_text,
     match_catalogue_variants,
@@ -57,7 +59,7 @@ from shared.text import clean_cell
 
 MATCH_CACHE_SCHEMA_VERSION = 1
 MATCH_CACHE_RECORD_TYPE = "spotify_track_match_cache"
-MATCHER_VERSION = 15
+MATCHER_VERSION = 16
 RECORDING_COHORT_STRATEGIES = CATALOGUE_RECORDING_STRATEGIES | {
     SAME_RECORDING_EDITION_MATCH_STRATEGY, REPEATED_PERFORMER_CREDIT_STRATEGY,
 }
@@ -245,7 +247,7 @@ def cached_track_match(
     matches: Mapping[str, Mapping[str, object]],
     seen_at: str | None = None,
     *,
-    spelling_positions: Sequence[SpotifyTrackCandidate] = (),
+    aligned_album_positions: Sequence[SpotifyTrackCandidate] = (),
 ) -> CachedSpotifyTrackMatch | None:
     cache_key, record = track_match_cache_entry(track, matches)
     if not record:
@@ -283,7 +285,7 @@ def cached_track_match(
             )
         ):
             return None
-        return cached_matched_track(track, cache_key, record, seen_at=seen_at, spelling_positions=spelling_positions)
+        return cached_matched_track(track, cache_key, record, seen_at=seen_at, aligned_album_positions=aligned_album_positions)
     if match_status in {AMBIGUOUS, UNMATCHED}:
         if cache_record_matcher_version(record) != MATCHER_VERSION:
             return None
@@ -372,7 +374,7 @@ def cached_matched_track(
     record: Mapping[str, object],
     seen_at: str | None = None,
     *,
-    spelling_positions: Sequence[SpotifyTrackCandidate] = (),
+    aligned_album_positions: Sequence[SpotifyTrackCandidate] = (),
 ) -> CachedSpotifyTrackMatch | None:
     candidate = spotify_candidate_from_cache_record(record, default_track=track)
     if not candidate:
@@ -381,7 +383,7 @@ def cached_matched_track(
     match_status = clean_cell(record.get("match_status"))
     review_candidates = (candidate,)
     if match_strategy in RECORDING_COHORT_STRATEGIES and match_status == MATCHED:
-        review_candidates = cached_recording_edition_cohort(track, record, spelling_positions=spelling_positions)
+        review_candidates = cached_recording_edition_cohort(track, record, aligned_album_positions=aligned_album_positions)
         if not review_candidates:
             return None
     if seen_at is not None and isinstance(record, dict):
@@ -402,6 +404,7 @@ def cached_matched_track(
             match_strategy=match_strategy,
             strict_album_recovery=match_status == MATCHED and record.get(STRICT_ALBUM_RECOVERY_FIELD) is True,
             title_search_complete=record.get("title_search_complete") is True,
+            composer_coverage=clean_cell(record.get("composer_coverage")),
         ),
         is_manual=match_status == "manual",
     )
@@ -555,7 +558,7 @@ def cached_recording_edition_cohort(
     track: PlaylistTrack,
     record: Mapping[str, object],
     *,
-    spelling_positions: Sequence[SpotifyTrackCandidate] = (),
+    aligned_album_positions: Sequence[SpotifyTrackCandidate] = (),
 ) -> tuple[SpotifyTrackCandidate, ...]:
     strategy = clean_cell(record.get("match_strategy"))
     repeated_credit = strategy == REPEATED_PERFORMER_CREDIT_STRATEGY
@@ -569,6 +572,10 @@ def cached_recording_edition_cohort(
     candidate_records = record.get("review_candidates")
     if chosen is None or not isinstance(candidate_records, list):
         return ()
+    if strategy == COMPOSER_PREFIX_STRATEGY:
+        coverage = record.get("composer_coverage")
+        if coverage != "search" and (coverage != "album" or not has_aligned_album_position(chosen, aligned_album_positions)):
+            return ()
     if repeated_credit or catalogue_recovery:
         count = record.get("repeated_credit_candidate_count" if repeated_credit else "recording_candidate_count")
         if (
@@ -602,7 +609,7 @@ def cached_recording_edition_cohort(
                 track, cohort, (), title_search_complete=record.get("title_search_complete") is True,
             )
             if strategy == EXACT_TITLE_RECORDING_STRATEGY
-            else match_catalogue_variants(track, cohort, (), spelling_positions)
+            else match_catalogue_variants(track, cohort, (), aligned_album_positions)
         )
         if (
             proof is None or proof.status != MATCHED or proof.match_strategy != strategy or proof.candidate != chosen
@@ -784,6 +791,8 @@ def cache_track_match(
             record["version_sensitive"] = True
         if decision.title_search_complete:
             record["title_search_complete"] = True
+        if decision.composer_coverage:
+            record["composer_coverage"] = decision.composer_coverage
         if match_strategy in RECORDING_COHORT_STRATEGIES:
             record["review_candidates"] = [
                 spotify_candidate_cache_record(candidate) for candidate in decision.review_candidates

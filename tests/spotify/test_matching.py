@@ -58,7 +58,7 @@ class SpotifyMatchingTests(unittest.TestCase):
         )
         second = replace(first, uri="spotify:track:second", album_id="edition-b")
         contradicted = replace(second, name="Another Song", isrc="USABC2400002")
-        result = choose_best_track_match(track, (first, contradicted), spelling_positions=(first, second))
+        result = choose_best_track_match(track, (first, contradicted), aligned_album_positions=(first, second))
         self.assertEqual((result.status, result.spotify_uri), (AMBIGUOUS, ""))
 
     def test_composer_prefix_requires_full_label_credits_album_and_unique_playable_candidate(self):
