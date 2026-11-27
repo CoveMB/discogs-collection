@@ -278,7 +278,7 @@ def cached_track_match(
     if match_status == MATCHED:
         if (
             not _strict_album_recovery_applies_to(track, record)
-            or not legacy_positive_is_safe(track, record)
+            or not automatic_positive_is_usable(track, record)
             or (
                 cache_record_is_version_sensitive(record)
                 and cache_record_matcher_version(record) != MATCHER_VERSION
@@ -293,7 +293,9 @@ def cached_track_match(
     return None
 
 
-def legacy_positive_is_safe(track: PlaylistTrack, record: Mapping[str, object]) -> bool:
+def automatic_positive_is_usable(track: PlaylistTrack, record: Mapping[str, object]) -> bool:
+    if record.get("spotify_is_playable") is False:
+        return False
     if cache_record_matcher_version(record) >= MATCHER_VERSION:
         return True
     fields = (track.track_name, track.artist_name, track.album_name, clean_cell(record.get("spotify_track_name")),
@@ -305,7 +307,7 @@ def legacy_positive_is_safe(track: PlaylistTrack, record: Mapping[str, object]) 
     candidate = spotify_candidate_from_cache_record(record, require_recording_metadata=True)
     return candidate is not None and choose_best_track_match(
         track, (candidate,), allow_leading_in_title_variant=False, allow_alphanumeric_spacing_fallback=False,
-        allow_constrained_typo_fallback=False, allow_version_substitute=False, repeated_credit_observations=(),
+        allow_constrained_typo_fallback=False, allow_version_substitute=False,
         allow_catalogue_recovery=False,
     ).status == MATCHED
 
@@ -635,7 +637,7 @@ def album_lookup_candidates_from_cache_record(
         return ()
     match_status = clean_cell(record.get("match_status"))
     if match_status == MATCHED:
-        if not legacy_positive_is_safe(track, record):
+        if not automatic_positive_is_usable(track, record):
             return ()
         if clean_cell(record.get("match_strategy")) in RECORDING_COHORT_STRATEGIES:
             return tuple(candidate for candidate in cached_recording_edition_cohort(track, record)

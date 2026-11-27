@@ -460,7 +460,7 @@ def _decision_from_candidates(
     match_strategy: str = "",
 ) -> TrackMatchDecision:
     candidate = candidates[0]
-    if len(candidates) == 1:
+    if len(candidates) == 1 and candidate.is_playable is not False:
         return TrackMatchDecision(
             track=track,
             status=MATCHED,
@@ -475,7 +475,7 @@ def _decision_from_candidates(
         track=track,
         status=AMBIGUOUS,
         spotify_uri="",
-        reason=ambiguous_reason,
+        reason="matching Spotify track is unavailable" if len(candidates) == 1 else ambiguous_reason,
         candidate=None,
         review_candidates=candidates,
         search_queries=search_queries,
@@ -491,13 +491,17 @@ def choose_best_track_match(
     allow_constrained_typo_fallback: bool = True,
     allow_version_substitute: bool = True,
     *,
-    repeated_credit_observations: Sequence[SpotifyTrackCandidate] | None = None,
+    search_observations: Sequence[SpotifyTrackCandidate] | None = None,
     allow_catalogue_recovery: bool = True,
     aligned_album_positions: Sequence[SpotifyTrackCandidate] = (),
 ) -> TrackMatchDecision:
-    if repeated_credit_observations is None:
-        repeated_credit_observations = candidates
-    candidates = deduplicate_spotify_track_candidates(candidates)
+    if search_observations is None:
+        search_observations = candidates
+    unavailable_uris = {candidate.uri for candidate in search_observations if candidate.is_playable is False}
+    candidates = tuple(
+        replace(candidate, is_playable=False) if candidate.uri in unavailable_uris else candidate
+        for candidate in deduplicate_spotify_track_candidates(candidates)
+    )
     exact_matches = tuple(candidate for candidate in candidates if candidate_matches_track(track, candidate))
     if exact_matches:
         return _decision_from_candidates(
@@ -643,7 +647,7 @@ def choose_best_track_match(
         )
 
     if allow_catalogue_recovery:
-        recovery = match_catalogue_variants(track, repeated_credit_observations, search_queries, aligned_album_positions)
+        recovery = match_catalogue_variants(track, search_observations, search_queries, aligned_album_positions)
         if recovery is not None:
             return recovery
 

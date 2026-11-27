@@ -704,6 +704,41 @@ def publish_summary_stub(**overrides):
 
 
 class SpotifyPublishPlaylistTests(unittest.TestCase):
+    def test_replace_holds_an_exact_unicode_track_marked_unavailable(self):
+        track = playlist_track("Test", "111", "Альбом", "Песня", "Север")
+        unavailable = SpotifyTrackCandidate(
+            "spotify:track:unavailable", track.track_name, (track.artist_name,), track.album_name, "album",
+            is_playable=False,
+        )
+        query = build_spotify_track_search_queries(track)[0]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            master = directory / "Test" / "Test.csv"
+            write_playlist_master(master, [playlist_row(track.release_id, track.album_name, track.track_name, track.artist_name)])
+            for label, observations in (
+                ("fresh", (unavailable,)),
+                ("conflicting playability", (replace(unavailable, is_playable=True), unavailable)),
+                ("untitled unavailable observation",
+                 (replace(unavailable, is_playable=True), replace(unavailable, name=""))),
+                ("previous automatic match", (unavailable,)),
+            ):
+                with self.subTest(label=label):
+                    client = PublishingSpotifyClient({query: observations})
+                    cache = directory / f"{label}.json"
+                    if label == "previous automatic match":
+                        records = {}
+                        cache_track_match(records, TrackMatchDecision(
+                            track, MATCHED, unavailable.uri, "prior automatic match", candidate=unavailable,
+                        ))
+                        save_spotify_track_match_cache(cache, records)
+                    result = publish_spotify_playlists(
+                        directory, directory / "report", client, "token", apply=False, publisher_sync_mode="replace",
+                        playlist_master_paths=(master,), match_cache_path=cache,
+                    )
+                    decision, = result.decisions
+                    self.assertEqual((decision.status, decision.spotify_uri), ("ambiguous", ""))
+                    self.assertIn("unavailable", decision.reason)
+
     def test_composer_recovery_with_truncated_broad_search_requires_a_complete_aligned_release(self):
         titles = ("Suite: I. Dawn", "Suite: II. Rain", "Suite: III. Sky")
         tracks = tuple(
@@ -1828,6 +1863,43 @@ class SpotifyPublishPlaylistTests(unittest.TestCase):
 
                 self.assertEqual(client.add_calls[-1], ("created-1", (middle_uri,), 1))
                 self.assertEqual([item.uri for item in inventory], [cohort[0].uri, middle_uri])
+
+    def test_capped_append_uses_a_later_cached_title_recovery_to_restore_order(self):
+        first = playlist_track("Test", "111", "Album", "First Song", "North")
+        later = playlist_track("Test", "222", "Crossings", "Night Ferry", "North, Sol")
+        first_row = playlist_row(first.release_id, first.album_name, first.track_name, first.artist_name)
+        later_row = playlist_row(later.release_id, later.album_name, later.track_name, later.artist_name)
+        first_hit = matching_candidate(first_row)
+        later_hit, _ = performer_credit_copies()
+        later_query = build_spotify_track_search_queries(later)[0]
+        recovered = search_spotify_track(later, FakeSpotifyClient({later_query: (later_hit,)}), "token", 10).decision
+        self.assertEqual(recovered.spotify_uri, later_hit.uri)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            masters = directory / "masters"
+            write_playlist_master(masters / "Test" / "Test.csv", [first_row, later_row])
+            cache = directory / "matches.json"
+            state = directory / "state.json"
+            records = {}
+            cache_track_match(records, recovered)
+            save_spotify_track_match_cache(cache, records)
+            seed_known_publish_state(state, "Test", first_row, 1)
+            existing = SpotifyPlaylistItem(later_hit.uri, later_hit.name, later_hit.artists, later_hit.album_name)
+            client = StrictPositionPublishingSpotifyClient(
+                {build_spotify_track_search_queries(first)[0]: (first_hit,)},
+                playlists=(SpotifyPlaylist("p", "Test", "", "current-user", public=False),),
+                playlist_items_by_id={"p": (existing,)},
+            )
+            report = directory / "report.txt"
+            for expected_stop in ("search_budget", "complete"):
+                result = publish_spotify_playlists(
+                    masters, report, client, "token", match_cache_path=cache, publish_state_cache_path=state,
+                    publisher_config=PublisherConfig("spotify", "", ""), max_new_searches_per_run=1,
+                )
+                self.assertEqual(result.stop_reason, expected_stop)
+                self.assertEqual(client.add_calls, [("p", (first_hit.uri,), 0)])
+                self.assertEqual([item.uri for item in client.playlist_items_by_id["p"]], [first_hit.uri, later_hit.uri])
 
     def test_uri_only_match_cannot_bypass_unresolved_configured_replacement_guard(self):
         manual = playlist_row("201", "Source Album", "Source First", "Source Artist")
